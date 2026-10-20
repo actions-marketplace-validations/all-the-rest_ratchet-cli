@@ -232,7 +232,10 @@ fails with the unified diff of the difference:
 The diff is a **patch**: `patch -p0` applies it to the committed file. The
 newline at the end of a file is part of the file, so a file that ends with a
 newline and one that does not differ — and the difference shows up in the
-diff.
+diff. A generated file that is not valid UTF-8 produces a **lossy** diff:
+the bytes that are not text are shown as the replacement character. The
+verdict is still right — it is computed on the raw bytes — but the human
+artifact is not a faithful rendering of a binary file.
 
 The status of a generated file is `ok` (in sync), `drift` (the committed file
 differs — a failed gate) or `new` (not committed yet — informational, not a
@@ -281,6 +284,14 @@ Two generator modes exist:
   its input in its output would produce a permanent drift, which the
   determinism rule forbids anyway. The tree is restored exactly afterwards:
   the bytes, the mode **and** the time.
+
+  What the engine can see is the **inode**, the **time** and the **bytes** of
+  the file. A write that changes none of them — the same bytes, written over
+  the same inode, with the time of the original restored — is reported as
+  *"produced nothing"*. That is the fail-closed direction: a false red,
+  never a false green. A generator that **replaces** the file (`cp -p` and
+  `mv`, the reproducible-build pattern) leaves a new inode behind and is
+  recognized as a write ✓.
 
 `ratchet drift` runs the drift gates alone; `ratchet check` runs them as part
 of the whole run. A drift command without a generated entry fails: an empty
@@ -353,7 +364,7 @@ rules are sorted by id, so the file is a stable diff.
 | `--format <stylish\|json>` | The output format, `stylish` by default. |
 | `--rule <id>` | Restrict the run to one rule. |
 | `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. |
-| `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. |
+| `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. A `check` option: `ratchet drift` runs every tier. |
 | `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |
 | `--quiet` | Only print failures. |
@@ -512,9 +523,10 @@ acted on.
 A baseline that moved against its committed counterpart is reported as
 `baseline-raised` / `baseline-lowered` — even when the count comparison failed
 as well: the baseline itself is the invalid artifact, and the count comparison
-is reported as an additional note. A run that executes no rule at all fails as
-well: an empty selection is never a pass. A `count` over a config without
-rules is a successful run.
+is reported as an additional note. A run that executes no **check** at all
+fails as well: an empty selection is never a pass. A check is a rule **or a
+drift gate**, so a project whose only gates are drift gates is green. A
+`count` over a config without rules is a successful run.
 
 Every path in the output is relative to the repository root: an absolute path,
 a machine name or a timestamp would make the same tree produce different bytes.

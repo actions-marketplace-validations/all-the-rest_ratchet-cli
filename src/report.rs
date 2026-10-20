@@ -55,12 +55,12 @@ pub fn render_stylish(report: &Report, quiet: bool) -> String {
             } else {
                 "PASS"
             };
-            out.push_str(&format!(
-                "  {status}  {:<width$}  {}\n",
+            out.push_str(&line(&format!(
+                "  {status}  {:<width$}  {}",
                 entry.path,
                 entry.detail.clone().unwrap_or_default(),
                 width = width
-            ));
+            )));
             if let Some(diff) = &entry.diff {
                 // The diff is a unified diff of its own: its lines start with
                 // a sign, and indenting them would change their meaning.
@@ -98,11 +98,23 @@ fn generated_suffix(report: &Report) -> String {
     format!(", {}", plural(report.generated.len(), "generated file"))
 }
 
+/// One line of the report, without the padding of an empty detail.
+///
+/// The label column is padded, and a row without a detail would end in
+/// spaces — the report carries words, not padding.
+fn line(text: &str) -> String {
+    format!("{}\n", text.trim_end())
+}
+
 /// Renders the human readable output of the drift command.
 ///
 /// The drift command runs the generated files only: there are no rules in its
 /// report, and the headline names the generated files alone.
-pub fn render_drift(entries: &[DriftEntry], quiet: bool) -> String {
+///
+/// The verdict is the one the run decided on — the same one the exit code and
+/// the JSON report carry.  The line must never say COHERENT while the run
+/// fails.
+pub fn render_drift(entries: &[DriftEntry], ok: bool, quiet: bool) -> String {
     let mut out = String::new();
     let drifted = entries
         .iter()
@@ -132,12 +144,12 @@ pub fn render_drift(entries: &[DriftEntry], quiet: bool) -> String {
         } else {
             "PASS"
         };
-        out.push_str(&format!(
-            "  {status}  {:<width$}  {}\n",
+        out.push_str(&line(&format!(
+            "  {status}  {:<width$}  {}",
             entry.path,
             entry.detail.clone().unwrap_or_default(),
             width = width
-        ));
+        )));
         if let Some(diff) = &entry.diff {
             out.push('\n');
             out.push_str(diff);
@@ -146,7 +158,7 @@ pub fn render_drift(entries: &[DriftEntry], quiet: bool) -> String {
 
     if !quiet {
         out.push('\n');
-        if drifted == 0 {
+        if ok {
             out.push_str(&format!(
                 "COHERENT — {} of {} gates passed\n",
                 entries.len(),

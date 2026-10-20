@@ -2498,6 +2498,8 @@ fn a_stale_generated_file_fails_with_a_unified_diff() {
     assert!(text.contains("-stale"), "{text}");
     assert!(text.contains("+fresh"), "{text}");
     assert!(text.contains("@@"), "{text}");
+    // The verdict line agrees with the exit code.
+    assert!(text.contains("NOT COHERENT"), "{text}");
 }
 
 #[test]
@@ -3743,6 +3745,34 @@ fn a_drift_command_without_a_generated_entry_fails() {
         "{}",
         stderr(&output)
     );
+    // The verdict line agrees with the exit code: it must not say COHERENT
+    // while the run fails.
+    let text = stdout(&output);
+    assert!(text.contains("NOT COHERENT"), "{text}");
+    assert!(!text.contains("\nCOHERENT —"), "{text}");
+}
+
+#[test]
+fn a_generator_that_replaces_the_file_is_not_mistaken_for_one_that_did_nothing() {
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    // The reproducible-build pattern: the file is replaced by a copy that
+    // keeps the time of the original.
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\ncp -p docs/generated.md docs/generated.md.tmp && mv docs/generated.md.tmp docs/generated.md\n",
+    );
+    repo.write("docs/generated.md", "original\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The generator did its job: the gate is green, not an operational error.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+    // The tree is unchanged: the restore put the original bytes back.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/generated.md"), "original\n");
 }
 
 #[test]

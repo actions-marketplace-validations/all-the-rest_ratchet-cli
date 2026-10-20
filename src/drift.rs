@@ -486,6 +486,11 @@ struct Snapshot {
     content: Option<Vec<u8>>,
     /// The time the file was written last, if it existed.
     modified: Option<SystemTime>,
+    /// The inode of the file, on the platforms that have one.
+    ///
+    /// The inode survives a preserved time: a generator that replaces the
+    /// file leaves a new one behind.
+    inode: Option<u64>,
     /// The original mode, on the platforms that have one.
     mode: Option<u32>,
     /// The symbolic link the target pointed to, if it was one.
@@ -504,6 +509,8 @@ struct Link {
     content: Option<Vec<u8>>,
     /// The time that file was written last, if it existed.
     modified: Option<SystemTime>,
+    /// The inode of that file, on the platforms that have one.
+    inode: Option<u64>,
     /// The mode of that file, on the platforms that have one.
     mode: Option<u32>,
 }
@@ -517,6 +524,7 @@ impl Snapshot {
                 target: target.to_path_buf(),
                 content: None,
                 modified: None,
+                inode: None,
                 mode: None,
                 link: None,
                 created,
@@ -525,24 +533,27 @@ impl Snapshot {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let raw = fs::read_link(target)?;
                 let resolved = resolve(target, &raw);
-                let (content, modified, mode) = match fs::metadata(&resolved) {
+                let (content, modified, inode, mode) = match fs::metadata(&resolved) {
                     Ok(metadata) => (
                         Some(fs::read(&resolved)?),
                         metadata.modified().ok(),
+                        inode_of(&metadata),
                         mode_of(&metadata),
                     ),
-                    Err(_) => (None, None, None),
+                    Err(_) => (None, None, None, None),
                 };
                 Ok(Snapshot {
                     target: target.to_path_buf(),
                     content: None,
                     modified: None,
+                    inode: None,
                     mode: None,
                     link: Some(Link {
                         raw,
                         resolved,
                         content,
                         modified,
+                        inode,
                         mode,
                     }),
                     created,
@@ -552,6 +563,7 @@ impl Snapshot {
                 target: target.to_path_buf(),
                 content: Some(fs::read(target)?),
                 modified: metadata.modified().ok(),
+                inode: inode_of(&metadata),
                 mode: mode_of(&metadata),
                 link: None,
                 created,
@@ -582,6 +594,12 @@ impl Snapshot {
         if now != Some(before) && now != Some(marker) {
             return true;
         }
+        // The time is the same — but a generator that **replaces** the file
+        // (`cp -p` and `mv`, the reproducible-build pattern) leaves a new
+        // inode behind, and the inode survives a preserved time.
+        if inode_of(&metadata) != self.inode() {
+            return true;
+        }
         produced != self.bytes()
     }
 
@@ -598,6 +616,14 @@ impl Snapshot {
         match &self.link {
             Some(link) => link.modified,
             None => self.modified,
+        }
+    }
+
+    /// The inode of the file behind the target, if it existed.
+    fn inode(&self) -> Option<u64> {
+        match &self.link {
+            Some(link) => link.inode,
+            None => self.inode,
         }
     }
 
@@ -845,6 +871,23 @@ fn mode_of(metadata: &fs::Metadata) -> Option<u32> {
 /// The mode of a file, on the platforms that have none.
 #[cfg(not(unix))]
 fn mode_of(_metadata: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// The inode of a file, on the platforms that have one.
+///
+/// The inode survives a preserved time: a generator that replaces the file
+/// (`cp -p` and `mv`, the reproducible-build pattern) leaves a new one behind,
+/// and that is the only signal that such a write happened.
+#[cfg(unix)]
+fn inode_of(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.ino())
+}
+
+/// The inode of a file, on the platforms that have none.
+#[cfg(not(unix))]
+fn inode_of(_metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
