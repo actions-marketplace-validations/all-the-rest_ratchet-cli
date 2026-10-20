@@ -25,7 +25,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::baseline::{Baseline, BaselineRecord};
 use crate::check::{ActionKind, BaselineAction, Report};
-use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Tier};
+use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Rule, Tier};
 use crate::git::Git;
 
 /// The starter config `ratchet init` writes.
@@ -177,6 +177,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
         Command::Baseline(args) => match &args.command {
             BaselineCommand::Init(args) => cmd_baseline(&cli, &cwd, false, args.reason.as_deref()),
             BaselineCommand::Update(args) => cmd_baseline(&cli, &cwd, true, args.reason.as_deref()),
+            BaselineCommand::Raise(args) => cmd_baseline_raise(&cli, args, &cwd),
         },
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
@@ -349,7 +350,7 @@ fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
             };
             println!("{}", report::render_json(&report));
         }
-        Format::Stylish => print!("{}", report::render_drift(&outcome.entries, cli.quiet)),
+        Format::Stylish => print!("{}", report::render_drift(&outcome.entries, ok, cli.quiet)),
     }
     print_notes(&notes, &debug, cli);
 
@@ -554,15 +555,7 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
     }
 
     let command = if update { "update" } else { "init" };
-    // The path that was written — relative to the repository root.
-    let path = path::display(Some(&context.root), &context.baseline_path);
-    match cli.format {
-        Format::Json => println!(
-            "{}",
-            report::render_baseline_json(command, &actions, failed)
-        ),
-        Format::Stylish => print!("{}", report::render_baseline(command, &path, &actions)),
-    }
+    print_baseline(cli, &context, command, &actions, failed);
 
     if counter_errors > 0 {
         Ok(2)
@@ -570,6 +563,169 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
         Ok(1)
     } else {
         Ok(0)
+    }
+}
+
+/// The decision of a raise: the move, or the refusal.
+enum Raise {
+    /// The baseline moves against its declared direction.
+    Move {
+        /// The new value of the baseline.
+        value: i64,
+        /// The reason, which travels with the record.
+        reason: String,
+        /// A human readable message.
+        message: String,
+    },
+    /// The move is refused; the baseline file stays untouched.
+    Refuse {
+        /// A human readable message.
+        message: String,
+    },
+}
+
+/// Decides what a raise of a rule does.
+///
+/// The command moves the baseline **against** the declared direction: a
+/// ceiling goes up, a floor goes down.  Every other move is the paydown's
+/// job (`baseline update`), and a raise without a reason is refused — the
+/// reason is what makes the move reviewable (SPEC 4, 5.2).
+///
+/// `current` is the value the baseline has today, `None` when the rule has no
+/// baseline yet.
+fn decide_raise(rule: &Rule, current: Option<i64>, value: i64, reason: Option<&str>) -> Raise {
+    let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
+        return Raise::Refuse {
+            message:
+                "refusing: a raise needs a reason — --reason \"<text>\" says why the baseline \
+                 moves against its direction"
+                    .to_string(),
+        };
+    };
+    let Some(current) = current else {
+        return Raise::Refuse {
+            message: format!(
+                "refusing: no baseline for {} — run ratchet baseline init",
+                rule.id
+            ),
+        };
+    };
+    if value < 0 {
+        return Raise::Refuse {
+            message: format!("refusing: a baseline cannot be negative — {value} is not a count"),
+        };
+    }
+
+    let against = match rule.direction {
+        Direction::Ceiling => value > current,
+        Direction::Floor => value < current,
+    };
+    if !against {
+        let message = if value == current {
+            format!("refusing: the baseline is already {current} — there is nothing to move")
+        } else {
+            match rule.direction {
+                Direction::Ceiling => format!(
+                    "refusing: value {value} does not raise the baseline {current} — a ceiling may \
+                     only decrease; that is the paydown — use `ratchet baseline update`"
+                ),
+                Direction::Floor => format!(
+                    "refusing: value {value} does not lower the baseline {current} — a floor may \
+                     only increase; that is the paydown — use `ratchet baseline update`"
+                ),
+            }
+        };
+        return Raise::Refuse { message };
+    }
+
+    let message = match rule.direction {
+        Direction::Ceiling => format!("{current} → {value} — raised deliberately"),
+        Direction::Floor => format!("{current} → {value} — lowered deliberately"),
+    };
+    Raise::Move {
+        value,
+        reason: reason.to_string(),
+        message,
+    }
+}
+
+/// The deliberate move against the declared direction (SPEC 5.5).
+///
+/// The paydown (`baseline update`) moves a baseline in the allowed direction;
+/// this command moves it the other way, on purpose.  The reason is required:
+/// it travels with the record, so the diff on the baseline file carries it
+/// (SPEC 4) and the monotonicity check can accept the move (SPEC 5.2).
+fn cmd_baseline_raise(cli: &Cli, args: &BaselineRaiseArgs, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+
+    // The command moves exactly one baseline: without a rule there is nothing
+    // to raise.
+    let Some(id) = cli.rule.as_deref() else {
+        return Err(Error::new(
+            "ratchet baseline raise needs a rule: --rule <id>",
+        ));
+    };
+    ensure_rule_exists(&context.config, Some(id))?;
+    let rule = &context.config.rules[id];
+
+    let mut baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
+    let current = baseline.get(id).map(|record| record.value);
+
+    let mut actions: Vec<BaselineAction> = Vec::new();
+    let mut failed = 0usize;
+
+    match decide_raise(rule, current, args.value, args.reason.as_deref()) {
+        Raise::Refuse { message } => {
+            failed += 1;
+            actions.push(BaselineAction {
+                id: id.to_string(),
+                kind: ActionKind::Refused,
+                value: current,
+                message,
+            });
+        }
+        Raise::Move {
+            value,
+            reason,
+            message,
+        } => {
+            // The record carries the new value **and** the reason: the reason
+            // travels with the record, so the diff on the baseline file
+            // carries it.
+            baseline.rules.insert(
+                id.to_string(),
+                BaselineRecord {
+                    value,
+                    reason: Some(reason),
+                },
+            );
+            baseline.save(Some(&context.root), &context.baseline_path)?;
+            actions.push(BaselineAction {
+                id: id.to_string(),
+                kind: ActionKind::Updated,
+                value: Some(value),
+                message,
+            });
+        }
+    }
+
+    print_baseline(cli, &context, "raise", &actions, failed);
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+/// Prints the output of a baseline command.
+fn print_baseline(
+    cli: &Cli,
+    context: &Context,
+    command: &str,
+    actions: &[BaselineAction],
+    failed: usize,
+) {
+    // The path that was written — relative to the repository root.
+    let path = path::display(Some(&context.root), &context.baseline_path);
+    match cli.format {
+        Format::Json => println!("{}", report::render_baseline_json(command, actions, failed)),
+        Format::Stylish => print!("{}", report::render_baseline(command, &path, actions)),
     }
 }
 
@@ -825,8 +981,8 @@ fn parent_dir(path: &Path) -> PathBuf {
 const SUBCOMMANDS: [&str; 5] = ["check", "count", "baseline", "drift", "init"];
 
 /// The options that take a value; the value is not a positional argument.
-const OPTIONS_WITH_VALUE: [&str; 7] = [
-    "config", "format", "rule", "tier", "ignore", "path", "reason",
+const OPTIONS_WITH_VALUE: [&str; 8] = [
+    "config", "format", "rule", "tier", "ignore", "path", "reason", "value",
 ];
 
 /// Inserts the default command when the first argument is not a subcommand:
@@ -994,12 +1150,26 @@ enum BaselineCommand {
     Init(BaselineReasonArgs),
     /// Move the baseline towards the current count, in the allowed direction only.
     Update(BaselineReasonArgs),
+    /// Move the baseline against its direction, with a reason.
+    Raise(BaselineRaiseArgs),
 }
 
 /// The arguments of the baseline commands.
 #[derive(Args, Debug)]
 struct BaselineReasonArgs {
     /// The reason stored in the baseline record.
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+}
+
+/// The arguments of `baseline raise`.
+#[derive(Args, Debug)]
+struct BaselineRaiseArgs {
+    /// The new value of the baseline.
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
+    value: i64,
+
+    /// The reason the baseline moves against its direction; it is required.
     #[arg(long, value_name = "TEXT")]
     reason: Option<String>,
 }
@@ -1061,5 +1231,113 @@ mod tests {
     fn leaves_the_help_alone() {
         let normalized = normalize_args(args(&["ratchet", "--help"]));
         assert_eq!(normalized.len(), 2);
+    }
+
+    /// A rule with a direction, for the decision of a raise.
+    fn rule(direction: Direction) -> Rule {
+        Rule {
+            id: "a".to_string(),
+            class: "c".to_string(),
+            incident: "i".to_string(),
+            unit: "u".to_string(),
+            direction,
+            tier: Tier::Fast,
+            count: config::Counter::Command {
+                command: vec!["echo".to_string(), "1".to_string()],
+            },
+            exclude: Vec::new(),
+            files: Vec::new(),
+            description: None,
+            exclude_globs: Vec::new(),
+            file_globs: Vec::new(),
+        }
+    }
+
+    /// The message of a refusal; `None` when the raise was allowed.
+    fn refusal(
+        direction: Direction,
+        current: Option<i64>,
+        value: i64,
+        reason: Option<&str>,
+    ) -> Option<String> {
+        match decide_raise(&rule(direction), current, value, reason) {
+            Raise::Refuse { message } => Some(message),
+            Raise::Move { .. } => None,
+        }
+    }
+
+    /// The move of a raise; `None` when it was refused.
+    fn movement(
+        direction: Direction,
+        current: Option<i64>,
+        value: i64,
+        reason: Option<&str>,
+    ) -> Option<(i64, String, String)> {
+        match decide_raise(&rule(direction), current, value, reason) {
+            Raise::Move {
+                value,
+                reason,
+                message,
+            } => Some((value, reason, message)),
+            Raise::Refuse { .. } => None,
+        }
+    }
+
+    #[test]
+    fn a_raise_without_a_reason_is_refused() {
+        let message = refusal(Direction::Ceiling, Some(5), 7, None).expect("the raise is refused");
+        assert!(message.contains("a raise needs a reason"), "{message}");
+        // An empty reason is no reason.
+        let message =
+            refusal(Direction::Ceiling, Some(5), 7, Some("   ")).expect("the raise is refused");
+        assert!(message.contains("a raise needs a reason"), "{message}");
+    }
+
+    #[test]
+    fn a_raise_against_the_direction_moves_the_baseline() {
+        // A ceiling goes up.
+        let (value, reason, message) =
+            movement(Direction::Ceiling, Some(5), 7, Some("because")).expect("the raise moves");
+        assert_eq!(value, 7);
+        assert_eq!(reason, "because");
+        assert!(message.contains("raised deliberately"), "{message}");
+        // A floor goes down.
+        let (value, reason, message) =
+            movement(Direction::Floor, Some(5), 3, Some("because")).expect("the raise moves");
+        assert_eq!(value, 3);
+        assert_eq!(reason, "because");
+        assert!(message.contains("lowered deliberately"), "{message}");
+    }
+
+    #[test]
+    fn a_raise_in_the_allowed_direction_is_the_paydown() {
+        // A ceiling that goes down.
+        let message =
+            refusal(Direction::Ceiling, Some(5), 3, Some("because")).expect("the raise is refused");
+        assert!(
+            message.contains("that is the paydown — use `ratchet baseline update`"),
+            "{message}"
+        );
+        // A floor that goes up.
+        let message =
+            refusal(Direction::Floor, Some(5), 7, Some("because")).expect("the raise is refused");
+        assert!(
+            message.contains("that is the paydown — use `ratchet baseline update`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_moves_nothing_is_refused() {
+        let message =
+            refusal(Direction::Ceiling, Some(5), 5, Some("because")).expect("the raise is refused");
+        assert!(message.contains("there is nothing to move"), "{message}");
+    }
+
+    #[test]
+    fn a_raise_of_a_rule_without_a_baseline_is_refused() {
+        let message =
+            refusal(Direction::Ceiling, None, 7, Some("because")).expect("the raise is refused");
+        assert!(message.contains("no baseline for a"), "{message}");
     }
 }

@@ -2,7 +2,7 @@
 
 `ratchet` is a standalone binary that enforces **ratchet gates**: quality
 gates that compare a **count** against a **baseline** that may only move in one
-declared direction.
+declared direction — or, deliberately and with a reason, against it.
 
 ## The idea in five lines
 
@@ -11,11 +11,13 @@ declared direction.
 2. The count is compared against a **baseline**, a number in the repository.
 3. A **ceiling** rule fails when the count rises above its baseline; a
    **floor** rule fails when the count falls below it.
-4. The baseline itself may only move in the declared direction: a ceiling may
-   only decrease, a floor may only increase. Raising a ceiling to make a gate
-   green is a **failed gate**, not a fix.
-5. The baseline moves only when a human says so — `ratchet baseline update`,
-   never automatically.
+4. The baseline itself moves in the declared direction: a ceiling may only
+   decrease, a floor may only increase. Raising a ceiling to make a gate green
+   is a **failed gate**, not a fix — the one exception is a deliberate raise
+   that carries its reason into the diff.
+5. The baseline moves only when a human says so, never automatically: in the
+   declared direction by `ratchet baseline update`, against it only by
+   `ratchet baseline raise`.
 
 The engine owns the baseline, the direction, the monotonicity and the
 reporting. The project owns the counting: a rule produces its number through a
@@ -56,6 +58,7 @@ ratchet check --tier fast # run the gates of one tier
 ratchet count           # print the current count per rule
 ratchet baseline init   # write the current count as the baseline
 ratchet baseline update # pay a ceiling down / a floor up — in that direction only
+ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
 ratchet drift           # run the drift gates: the generated files
 ratchet init            # write a starter config
 ```
@@ -344,6 +347,10 @@ rules are sorted by id, so the file is a stable diff.
 }
 ```
 
+The `reason` is optional — but it is more than an explanation: it is what
+makes a **deliberate move against the declared direction** reviewable. The
+reason travels with the record, so the diff on the baseline file carries it.
+
 ## The commands
 
 | Command | What it does |
@@ -352,6 +359,7 @@ rules are sorted by id, so the file is a stable diff.
 | `ratchet count` | Prints the current count per rule, without a comparison. |
 | `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. |
 | `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. |
+| `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
 
@@ -371,7 +379,40 @@ rules are sorted by id, so the file is a stable diff.
 | `--version`, `--help` | |
 
 `baseline init` and `baseline update` accept `--reason <text>`, which is stored
-in the baseline record.
+in the baseline record. `baseline raise` needs `--rule <id>`, `--value <n>` and
+`--reason <text>` — the reason is not optional there.
+
+### The deliberate raise
+
+A ratchet forbids the forbidden direction: a ceiling may only decrease, a
+floor may only increase. That is the right rule for the debt a project pays
+down — but a project sometimes has to move a baseline **against** its
+direction on purpose: a dependency was added with a reason, the debt was
+written off, a floor was lowered because the module it guarded is gone.
+
+```sh
+ratchet baseline raise --rule dependency-count --value 8 --reason "the self-update needs two crates"
+```
+
+`baseline raise` is that command. It writes the new value **with the reason**
+and touches nothing else.
+
+* The move must be **against** the declared direction: a ceiling goes **up**, a
+  floor goes **down**. A move in the allowed direction is the paydown's job —
+  `ratchet baseline update` does it, and `baseline raise` refuses it: *"that is
+  the paydown — use `ratchet baseline update`"*.
+* The **reason is required**. A raise without one is refused like any other
+  forbidden move, and the baseline file stays untouched.
+* The reason **travels with the record**: it is written into
+  `ratchet.baseline.json`, so the diff on the baseline file carries it. That is
+  what makes the move reviewable — the change is visible, deliberate and
+  reviewable on its own.
+
+The monotonicity check accepts a raise that carries a reason — the reason is in
+the file and therefore in the diff. A raise without a reason is rejected like
+any other forbidden move (`baseline-raised` / `baseline-lowered`, exit `1`).
+`baseline update` keeps its shape: it moves only in the allowed direction and
+refuses the other.
 
 ### The tiers
 
@@ -510,23 +551,26 @@ rules and the drift gates.
 ```
 
 The `notes` array carries the same notes the human output prints on stderr —
-the tier floor, the skipped monotonicity comparison, a skipped drift gate. It
-is empty when there is nothing to say. A machine consumer must be able to
-learn why the run is not green **without** the note being only on stderr: a
-report that says `ok: false` and gives no reason is a report that cannot be
-acted on.
+the tier floor, the skipped monotonicity comparison, a skipped drift gate, a
+baseline that was raised deliberately (with its reason). It is empty when there
+is nothing to say. A machine consumer must be able to learn why the run is not
+green **without** the note being only on stderr: a report that says `ok: false`
+and gives no reason is a report that cannot be acted on.
 
 ```
 "notes": ["the tier `fast` executed 2 checks, the floor is 5"]
 ```
 
-A baseline that moved against its committed counterpart is reported as
-`baseline-raised` / `baseline-lowered` — even when the count comparison failed
-as well: the baseline itself is the invalid artifact, and the count comparison
-is reported as an additional note. A run that executes no **check** at all
-fails as well: an empty selection is never a pass. A check is a rule **or a
-drift gate**, so a project whose only gates are drift gates is green. A
-`count` over a config without rules is a successful run.
+A baseline that moved against its committed counterpart **without a reason** is
+reported as `baseline-raised` / `baseline-lowered` — even when the count
+comparison failed as well: the baseline itself is the invalid artifact, and the
+count comparison is reported as an additional note. With a reason the move is
+accepted: the reason is in the file and therefore in the diff, so the run
+carries a note that names the move and its reason instead of a failure. A run
+that executes no **check** at all fails as well: an empty selection is never a
+pass. A check is a rule **or a drift gate**, so a project whose only gates are
+drift gates is green. A `count` over a config without rules is a successful
+run.
 
 Every path in the output is relative to the repository root: an absolute path,
 a machine name or a timestamp would make the same tree produce different bytes.
@@ -560,8 +604,9 @@ the baselines — the baseline file is written by the tool, never by hand.
 
 Four of the five rules count zero today: they are **boolean gates** — *no
 occurrence may appear* — and their baseline must never move. `dependency-count`
-is the only ratchet: its baseline of 6 dependency entries may only decrease,
-and `ratchet baseline update` is the only way to move it.
+is the only ratchet: its baseline of 6 dependency entries may only decrease.
+`ratchet baseline update` moves it in that direction; `ratchet baseline raise`
+moves it against it — deliberately, with a reason that travels with the record.
 
 The counters live in `scripts/count.sh`, one case per counter name; each one
 prints exactly one integer. They are plain `sh` and the tools every unix has

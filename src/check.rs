@@ -322,17 +322,42 @@ pub fn check(
                     _ => None,
                 };
                 if let Some((violation, explanation)) = violation {
-                    // The monotonicity check takes precedence; the count
-                    // comparison is reported as an additional note (SPEC 5.2).
-                    if count_status.is_failure() && count_status != RuleStatus::MissingBaseline {
-                        report.notes.push(format!(
-                            "{id}: the count {count} also fails against the baseline {} ({})",
-                            record.value,
-                            count_status.as_str()
-                        ));
+                    // A move against the declared direction is allowed when
+                    // the record carries a reason: the reason is in the file,
+                    // so it is in the diff — the change is visible, deliberate
+                    // and reviewable on its own (SPEC 5.2).
+                    let reason = record
+                        .reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty());
+                    match reason {
+                        Some(reason) => {
+                            let verb = match rule.direction {
+                                Direction::Ceiling => "raised",
+                                Direction::Floor => "lowered",
+                            };
+                            report.notes.push(format!(
+                                "{id}: the baseline was {verb} deliberately, {} → {} — {reason}",
+                                committed_record.value, record.value
+                            ));
+                        }
+                        None => {
+                            // The monotonicity check takes precedence; the count
+                            // comparison is reported as an additional note (SPEC 5.2).
+                            if count_status.is_failure()
+                                && count_status != RuleStatus::MissingBaseline
+                            {
+                                report.notes.push(format!(
+                                    "{id}: the count {count} also fails against the baseline {} ({})",
+                                    record.value,
+                                    count_status.as_str()
+                                ));
+                            }
+                            status = violation;
+                            detail = Some(explanation);
+                        }
                     }
-                    status = violation;
-                    detail = Some(explanation);
                 }
             }
         }

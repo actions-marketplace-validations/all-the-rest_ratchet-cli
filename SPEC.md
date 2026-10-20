@@ -231,9 +231,13 @@ failure, not a pass — the rule that would have run is not silently skipped.
 }
 ```
 
-* Machine-written by `ratchet baseline init` and `ratchet baseline update`.
+* Machine-written by `ratchet baseline init`, `ratchet baseline update` and
+  `ratchet baseline raise`.
 * Never hand-edited.
-* `reason` is optional and only present when one was given.
+* `reason` is optional and only present when one was given. It does more than
+  explain a paydown: it is what makes a **deliberate move against the declared
+  direction** reviewable — the reason travels with the record, so the diff on
+  the baseline file carries it.
 * Rules are sorted by id — the file is a stable diff.
 
 ## 5. Commands
@@ -243,6 +247,7 @@ ratchet [check] [paths…] [options]
 ratchet count [--rule <id>] [--format <stylish|json>]
 ratchet baseline init [--rule <id>] [--reason <text>]
 ratchet baseline update [--rule <id>] [--reason <text>]
+ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
 ratchet init
 ratchet update
@@ -294,6 +299,12 @@ match it must not silently disable the gate.
    When the monotonicity check fails, it takes precedence over the count
    comparison in the report: the baseline is the invalid artifact, and the
    count comparison is reported only as an additional note.
+
+   The monotonicity check accepts a move against the declared direction **only**
+   when the baseline record carries a reason. A raise without a reason is
+   rejected like any other forbidden move; a raise with a reason is allowed,
+   because the reason is in the file and therefore in the diff — the change is
+   visible, deliberate and reviewable on its own.
 5. Tiers — `--tier` selects one tier. The number of **executed** checks in the
    selected tier must be ≥ the tier's `floor`, and must be > 0. Zero executed
    checks in the selected tier → fail ("empty selection").
@@ -333,6 +344,17 @@ Rules that may not move are reported as refused and are **not** modified; the
 command then exits `1` so the refusal is noticed. `--rule` restricts it to one
 rule. `--reason <text>` is stored in the baseline record. Touches only the
 baseline file. Never runs automatically.
+
+A move **against** the declared direction is possible only as its own
+deliberate command:
+
+```
+ratchet baseline raise --rule <id> --value <n> --reason "<text>"
+```
+
+It writes the new value **with the reason** and touches nothing else. A raise
+without a reason is refused like any other forbidden move. `baseline update`
+keeps its shape: it moves only in the allowed direction and refuses the other.
 
 ### 5.6 `init`
 
@@ -427,10 +449,11 @@ A rule entry may carry a `detail` field: the reason for a status that is not
 able to learn **why** a rule failed without parsing the human output.
 
 The `notes` array carries the same notes the human output prints on stderr —
-the tier floor, the skipped monotonicity comparison, a skipped drift gate. It
-is empty when there is nothing to say. A machine consumer must be able to learn
-why the run is not green **without** the note being only on stderr: a report
-that says `ok: false` and gives no reason is a report that cannot be acted on.
+the tier floor, the skipped monotonicity comparison, a skipped drift gate, a
+baseline that was raised deliberately (with its reason). It is empty when there
+is nothing to say. A machine consumer must be able to learn why the run is not
+green **without** the note being only on stderr: a report that says `ok: false`
+and gives no reason is a report that cannot be acted on.
 
 ## 7. Drift gates
 

@@ -3943,3 +3943,480 @@ fn a_repository_without_a_commit_has_nothing_committed_yet() {
     assert_eq!(report["generated"][0]["status"], "new");
     assert_eq!(report["ok"], true);
 }
+
+// --- the deliberate raise ----------------------------------------------------
+
+/// A config with a ceiling rule and a floor rule.
+fn two_directions_config() -> &'static str {
+    r#"[
+      {
+        "rules": {
+          "todo-markers": {
+            "class": "unfinished work",
+            "incident": "a TODO marker was merged without a tracking issue",
+            "unit": "markers",
+            "direction": "ceiling",
+            "count": { "command": ["echo", "3"] }
+          },
+          "tests": {
+            "class": "coverage",
+            "incident": "a test was deleted",
+            "unit": "tests",
+            "direction": "floor",
+            "count": { "command": ["echo", "3"] }
+          }
+        }
+      }
+    ]"#
+}
+
+/// A baseline with two records.
+fn two_records_baseline() -> String {
+    "{\n  \"version\": 1,\n  \"rules\": {\n    \"tests\": { \"value\": 5 },\n    \"todo-markers\": { \"value\": 5 }\n  }\n}\n".to_string()
+}
+
+/// The baseline of the repository, parsed.
+fn baseline_of(repo: &Repo) -> Value {
+    serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("the baseline is JSON")
+}
+
+#[test]
+fn baseline_raise_writes_the_value_and_the_reason() {
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "7",
+        "--reason",
+        "the self-update needs two more crates",
+    ]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let baseline = baseline_of(&repo);
+    assert_eq!(baseline["rules"]["todo-markers"]["value"], 7);
+    assert_eq!(
+        baseline["rules"]["todo-markers"]["reason"],
+        "the self-update needs two more crates"
+    );
+    // The other rule is untouched.
+    assert_eq!(baseline["rules"]["tests"]["value"], 5);
+    assert!(baseline["rules"]["tests"].get("reason").is_none());
+    // The command touches the baseline file and nothing else.
+    assert_eq!(repo.status(), " M ratchet.baseline.json\n");
+}
+
+#[test]
+fn baseline_raise_without_a_reason_is_refused() {
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let before = repo.read("ratchet.baseline.json");
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "7",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("refusing: a raise needs a reason"), "{text}");
+    // The baseline file is byte-identical.
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+    assert_eq!(repo.status(), "");
+}
+
+#[test]
+fn baseline_raise_refuses_the_paydown_direction() {
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let before = repo.read("ratchet.baseline.json");
+
+    // A ceiling that goes down is the paydown's job.
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "3",
+        "--reason",
+        "because",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("that is the paydown — use `ratchet baseline update`"),
+        "{text}"
+    );
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+
+    // A floor that goes up is the paydown's job as well.
+    let output = repo.run(&[
+        "baseline", "raise", "--rule", "tests", "--value", "7", "--reason", "because",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("that is the paydown — use `ratchet baseline update`"),
+        "{text}"
+    );
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+}
+
+#[test]
+fn baseline_raise_lowers_a_floor_deliberately() {
+    // A floor may only increase: the move against that direction is a
+    // deliberate lowering.
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "tests",
+        "--value",
+        "3",
+        "--reason",
+        "the floor was written off",
+    ]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let baseline = baseline_of(&repo);
+    assert_eq!(baseline["rules"]["tests"]["value"], 3);
+    assert_eq!(
+        baseline["rules"]["tests"]["reason"],
+        "the floor was written off"
+    );
+    // The ceiling is untouched.
+    assert_eq!(baseline["rules"]["todo-markers"]["value"], 5);
+}
+
+#[test]
+fn baseline_raise_needs_a_rule() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+
+    let output = repo.run(&["baseline", "raise", "--value", "7", "--reason", "because"]);
+
+    assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("needs a rule"));
+}
+
+#[test]
+fn baseline_raise_of_an_unknown_rule_exits_two() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+
+    let output = repo.run(&[
+        "baseline", "raise", "--rule", "nope", "--value", "7", "--reason", "because",
+    ]);
+
+    assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("unknown rule: nope"));
+}
+
+#[test]
+fn baseline_raise_of_a_rule_without_a_baseline_is_refused() {
+    let repo = Repo::new(ceiling_config(), None);
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "7",
+        "--reason",
+        "because",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("refusing: no baseline for todo-markers — run ratchet baseline init"),
+        "{text}"
+    );
+    assert!(!repo.path().join("ratchet.baseline.json").exists());
+}
+
+#[test]
+fn the_json_report_names_the_raise_command() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "7",
+        "--reason",
+        "because",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["baseline"]["command"], "raise");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["rules"][0]["action"], "updated");
+    assert_eq!(report["rules"][0]["value"], 7);
+}
+
+#[test]
+fn the_monotonicity_check_accepts_a_raise_with_a_reason() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    // The working tree raises the baseline and says why.
+    repo.write(
+        "ratchet.baseline.json",
+        "{\n  \"version\": 1,\n  \"rules\": {\n    \"todo-markers\": { \"value\": 7, \"reason\": \"the self-update needs two more crates\" }\n  }\n}\n",
+    );
+
+    let output = repo.run(&["check"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The report names the reason: it is in the baseline file, so it is in the
+    // diff.
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the baseline was raised deliberately, 5 → 7"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the self-update needs two more crates"),
+        "{text}"
+    );
+
+    // The note is in the JSON report too: a machine consumer must not have to
+    // read stderr to learn why the run is green (SPEC 6.3).
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let notes: Vec<&str> = report["notes"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|note| note.as_str().expect("a string"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("the baseline was raised deliberately, 5 → 7"),
+        "{notes:?}"
+    );
+    assert!(
+        notes[0].contains("the self-update needs two more crates"),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_monotonicity_check_rejects_a_raise_without_a_reason() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    // The working tree raises the baseline without saying why.
+    repo.write("ratchet.baseline.json", &baseline("todo-markers", 7));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["status"], "baseline-raised");
+}
+
+#[test]
+fn the_monotonicity_check_accepts_a_lowered_floor_with_a_reason() {
+    let repo = Repo::new(floor_config(), Some(&baseline("tests", 5)));
+    repo.write(
+        "ratchet.baseline.json",
+        "{\n  \"version\": 1,\n  \"rules\": {\n    \"tests\": { \"value\": 3, \"reason\": \"the floor was written off\" }\n  }\n}\n",
+    );
+
+    let output = repo.run(&["check"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the baseline was lowered deliberately, 5 → 3"),
+        "{text}"
+    );
+    assert!(text.contains("the floor was written off"), "{text}");
+}
+
+#[test]
+fn the_monotonicity_check_rejects_a_lowered_floor_without_a_reason() {
+    let repo = Repo::new(floor_config(), Some(&baseline("tests", 5)));
+    repo.write("ratchet.baseline.json", &baseline("tests", 3));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["status"], "baseline-lowered");
+}
+
+#[test]
+fn the_paydown_still_refuses_the_forbidden_direction() {
+    // A ceiling whose count is above the baseline: the paydown may not raise
+    // it.
+    let ceiling = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 2)));
+    let before = ceiling.read("ratchet.baseline.json");
+
+    let output = ceiling.run(&["baseline", "update", "--rule", "todo-markers"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("refusing: count 3 > baseline 2 — a ceiling may only decrease"),
+        "{text}"
+    );
+    assert_eq!(ceiling.read("ratchet.baseline.json"), before);
+
+    // A floor whose count is below the baseline: the paydown may not lower it.
+    let floor = Repo::new(floor_config(), Some(&baseline("tests", 5)));
+    let before = floor.read("ratchet.baseline.json");
+
+    let output = floor.run(&["baseline", "update", "--rule", "tests"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("refusing: count 3 < baseline 5 — a floor may only increase"),
+        "{text}"
+    );
+    assert_eq!(floor.read("ratchet.baseline.json"), before);
+}
+
+#[test]
+fn baseline_raise_of_a_negative_value_is_refused() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let before = repo.read("ratchet.baseline.json");
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "-3",
+        "--reason",
+        "because",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("refusing: a baseline cannot be negative"),
+        "{text}"
+    );
+    // The baseline file is untouched.
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+}
+
+#[test]
+fn baseline_raise_with_an_empty_reason_is_refused() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let before = repo.read("ratchet.baseline.json");
+
+    let output = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "todo-markers",
+        "--value",
+        "7",
+        "--reason",
+        "",
+    ]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("refusing: a raise needs a reason"), "{text}");
+    // The baseline file is untouched.
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+}
+
+#[test]
+fn a_deliberate_raise_does_not_excuse_an_unreasoned_raise_of_another_rule() {
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    // The ceiling is raised deliberately; the floor is lowered without a
+    // reason.
+    repo.write(
+        "ratchet.baseline.json",
+        "{\n  \"version\": 1,\n  \"rules\": {\n    \"tests\": { \"value\": 3 },\n    \"todo-markers\": { \"value\": 7, \"reason\": \"the self-update needs two more crates\" }\n  }\n}\n",
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The reason of one rule does not excuse the unreasoned move of the other.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let rules = report["rules"].as_array().expect("an array");
+    let status = |id: &str| -> &str {
+        rules
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .expect("the rule is in the report")["status"]
+            .as_str()
+            .expect("a status")
+    };
+    assert_eq!(status("todo-markers"), "ok");
+    assert_eq!(status("tests"), "baseline-lowered");
+    // The deliberate raise is reported as a note, the other move as a failure.
+    let notes: Vec<&str> = report["notes"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|note| note.as_str().expect("a string"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("todo-markers: the baseline was raised deliberately"),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_deliberate_lowering_does_not_excuse_an_unreasoned_raise_of_another_rule() {
+    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    // The floor is lowered deliberately; the ceiling is raised without a
+    // reason.
+    repo.write(
+        "ratchet.baseline.json",
+        "{\n  \"version\": 1,\n  \"rules\": {\n    \"tests\": { \"value\": 3, \"reason\": \"the floor was written off\" },\n    \"todo-markers\": { \"value\": 7 }\n  }\n}\n",
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The reason of one rule does not excuse the unreasoned move of the other.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let rules = report["rules"].as_array().expect("an array");
+    let status = |id: &str| -> &str {
+        rules
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .expect("the rule is in the report")["status"]
+            .as_str()
+            .expect("a status")
+    };
+    assert_eq!(status("tests"), "ok");
+    assert_eq!(status("todo-markers"), "baseline-raised");
+    // The deliberate move is reported as a note, the other move as a failure.
+    let notes: Vec<&str> = report["notes"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|note| note.as_str().expect("a string"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("tests: the baseline was lowered deliberately"),
+        "{notes:?}"
+    );
+}
