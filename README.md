@@ -59,6 +59,7 @@ ratchet check --tier fast # run the gates of one tier
 ratchet count           # print the current count per rule
 ratchet baseline init   # write the current count as the baseline
 ratchet baseline update # pay a ceiling down / a floor up — in that direction only
+ratchet baseline path   # print the path of the baseline file
 ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
 ratchet drift           # run the drift gates: the generated files
 ratchet update          # update the binary to the newest release
@@ -361,6 +362,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet count` | Prints the current count per rule, without a comparison. |
 | `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. |
 | `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. |
+| `ratchet baseline path` | Prints the **repository-relative path** of the baseline file — the path the binary itself uses, and nothing else. It is the answer to "which file is my baseline?" for a script outside the binary: the resolution lives in one place, and a second implementation answers a different question than the binary. |
 | `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
 | `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
@@ -621,8 +623,8 @@ look for an asset the release does not produce.
 
 | Asset | Name | Used by |
 |---|---|---|
-| The binary | `ratchet-<version>-<os>-<arch>` (`.exe` on windows) | `ratchet update` |
-| The archive | `ratchet-<version>-<os>-<arch>.tar.gz` (`.zip` on windows) | the manual install, the GitHub Action |
+| The binary | `ratchet-<version>-<os>-<arch>` (`.exe` on windows) | `ratchet update`, the GitHub Action |
+| The archive | `ratchet-<version>-<os>-<arch>.tar.gz` (`.zip` on windows) | the manual install |
 
 The platforms are `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
 `macos-aarch64` and `windows-x86_64`. `checksums.txt` covers every asset of
@@ -664,6 +666,162 @@ socket. Every invocation of the binary in the tests carries
 `RATCHET_NO_UPDATE_CHECK=1` — the update check is the only thing that would
 reach the network, and it is off: **the tests never touch the network**, and
 they never write into the cache of the machine that runs them.
+
+## The GitHub Action
+
+This repository carries a **native action** (`action.yml`), so a project that
+uses the gates never downloads a binary itself:
+
+```yaml
+- uses: all-the-rest/ratchet-cli@v1
+  with:
+    mode: validate
+```
+
+The action has **two modes**:
+
+| mode | what it does | when |
+|---|---|---|
+| `validate` | installs the binary and runs `ratchet check`; a failing gate fails the job | every push and every pull request |
+| `update` | installs the binary, runs `ratchet baseline update` and **commits** the changed baseline | only a deliberate, scheduled or manually triggered run |
+
+The update mode is **opt-in**: a bot that moves the baseline silently on every
+push defeats the monotonicity check. It commits the baseline with the reason
+of the run and sets the identity of the commit (`ratchet[bot]`) — it does
+**not** push: the push is the decision of the calling workflow.
+
+The update mode **asks** the binary which file is the baseline
+(`ratchet baseline path`) — it never guesses the path from the config. A
+script that re-implements the resolution answers a different question than
+the binary, and a wrong answer is a commit of the wrong file — or a green run
+that committed nothing at all. It also **refuses a dirty working tree** and a
+**detached HEAD**: with a clean tree on a branch, the file the binary changed
+is the baseline file, and the commit contains it and nothing else.
+
+The action decides nothing else: the rules, the direction and the units stay in
+the project's `ratchet.config.jsonc`; the `tier` input selects the tier of
+the **validate** mode.
+
+### The inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `mode` | `validate` | `validate` or `update`. An unknown mode fails the job. |
+| `version` | `v0.1.0` | The version of the binary the action installs — the tag of the release. |
+| `config` | `ratchet.config.jsonc` | The path of the config, relative to the workspace. |
+| `tier` | *(empty)* | `fast`, `slow`, or empty for every tier. The **validate mode only**: `ratchet baseline update` has no tier selection, so the update mode ignores the input. |
+| `args` | *(empty)* | Extra arguments for `ratchet check`; they are split on whitespace. |
+| `baseline-reason` | *(empty)* | The reason the update mode stores with the baseline move. |
+
+The `baseline-reason` is **required** in the update mode: the baseline move is
+a reviewed artifact, and the reason is what makes it reviewable — it travels
+with the record, so the diff of the baseline file carries it.
+
+### The workflow
+
+The gates only read the repository: the default permission is enough.
+
+```yaml
+# .github/workflows/ratchet.yml
+name: ratchet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: The gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The ratchet gates
+        uses: all-the-rest/ratchet-cli@v1
+        with:
+          mode: validate
+          tier: fast
+```
+
+The update mode **writes**: the workflow has to grant the permission — the
+action cannot grant one.
+
+```yaml
+# .github/workflows/ratchet-baseline.yml
+name: ratchet baseline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  baseline:
+    name: The baseline moves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: The ratchet baseline
+        uses: all-the-rest/ratchet-cli@v1
+        with:
+          mode: update
+          baseline-reason: "the nightly run pays the ceiling down"
+
+      - name: Push the baseline
+        run: git push origin HEAD:${{ github.ref_name }}
+```
+
+### The two version lines
+
+- the **action** is pinned by a tag of this repository (`v1` — a moving major
+  tag, or a concrete tag for a reproducible pin);
+- the **binary** is pinned by the `version` input of the action, and the
+  assets of a release are immutable per tag.
+
+A project therefore pins the action, and the action pins the binary. The two
+lines move independently: a new action can install an old binary, and a new
+binary needs no new action.
+
+The default of the `version` input is the release of this repository. A test
+compares it with the version of `Cargo.toml`: a release has to name its
+version in the action as well, or the action would install a release that
+does not exist.
+
+### The install step
+
+The action installs the **raw binary** of the release
+(`ratchet-<version>-<os>-<arch>`, `.exe` on windows) — not the archive: the
+runner needs no `tar`, no `unzip` and no platform-specific unpack step. The
+platforms are `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
+`macos-aarch64` and `windows-x86_64`; a platform the release does not
+publish fails the step.
+
+The download is **verified**: the SHA-256 of the asset is compared with the
+`checksums.txt` of the release (`sha256sum` on ubuntu, `shasum -a 256` on
+macOS). A missing checksum or a mismatch **fails the step** — nothing is
+installed from an unverified download.
+
+The verification protects against **corruption**, not against a hostile
+origin: the checksum is fetched from the same origin as the asset, so the
+origin is the trust anchor. Only the calling workflow — trusted code — may
+move it (`RATCHET_ASSET_BASE`); a workflow that takes the base from an
+untrusted input has moved the trust anchor itself.
+
+The name of the asset is defined **once**, in the binary, and mirrored in the
+action and in the release workflow. A test substitutes the template of the
+action and compares the result with the function of the binary for every
+platform: a renamed asset fails the test instead of the action.
 
 ## This repo gates itself
 
@@ -769,9 +927,10 @@ What the gates do **not** cover, named here rather than in a footnote:
 
 ## Not implemented yet
 
-`SPEC.md` describes more than this binary does today. The self-update and the
-release workflow exist now, but **no tag was pushed yet**: there is no GitHub
-Release to download, build the binary from source.
+`SPEC.md` describes more than this binary does today. The self-update, the
+release workflow and the GitHub Action exist now, but **no tag was pushed
+yet**: there is no GitHub Release to download and no release for the action
+to install, build the binary from source.
 
 ## Specification
 

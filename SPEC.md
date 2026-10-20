@@ -247,6 +247,7 @@ ratchet [check] [paths…] [options]
 ratchet count [--rule <id>] [--format <stylish|json>]
 ratchet baseline init [--rule <id>] [--reason <text>]
 ratchet baseline update [--rule <id>] [--reason <text>]
+ratchet baseline path
 ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
 ratchet init
@@ -355,6 +356,11 @@ ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 It writes the new value **with the reason** and touches nothing else. A raise
 without a reason is refused like any other forbidden move. `baseline update`
 keeps its shape: it moves only in the allowed direction and refuses the other.
+
+`ratchet baseline path` prints the repository-relative path of the baseline
+file — the path the binary itself uses. It is the answer to the question "which
+file is my baseline?", and it is what a script outside the binary must ask
+instead of re-implementing the config's resolution.
 
 ### 5.6 `init`
 
@@ -561,3 +567,55 @@ generated files, never hand-written text.
 * No rule *functions* in the config — the engine is a runtime-free binary.
 * No automatic fix of violations; `--fix` only regenerates generated files.
 * No automatic baseline change; `baseline update` is always explicit.
+
+## 12. The GitHub Action
+
+A native action in this repository (`action.yml`), usable as
+`uses: all-the-rest/ratchet-cli@v1` in any project.
+
+**Two modes** (the input `mode`):
+
+| mode | what it does | when |
+|---|---|---|
+| `validate` | installs the binary, runs `ratchet check`; a failing gate fails the job | every push and every pull request |
+| `update` | installs the binary, runs `ratchet baseline update` and **commits** the changed baseline | a deliberate, scheduled or manually triggered run |
+
+An unknown mode **fails the job**: a mode that runs neither step would leave
+the job green without having done anything.
+
+**The inputs:** `mode`, `version` (the binary version the action installs),
+`config`, `tier` (the tier of the **validate** mode — `ratchet baseline update`
+has no tier selection, so the update mode ignores it), `args`,
+`baseline-reason`.
+
+**The install:** the **raw binary** asset of the release (no `tar`, no `unzip`,
+no platform-specific unpack step), verified against the release's
+`checksums.txt` — `sha256sum` or `shasum -a 256`, whichever the runner has. A
+missing checksum or a mismatch **fails the step**; nothing is installed from an
+unverified download.
+
+**The naming:** the asset name is defined **once**, in the binary. The action
+and the release workflow mirror it, and a test substitutes their templates and
+compares the result with the binary's function for every platform — a renamed
+asset fails the test instead of the action.
+
+**The update mode** commits the baseline file and nothing else, with the
+identity `ratchet[bot]`, and it **never pushes** — the push is the calling
+workflow's decision. It needs a `baseline-reason` (an empty one fails the step)
+and it moves the baseline only in the declared direction: a deliberate raise
+stays a human decision, because a bot that raises on every push would defeat
+the monotonicity check.
+
+The action **asks the binary** which file is the baseline (`ratchet baseline
+path`) — it never guesses it from the config. A script that re-implements the
+config's resolution answers a different question than the binary, and a wrong
+answer is a commit of the wrong file. The action also **refuses a dirty
+working tree**: with a clean tree, the file the binary changed is the baseline
+file, and the commit contains it and nothing else.
+
+**The permissions** are the workflow's: the action cannot grant them. The
+`validate` mode needs `contents: read`, the `update` mode `contents: write`.
+
+**Two version lines:** the action is pinned by a tag in this repository, the
+binary by the action's `version` input. A project pins the action; the action
+pins the binary — the project never downloads a binary itself.

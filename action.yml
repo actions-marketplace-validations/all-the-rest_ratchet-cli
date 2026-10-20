@@ -1,0 +1,77 @@
+name: ratchet
+description: Run the ratchet gates of a repository — validate them, or move the baseline deliberately.
+author: all-the-rest
+
+branding:
+  icon: check-circle
+  color: orange
+
+inputs:
+  mode:
+    description: 'validate — run the gates, a failing gate fails the job; update — move the baseline and commit it'
+    required: false
+    default: validate
+  version:
+    description: The version of the binary the action installs (the tag of the release).
+    required: false
+    default: v0.1.0
+  config:
+    description: The path of the config, relative to the workspace.
+    required: false
+    default: ratchet.config.jsonc
+  tier:
+    description: 'The tier of the validate mode: fast, slow, or empty for every tier. The update mode ignores it — `ratchet baseline update` has no tier selection.'
+    required: false
+    default: ''
+  args:
+    description: Extra arguments for `ratchet check`; they are split on whitespace.
+    required: false
+    default: ''
+  baseline-reason:
+    description: The reason the update mode stores with the baseline move.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Check the mode
+      # The check is a script and not an `if:` on the step: a composite step
+      # without an `if:` always runs, so the check cannot be switched off.
+      # The mode reaches the shell as an environment variable — an input
+      # that is interpolated into a command can become a command.
+      shell: bash
+      env:
+        RATCHET_MODE: ${{ inputs.mode }}
+      run: bash "${{ github.action_path }}/action/mode.sh"
+
+    - name: Install the binary
+      shell: bash
+      env:
+        RATCHET_VERSION: ${{ inputs.version }}
+      run: bash "${{ github.action_path }}/action/install.sh"
+
+    - name: Validate the gates
+      # The gates of the project: the rules, the direction and the units stay
+      # in its config; the `tier` input selects the tier of this mode.
+      if: inputs.mode == 'validate'
+      shell: bash
+      env:
+        RATCHET_CONFIG: ${{ inputs.config }}
+        RATCHET_TIER: ${{ inputs.tier }}
+        RATCHET_ARGS: ${{ inputs.args }}
+        # A green run never depends on the network.
+        RATCHET_NO_UPDATE_CHECK: '1'
+      run: bash "${{ github.action_path }}/action/validate.sh"
+
+    - name: Update the baseline
+      # The baseline moves in the declared direction only, and the change is
+      # committed — never pushed: that is the decision of the workflow.
+      if: inputs.mode == 'update'
+      shell: bash
+      env:
+        RATCHET_CONFIG: ${{ inputs.config }}
+        RATCHET_REASON: ${{ inputs.baseline-reason }}
+        # A green run never depends on the network.
+        RATCHET_NO_UPDATE_CHECK: '1'
+      run: bash "${{ github.action_path }}/action/update.sh"

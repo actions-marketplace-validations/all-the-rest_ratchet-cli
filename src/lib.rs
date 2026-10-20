@@ -185,6 +185,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
         Command::Baseline(args) => match &args.command {
             BaselineCommand::Init(args) => cmd_baseline(&cli, &cwd, false, args.reason.as_deref()),
             BaselineCommand::Update(args) => cmd_baseline(&cli, &cwd, true, args.reason.as_deref()),
+            BaselineCommand::Path(_) => cmd_baseline_path(&cli, &cwd),
             BaselineCommand::Raise(args) => cmd_baseline_raise(&cli, args, &cwd),
         },
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
@@ -756,6 +757,33 @@ fn print_baseline(
     }
 }
 
+/// The path of the baseline file: the answer to "which file is my baseline?".
+///
+/// The path is the one every other command uses — the config's `baseline`
+/// key, the default next to the config.  The resolution lives in one place
+/// (`load_context`), so a script outside the binary asks instead of
+/// re-implementing it: a second implementation answers a different question
+/// than the binary, and a wrong answer is a commit of the wrong file
+/// (SPEC 5.5).
+///
+/// The path is repository-relative and nothing else is printed: the output is
+/// meant for a shell.
+fn cmd_baseline_path(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+    let Some(relative) = context.baseline_rel.as_deref() else {
+        return Err(Error::new(
+            "the baseline is not inside the repository root — its path cannot be named",
+        ));
+    };
+    if relative.is_empty() {
+        return Err(Error::new(
+            "the baseline is the repository root itself — its path cannot be named",
+        ));
+    }
+    println!("{relative}");
+    Ok(0)
+}
+
 fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     // The same discovery as `check`: a config in a parent directory of the
     // repository must not be shadowed by a second one.
@@ -1231,6 +1259,8 @@ enum BaselineCommand {
     Init(BaselineReasonArgs),
     /// Move the baseline towards the current count, in the allowed direction only.
     Update(BaselineReasonArgs),
+    /// Print the path of the baseline file.
+    Path(BaselinePathArgs),
     /// Move the baseline against its direction, with a reason.
     Raise(BaselineRaiseArgs),
 }
@@ -1242,6 +1272,10 @@ struct BaselineReasonArgs {
     #[arg(long, value_name = "TEXT")]
     reason: Option<String>,
 }
+
+/// The arguments of `baseline path`.
+#[derive(Args, Debug)]
+struct BaselinePathArgs {}
 
 /// The arguments of `baseline raise`.
 #[derive(Args, Debug)]

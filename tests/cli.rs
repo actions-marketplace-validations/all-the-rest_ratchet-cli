@@ -1495,6 +1495,144 @@ fn the_baseline_command_prints_the_path_it_wrote() {
 }
 
 #[test]
+fn baseline_path_names_the_default_baseline() {
+    let repo = Repo::new(ceiling_config(), None);
+
+    let output = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The path and nothing else: the output is meant for a shell.
+    assert_eq!(stdout(&output), "ratchet.baseline.json\n");
+}
+
+#[test]
+fn baseline_path_names_the_baseline_the_config_names() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "name": "test",
+            "baseline": "custom/baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+
+    let output = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(stdout(&output), "custom/baseline.json\n");
+}
+
+#[test]
+fn baseline_path_names_the_file_the_other_commands_write() {
+    // The path is the one of the file the baseline commands write — one
+    // resolution, not two.
+    let repo = Repo::new(
+        r#"[
+          {
+            "name": "test",
+            "baseline": "custom/baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+
+    let path = repo.run(&["baseline", "path"]);
+    let init = repo.run(&["baseline", "init"]);
+
+    assert_eq!(code(&init), 0, "{}", stderr(&init));
+    let named = stdout(&path).trim().to_string();
+    assert_eq!(named, "custom/baseline.json");
+    assert!(
+        repo.path().join(&named).is_file(),
+        "the baseline command wrote the file the path names"
+    );
+}
+
+#[test]
+fn baseline_path_of_a_javascript_config_names_its_baseline() {
+    if !node_available() {
+        eprintln!(
+            "*** SKIPPED: node is not on the PATH — this JavaScript test did NOT run. \
+             Install node (or run the CI, which installs it) to exercise it. ***"
+        );
+        return;
+    }
+    let repo = Repo::plain("", None);
+    std::fs::remove_file(repo.path().join("ratchet.config.jsonc")).expect("the config is removed");
+    repo.write(
+        "ratchet.config.mjs",
+        "export default [\n  {\n    name: \"test\",\n    baseline: \"custom/baseline.json\",\n    rules: {},\n  },\n];\n",
+    );
+
+    let output = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(stdout(&output), "custom/baseline.json\n");
+}
+
+#[test]
+fn baseline_path_without_a_config_exits_two() {
+    let repo = Repo::plain("", None);
+    std::fs::remove_file(repo.path().join("ratchet.config.jsonc")).expect("the config is removed");
+
+    let output = repo.run_without_git(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no config found"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn baseline_path_of_a_broken_config_exits_two() {
+    let repo = Repo::plain("this is not a config", None);
+
+    let output = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("invalid JSON"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn baseline_path_of_a_baseline_outside_the_repository_root_exits_two() {
+    let repo = Repo::plain(r#"[{"baseline": "../outside.json", "rules": {}}]"#, None);
+
+    let output = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("baseline must be inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn baseline_init_does_not_count_the_rules_that_have_a_baseline() {
     // The counter of the rule fails, but the rule has a baseline already: the
     // command must not run the counter.

@@ -168,7 +168,7 @@ CI of its own today.
 **Decision.**
 
 - A **native GitHub Action** in this repo (`action.yml`), usable as
-  `uses: reisi007/ratchet-cli@v1` in any project. Two modes:
+  `uses: all-the-rest/ratchet-cli@v1` in any project. Two modes:
   - **validate** — installs the binary and runs `ratchet check`; a failing
     gate fails the job. This is the commit/PR gate.
   - **update** — runs `ratchet baseline update` and commits the changed
@@ -180,16 +180,15 @@ CI of its own today.
 
 **Open.**
 
-- `action.yml` in this repo, with the install path for the platform binaries.
-  The release assets and their `checksums.txt` are published by the release
-  workflow (`.github/workflows/release.yml`) — but **no tag was pushed yet**,
-  so there is no release to download, and the action depends on one.
-- The workflow that builds and releases the action has to publish it with the
-  binary releases (the release CI in the spec covers the binary; the action
-  needs its own tag or a versioned release). An action tag and a binary tag are
-  two version lines — a project pins the action, not the binary.
-- The two consuming projects need a workflow that calls the action — a
-  project-level task, not a tool task.
+- **No release exists yet.** The action installs the release of its `version`
+  input (`v0.1.0` by default) — but no tag was pushed, so there is nothing to
+  download: the action is untested against a real release. Every release has
+  to name its version in the default of the input (a test compares it with
+  `Cargo.toml`).
+- **The tag of the action** (`v1`) has to be pushed next to the binary tag:
+  two version lines, and a project pins the action, not the binary.
+- The two consuming projects (website, portal) need a workflow that calls the
+  action — a project-level task, not a tool task.
 
 ## Not open here
 
