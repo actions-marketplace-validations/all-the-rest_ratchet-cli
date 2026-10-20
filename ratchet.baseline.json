@@ -2,7 +2,8 @@
   "version": 1,
   "rules": {
     "dependency-count": {
-      "value": 6
+      "value": 8,
+      "reason": "the self-update needs an HTTPS client and a SHA-256 implementation"
     },
     "no-machine-path-in-source": {
       "value": 0

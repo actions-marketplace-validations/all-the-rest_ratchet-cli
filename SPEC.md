@@ -518,10 +518,34 @@ generated files, never hand-written text.
 * `ratchet update` downloads the newest release asset for the platform from the
   GitHub Releases API, verifies the SHA-256 against `checksums.txt`, replaces
   the binary atomically and prints the new version.
+* A release publishes **two** assets per platform: the **archive**
+  (`ratchet-<version>-<os>-<arch>.tar.gz`, `.zip` on windows) for the manual
+  install, and the **raw binary** (`ratchet-<version>-<os>-<arch>`, `.exe` on
+  windows) for the self-update. The self-update takes the binary: unpacking an
+  archive would need an inflate implementation, and the binary has no runtime
+  dependency. Both names come from one stem, and the release workflow and the
+  binary are checked against each other so the two cannot drift.
+* The replacement: on unix the new binary is written next to the old one and
+  **renamed** over it (the running process keeps its inode); on windows a
+  running executable cannot be replaced — the new binary is written next to it
+  and the command says what to do. Doing nothing silently is the worst of the
+  three.
+* A **wrong checksum** refuses the update and leaves the binary untouched.
+* The version comparison is hand-written for `MAJOR.MINOR.PATCH` (a pre-release
+  suffix is ignored, a missing field counts as zero). A malformed version
+  fails closed: the update is refused, nothing is downloaded, nothing is
+  touched.
+* The version comes from the manifest (`Cargo.toml`), never from a string in
+  the code, and the release workflow **checks the tag against the manifest**: a
+  tag `v0.2.0` with a manifest that says `0.1.0` fails the release.
 * An update **check** runs at most once per 24 h. The timestamp lives in
   `$XDG_CACHE_HOME/ratchet/update-check` (fallback `~/.cache/ratchet/update-check`).
-  It is non-blocking, silent on failure, and prints at most one line.
-* Disable with `--no-update-check` or `RATCHET_NO_UPDATE_CHECK=1`.
+  It is **synchronous but bounded** (2 s for the whole request) and it happens
+  at most once a day; it is silent on every failure and it never changes the
+  exit code. "Never blocks" means: it never decides the outcome and it never
+  fails the run.
+* Disable with `--no-update-check` or `RATCHET_NO_UPDATE_CHECK=1`. The CI sets
+  the variable, so the CI runs stay hermetic.
 
 ## 10. Exit codes
 

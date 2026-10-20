@@ -25,8 +25,9 @@ command or a JSON file.
 
 ## Install
 
-There is no release yet — the release workflow is part of a later step. Until
-one exists, build the binary from source and put it on your `PATH`:
+There is no release yet — the release workflow landed with the self-update,
+but no tag was pushed. Until a release exists, build the binary from source
+and put it on your `PATH`:
 
 ```sh
 cargo build --release
@@ -34,8 +35,8 @@ install -m 0755 target/release/ratchet /usr/local/bin/
 ratchet --version
 ```
 
-When a release is published, it will consist of per-OS/arch tarballs with a
-`checksums.txt`; installing it will look like this:
+When a release is published, it consists of per-OS/arch tarballs with a
+`checksums.txt`; installing it looks like this:
 
 ```sh
 tar -xzf ratchet-<version>-<os>-<arch>.tar.gz
@@ -45,8 +46,8 @@ mv ratchet /usr/local/bin/
 
 The intended way to update an installed binary is `ratchet update`: it
 downloads the newest release asset for the platform, verifies the SHA-256
-against `checksums.txt` and replaces the binary. The self-update is not
-implemented in this build yet — until it is, replace the binary by hand.
+against `checksums.txt` and replaces the binary. See
+[the self-update](#the-self-update) below.
 
 ## Usage
 
@@ -60,6 +61,7 @@ ratchet baseline init   # write the current count as the baseline
 ratchet baseline update # pay a ceiling down / a floor up — in that direction only
 ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
 ratchet drift           # run the drift gates: the generated files
+ratchet update          # update the binary to the newest release
 ratchet init            # write a starter config
 ```
 
@@ -361,6 +363,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. |
 | `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
+| `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
 
 ### Options
@@ -376,6 +379,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |
 | `--quiet` | Only print failures. |
+| `--no-update-check` | Do not check for a new version. The same is true for `RATCHET_NO_UPDATE_CHECK=1`. |
 | `--version`, `--help` | |
 
 `baseline init` and `baseline update` accept `--reason <text>`, which is stored
@@ -391,7 +395,7 @@ direction on purpose: a dependency was added with a reason, the debt was
 written off, a floor was lowered because the module it guarded is gone.
 
 ```sh
-ratchet baseline raise --rule dependency-count --value 8 --reason "the self-update needs two crates"
+ratchet baseline raise --rule dependency-count --value 8 --reason "the self-update needs an HTTPS client and a SHA-256 implementation"
 ```
 
 `baseline raise` is that command. It writes the new value **with the reason**
@@ -586,7 +590,80 @@ entry per rule with an `action` (`added`, `kept`, `updated`, `refused`).
 |---|---|
 | `0` | green |
 | `1` | at least one gate failed |
-| `2` | operational error: invalid config, missing config, crashed counter, unreadable file, unknown command or path, a committed baseline that does not parse |
+| `2` | operational error: invalid config, missing config, crashed counter, unreadable file, unknown command or path, a committed baseline that does not parse, a failed self-update |
+
+## The self-update
+
+`ratchet update` replaces the binary with the newest release of this
+repository. It needs no config and no repository: it touches the binary and
+nothing else — never the tree of the project it runs in.
+
+```sh
+ratchet update
+```
+
+The run has four steps:
+
+1. the newest release is resolved through the GitHub API
+   (`/repos/all-the-rest/ratchet-cli/releases/latest`);
+2. its version is compared with the version of the running binary — a release
+   that is not newer is reported and nothing happens;
+3. the asset for the platform is downloaded and its SHA-256 is verified
+   against the `checksums.txt` of the release — **a checksum that does not
+   match refuses the update and leaves the binary untouched**;
+4. the binary is replaced.
+
+### The assets
+
+The names of the assets are defined **once**, in the binary, and mirrored in
+the release workflow. A test compares the two, so the self-update can never
+look for an asset the release does not produce.
+
+| Asset | Name | Used by |
+|---|---|---|
+| The binary | `ratchet-<version>-<os>-<arch>` (`.exe` on windows) | `ratchet update` |
+| The archive | `ratchet-<version>-<os>-<arch>.tar.gz` (`.zip` on windows) | the manual install, the GitHub Action |
+
+The platforms are `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
+`macos-aarch64` and `windows-x86_64`. `checksums.txt` covers every asset of
+the release.
+
+### The replacement
+
+On unix the new binary is written next to the old one and **renamed** over it:
+the running process keeps its inode, the file on disk is the new one. On
+windows a running executable cannot be replaced — the new binary is written
+next to it as `ratchet.exe.new`, and the command says what to do with it.
+
+### The update check
+
+`ratchet check` looks once a day whether there is a newer version, and prints
+one line when there is:
+
+```
+ratchet: note: a new version is available: 0.2.0 — run `ratchet update`
+```
+
+The check is **silent on every failure**: a network problem must never turn a
+green gate red. It runs at most once per 24 h — the timestamp lives in
+`$XDG_CACHE_HOME/ratchet/update-check`, or `~/.cache/ratchet/update-check` —
+and it is disabled with `--no-update-check` or `RATCHET_NO_UPDATE_CHECK=1`.
+The CI sets that variable: a green run never depends on the network.
+
+### The endpoints
+
+| Variable | Meaning |
+|---|---|
+| `RATCHET_UPDATE_API_BASE` | The base of the release API. `https://api.github.com` by default. |
+| `RATCHET_UPDATE_ASSET_BASE` | The base of the release assets. `https://github.com/all-the-rest/ratchet-cli/releases/download` by default. |
+| `RATCHET_UPDATE_TARGET` | The binary that is replaced. The running one by default. |
+| `RATCHET_NO_UPDATE_CHECK` | `1` disables the update check. |
+
+The first three exist so that the tests can serve a fake release from a local
+socket. Every invocation of the binary in the tests carries
+`RATCHET_NO_UPDATE_CHECK=1` — the update check is the only thing that would
+reach the network, and it is off: **the tests never touch the network**, and
+they never write into the cache of the machine that runs them.
 
 ## This repo gates itself
 
@@ -596,7 +673,7 @@ the baselines — the baseline file is written by the tool, never by hand.
 
 | Rule | Class | Unit | Direction | Value today |
 |---|---|---|---|---|
-| `dependency-count` | supply-chain debt | dependency entries | ceiling | 6 |
+| `dependency-count` | supply-chain debt | dependency entries | ceiling | 8 |
 | `no-machine-path-in-source` | a machine-specific path baked into the source | occurrences | ceiling | 0 |
 | `no-panic-in-source` | crash instead of a clean failure | occurrences | ceiling | 0 |
 | `no-unfinished-marker` | unfinished work | occurrences | ceiling | 0 |
@@ -604,9 +681,16 @@ the baselines — the baseline file is written by the tool, never by hand.
 
 Four of the five rules count zero today: they are **boolean gates** — *no
 occurrence may appear* — and their baseline must never move. `dependency-count`
-is the only ratchet: its baseline of 6 dependency entries may only decrease.
+is the only ratchet: its baseline of 8 dependency entries may only decrease.
 `ratchet baseline update` moves it in that direction; `ratchet baseline raise`
 moves it against it — deliberately, with a reason that travels with the record.
+
+The baseline of 8 is itself the record of a deliberate raise: the self-update
+needs an HTTPS client and a SHA-256 implementation, and the reason says so:
+
+```sh
+ratchet baseline raise --rule dependency-count --value 8 --reason "the self-update needs an HTTPS client and a SHA-256 implementation"
+```
 
 The counters live in `scripts/count.sh`, one case per counter name; each one
 prints exactly one integer. They are plain `sh` and the tools every unix has
@@ -673,7 +757,7 @@ What the gates do **not** cover, named here rather than in a footnote:
   print in a path that no test exercises is not caught.
 - **A panic that is not a `panic!`.** The `no-panic-in-source` gate counts
   `panic!` and `unreachable!` only. `unwrap()`, `expect()` and `assert!` are
-  not counted — 65 such occurrences exist in `src/`, all of them inside the
+  not counted — 174 such occurrences exist in `src/`, all of them inside the
   `#[cfg(test)]` modules, while the gate reports 0. A ceiling on them would
   turn every new test red, so the class stays open and is named here.
 - **The integration tests.** The four source counters match every `*.rs` file
@@ -685,10 +769,9 @@ What the gates do **not** cover, named here rather than in a footnote:
 
 ## Not implemented yet
 
-`SPEC.md` describes more than this binary does today. The self-update
-(`ratchet update`) is specified but not implemented, and the release workflow
-does not exist either: there is no GitHub Release to download yet, build the
-binary from source.
+`SPEC.md` describes more than this binary does today. The self-update and the
+release workflow exist now, but **no tag was pushed yet**: there is no GitHub
+Release to download, build the binary from source.
 
 ## Specification
 

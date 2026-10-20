@@ -18,6 +18,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
 
+    env:
+      # The update check asks the release API for the newest version.  The CI
+      # stays hermetic: it does not depend on the network, and a network
+      # problem can never turn a green run red.
+      RATCHET_NO_UPDATE_CHECK: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5

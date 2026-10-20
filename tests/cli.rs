@@ -6,6 +6,17 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The command that runs the binary.
+///
+/// Every invocation of the binary goes through here: the update check needs
+/// the network, and the tests do not — the variable keeps the tests
+/// hermetic and keeps the cache of the machine that runs them untouched.
+fn binary() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratchet"));
+    command.env("RATCHET_NO_UPDATE_CHECK", "1");
+    command
+}
+
 /// A temporary git repository with a config and a baseline.
 struct Repo {
     dir: TempDir,
@@ -77,7 +88,7 @@ impl Repo {
 
     /// Runs the binary in the repository.
     fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ratchet"))
+        binary()
             .args(arguments)
             .current_dir(self.path())
             .output()
@@ -87,7 +98,7 @@ impl Repo {
     /// Runs the binary without a reachable git repository.
     fn run_without_git(&self, arguments: &[&str]) -> Output {
         let ceiling = self.path().parent().expect("a parent directory");
-        Command::new(env!("CARGO_BIN_EXE_ratchet"))
+        binary()
             .args(arguments)
             .current_dir(self.path())
             .env("GIT_CEILING_DIRECTORIES", ceiling)
@@ -498,7 +509,7 @@ fn the_config_is_found_in_a_parent_directory() {
     let nested = repo.path().join("nested/deeper");
     std::fs::create_dir_all(&nested).expect("the directory is created");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    let output = binary()
         .arg("check")
         .current_dir(&nested)
         .output()
@@ -884,7 +895,7 @@ fn a_committed_baseline_that_does_not_parse_exits_two() {
 fn an_unknown_command_or_path_exits_two() {
     let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
 
-    for argument in ["update", "chek", "driftt"] {
+    for argument in ["chek", "driftt"] {
         let output = repo.run(&[argument]);
         assert_eq!(code(&output), 2, "{argument} must not be green");
         let text = stderr(&output);
@@ -915,7 +926,7 @@ fn init_does_not_shadow_a_config_of_a_parent_directory() {
     let nested = repo.path().join("nested/deeper");
     std::fs::create_dir_all(&nested).expect("the directory is created");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    let output = binary()
         .arg("init")
         .current_dir(&nested)
         .output()
@@ -1534,7 +1545,7 @@ fn init_writes_the_config_where_the_discovery_finds_it() {
     let nested = repo.path().join("nested");
     std::fs::create_dir_all(&nested).expect("the directory is created");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    let output = binary()
         .arg("init")
         .current_dir(&nested)
         .output()
@@ -1915,7 +1926,7 @@ fn a_failing_generator_leaves_no_temporary_directory_behind() {
 
     // The engine writes its temporary output into TMPDIR.
     let temporary = tempfile::tempdir().expect("a temporary directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    let output = binary()
         .arg("check")
         .current_dir(repo.path())
         .env("TMPDIR", temporary.path())
@@ -1961,7 +1972,7 @@ fn a_generator_that_writes_nothing_leaves_no_temporary_directory_behind() {
     repo.git(&["commit", "-q", "-m", "generator"]);
 
     let temporary = tempfile::tempdir().expect("a temporary directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    let output = binary()
         .arg("check")
         .current_dir(repo.path())
         .env("TMPDIR", temporary.path())

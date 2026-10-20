@@ -181,8 +181,9 @@ CI of its own today.
 **Open.**
 
 - `action.yml` in this repo, with the install path for the platform binaries.
-  The release assets and their `checksums.txt` **do not exist yet** — they land
-  with the release task, and the action depends on them.
+  The release assets and their `checksums.txt` are published by the release
+  workflow (`.github/workflows/release.yml`) — but **no tag was pushed yet**,
+  so there is no release to download, and the action depends on one.
 - The workflow that builds and releases the action has to publish it with the
   binary releases (the release CI in the spec covers the binary; the action
   needs its own tag or a versioned release). An action tag and a binary tag are

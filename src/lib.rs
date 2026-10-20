@@ -15,6 +15,8 @@ pub mod generate;
 pub mod git;
 pub mod path;
 pub mod report;
+pub mod update;
+pub mod update_check;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -123,6 +125,12 @@ impl From<baseline::BaselineError> for Error {
     }
 }
 
+impl From<update::Error> for Error {
+    fn from(error: update::Error) -> Self {
+        Self::new(error.message())
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::new(error.to_string())
@@ -181,6 +189,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
         },
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
+        Command::Update(args) => cmd_update(&cli, args),
     }
 }
 
@@ -293,8 +302,26 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
         Format::Stylish => print!("{}", report::render_stylish(&report, cli.quiet)),
     }
     print_notes(&report.notes, &report.debug, cli);
+    check_for_a_new_version(cli);
 
     Ok(exit_code(&report))
+}
+
+/// Asks the release API whether there is a newer version.
+///
+/// The check runs at most once a day, it never blocks the gate for longer
+/// than a moment and it never fails it: every error is swallowed and the
+/// gate keeps its verdict (SPEC 9).
+fn check_for_a_new_version(cli: &Cli) {
+    if cli.no_update_check || cli.quiet || update_check::disabled() {
+        return;
+    }
+    let Ok(current) = update::current_version() else {
+        return;
+    };
+    if let Some(message) = update_check::run(&update::api_base(), current) {
+        eprintln!("ratchet: note: {message}");
+    }
 }
 
 /// Runs the drift gates: the generated files and nothing else.
@@ -776,6 +803,50 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     Ok(0)
 }
 
+/// The self-update: the newest release, verified and put in place.
+///
+/// The command needs no config and no repository: it replaces the binary and
+/// touches nothing else (SPEC 9).
+fn cmd_update(_cli: &Cli, _args: &UpdateArgs) -> Result<i32, Error> {
+    let options = update::Options {
+        current: update::current_version()?,
+        api_base: update::api_base(),
+        download_base: update::download_base(),
+        target: update::target_path()?,
+    };
+    let outcome = update::run(&options)?;
+    match outcome {
+        update::Outcome::Current { release } => {
+            println!(
+                "ratchet {} is up to date — the newest release is {release}",
+                options.current
+            );
+        }
+        update::Outcome::Updated { version } => {
+            println!(
+                "ratchet {} → {version} — the binary was replaced",
+                options.current
+            );
+        }
+        update::Outcome::Deferred {
+            version,
+            path,
+            file,
+        } => {
+            println!(
+                "ratchet {} → {version} — a running executable cannot be replaced on windows",
+                options.current
+            );
+            println!("the new binary was written to {}", path.display());
+            println!("move it over {} and start ratchet again", file.display());
+        }
+    }
+    // The binary is up to date now: the check must not announce the version
+    // that was just installed.
+    update_check::mark_checked();
+    Ok(0)
+}
+
 /// Fails when `--rule` names a rule that does not exist.
 fn ensure_rule_exists(config: &Config, rule: Option<&str>) -> Result<(), Error> {
     if let Some(rule) = rule {
@@ -978,7 +1049,7 @@ fn parent_dir(path: &Path) -> PathBuf {
 }
 
 /// The subcommands of the CLI.
-const SUBCOMMANDS: [&str; 5] = ["check", "count", "baseline", "drift", "init"];
+const SUBCOMMANDS: [&str; 6] = ["check", "count", "baseline", "drift", "init", "update"];
 
 /// The options that take a value; the value is not a positional argument.
 const OPTIONS_WITH_VALUE: [&str; 8] = [
@@ -1090,6 +1161,10 @@ struct Cli {
     /// Only print failures.
     #[arg(long, global = true, short = 'q')]
     quiet: bool,
+
+    /// Do not check for a new version.
+    #[arg(long, global = true)]
+    no_update_check: bool,
 }
 
 /// The commands.
@@ -1105,6 +1180,8 @@ enum Command {
     Drift(DriftArgs),
     /// Write a starter config.
     Init(InitArgs),
+    /// Update the binary to the newest release.
+    Update(UpdateArgs),
 }
 
 /// The arguments of `check`.
@@ -1134,6 +1211,10 @@ struct CountArgs {}
 /// The arguments of `init`.
 #[derive(Args, Debug)]
 struct InitArgs {}
+
+/// The arguments of `update`.
+#[derive(Args, Debug)]
+struct UpdateArgs {}
 
 /// The arguments of `baseline`.
 #[derive(Args, Debug)]
