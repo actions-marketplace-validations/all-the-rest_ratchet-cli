@@ -178,16 +178,49 @@ fn run_update(release: &FakeRelease, target: &Path) -> Output {
         .expect("the binary runs")
 }
 
-/// Runs `ratchet check` in the project, with the cache in `cache`.
+/// Runs `ratchet check` in the project, with the update check **enabled**.
+///
+/// The inherited environment is not trusted: the variable that disables the
+/// check is removed from the environment of the child.  A variable that is
+/// set job-wide in the CI is a global switch — it switches off not only the
+/// runs but also the tests that verify the behaviour it switches off, and a
+/// test that needs the behaviour switched on has to be able to lift the
+/// switch for its own process.
 fn run_check(release: &FakeRelease, project: &Path, cache: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ratchet"))
+    check_command(release, project, cache)
+        .env_remove("RATCHET_NO_UPDATE_CHECK")
+        .output()
+        .expect("the binary runs")
+}
+
+/// The command that runs `ratchet check` in the project.
+///
+/// The cache of the update check points into the directory of the test: the
+/// tests never write into the cache of the machine that runs them.
+fn check_command(release: &FakeRelease, project: &Path, cache: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratchet"));
+    command
         .arg("check")
         .current_dir(project)
         .env("RATCHET_UPDATE_API_BASE", &release.api_base)
         .env("RATCHET_UPDATE_ASSET_BASE", &release.download_base)
-        .env("XDG_CACHE_HOME", cache)
-        .output()
-        .expect("the binary runs")
+        .env("XDG_CACHE_HOME", cache);
+    command
+}
+
+/// The line the update check prints.
+const CHECK_LINE: &str = "ratchet: note: a new version is available: 99.0.0 — run `ratchet update`";
+
+/// The lines of a run that belong to the update check.
+///
+/// The engine prints its own notes too — the ones about a missing git
+/// repository, for example.  Only the line of the check is counted.
+fn check_lines(output: &Output) -> Vec<String> {
+    stderr(output)
+        .lines()
+        .filter(|line| line.contains("a new version is available"))
+        .map(|line| line.to_string())
+        .collect()
 }
 
 /// A project with a config and a baseline: the gate runs and is green.
@@ -386,14 +419,11 @@ fn the_update_check_prints_one_line_and_waits_a_day() {
 
     // The gate is green and the check does not change that.
     assert!(first.status.success(), "{}", stderr(&first));
-    let text = stderr(&first);
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| line.contains("a new version is available"))
-        .collect();
-    assert_eq!(lines.len(), 1, "the check prints one line: {text}");
-    assert!(lines[0].contains("99.0.0"), "{text}");
-    assert!(lines[0].contains("ratchet update"), "{text}");
+    // The assertion looks at the line of the check and at nothing else: the
+    // engine prints its own notes — "not a git repository" and the like —
+    // and they are none of the check's business.
+    let lines = check_lines(&first);
+    assert_eq!(lines, vec![CHECK_LINE], "the check prints one line");
     // The state of the check is written.
     assert!(
         cache.join("ratchet").join("update-check").is_file(),
@@ -404,8 +434,8 @@ fn the_update_check_prints_one_line_and_waits_a_day() {
     let second = run_check(&release, directory.path(), &cache);
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(
-        !stderr(&second).contains("a new version is available"),
-        "{}",
+        check_lines(&second).is_empty(),
+        "the check waits a day: {}",
         stderr(&second)
     );
 }
@@ -432,26 +462,50 @@ fn a_failing_update_check_is_silent() {
 }
 
 #[test]
-fn the_update_check_can_be_disabled() {
+fn the_update_check_can_be_disabled_by_the_flag() {
     let newer = Version::parse("99.0.0").expect("the version parses");
     let tag = format!("v{newer}");
     let release = FakeRelease::start(&routes(&tag, &[], ""));
     let directory = project();
     let cache = directory.path().join("cache");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ratchet"))
-        .arg("check")
+    // The flag is what disables the check here: the environment of the
+    // machine that runs the test does not matter.
+    let output = check_command(&release, directory.path(), &cache)
         .arg("--no-update-check")
-        .current_dir(directory.path())
-        .env("RATCHET_UPDATE_API_BASE", &release.api_base)
-        .env("XDG_CACHE_HOME", &cache)
+        .env_remove("RATCHET_NO_UPDATE_CHECK")
         .output()
         .expect("the binary runs");
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        !stderr(&output).contains("a new version is available"),
-        "{}",
+        check_lines(&output).is_empty(),
+        "the check must be silent: {}",
+        stderr(&output)
+    );
+    // The disabled check does not even write its state.
+    assert!(!cache.join("ratchet").join("update-check").exists());
+}
+
+#[test]
+fn the_update_check_can_be_disabled_by_the_environment() {
+    let newer = Version::parse("99.0.0").expect("the version parses");
+    let tag = format!("v{newer}");
+    let release = FakeRelease::start(&routes(&tag, &[], ""));
+    let directory = project();
+    let cache = directory.path().join("cache");
+
+    // The variable is what disables the check here: the environment of the
+    // machine that runs the test does not matter.
+    let output = check_command(&release, directory.path(), &cache)
+        .env("RATCHET_NO_UPDATE_CHECK", "1")
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        check_lines(&output).is_empty(),
+        "the check must be silent: {}",
         stderr(&output)
     );
     // The disabled check does not even write its state.
