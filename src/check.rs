@@ -252,7 +252,7 @@ pub fn check(
         }
         report.executed += 1;
 
-        let run = match counter::run_counter(&rule.count, root) {
+        let run = match counter::run_counter(&rule.count, root, &format!("rules.{id}.count")) {
             Ok(run) => run,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);
@@ -537,7 +537,7 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
             }
         }
         report.executed += 1;
-        let run = match counter::run_counter(&rule.count, root) {
+        let run = match counter::run_counter(&rule.count, root, &format!("rules.{id}.count")) {
             Ok(run) => run,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);

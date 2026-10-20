@@ -155,6 +155,7 @@ Exactly one of:
 { "command": ["node", "scripts/count.mjs", "--json"] }
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites" }
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites", "generate": ["node", "scripts/audit-inventory.mjs"], "output_arg": "--output" }
+{ "registry": "ratchet.findings.json", "severities": ["critical", "high"], "statuses": ["open", "in-progress"] }
 ```
 
 * `command` — an argv array. **No shell** is involved; the arguments are passed
@@ -619,3 +620,87 @@ file, and the commit contains it and nothing else.
 **Two version lines:** the action is pinned by a tag in this repository, the
 binary by the action's `version` input. A project pins the action; the action
 pins the binary — the project never downloads a binary itself.
+
+## 13. The findings registry
+
+A JSON registry in the project: `ratchet.findings.json`.
+
+```json
+{
+  "version": 1,
+  "findings": [
+    {
+      "id": "SEC-01",
+      "title": "org admins reassign foreign users",
+      "severity": "critical",
+      "status": "fixed",
+      "status_since": "2026-10-19",
+      "owner": "…",
+      "ticket": "D-12",
+      "regression_test": "OrgAdminDelegationBoundaryTest",
+      "path": "backend/src/…",
+      "note": "…"
+    }
+  ]
+}
+```
+
+### The fields
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | stable and unique; minted once where the source has none (`UI-001`, …) |
+| `title` | yes | one line |
+| `severity` | yes | one of the canonical levels |
+| `status` | yes | one of the canonical statuses |
+| `status_since` | no | the date the status was reached |
+| `owner` | yes, unless the status is `fixed` | who owns the finding |
+| `ticket` | yes, unless the status is `fixed` | the decision, the review round or the issue that tracks it |
+| `regression_test` | no | the test that proves the fix |
+| `path` | no | where the defect lives — a **pointer** for a reader, not a path the tool reads |
+| `note` | no | free text |
+
+An `owner` and a `ticket` are mandatory for everything that is not `fixed`: a
+closed finding has its commit and its regression test, an open one has nobody
+— a graveyard entry.
+
+### The vocabulary
+
+The levels and the statuses are **not** decided here: they are defined once in
+the `ratchet-gates` skill
+(`~/dev/agents-skills/.agents/skills/ratchet-gates/references/vocabulary.md`):
+
+* the levels `critical`, `high`, `medium`, `low`, `info`;
+* the statuses `open`, `in-progress`, `fixed`, `accepted`, `wontfix`.
+
+An unknown level or status is a **hard error** (exit 2, with the offending
+entry named), never a fallback. A registry that cannot be read is not a gate
+that reports zero findings — it is an error.
+
+### The counting rule
+
+The count is the number of findings whose status **counts**: `open` and
+`in-progress`. `accepted` and `wontfix` do not count but stay visible — a
+decision is not a deletion. `fixed` is resolved.
+
+**Which levels count is named by the rule**, not by the engine:
+
+```jsonc
+"count": { "registry": "ratchet.findings.json", "severities": ["critical", "high"], "statuses": ["open", "in-progress"] }
+```
+
+The rule's lists are **authoritative** when they are present: `statuses` names
+the statuses that count, `severities` the levels that count. Without them, every
+level counts and the counting statuses of the vocabulary count. An empty list is
+a configuration error — a gate that counts nothing is green forever.
+
+A rule with `direction: "ceiling"` and `baseline: 0` **is** the boolean gate
+("no open finding"): the same mechanic, no second kind of gate.
+
+### The registry is a view
+
+The prose document (the security review closure, the UI review log) stays the
+**human record**. The registry is the machine-readable view of it. The two are
+migrated in the same commit and must not disagree about the severity of a
+finding — a status written into the severity field destroys the severity, and
+the migration has to recover it from the row.

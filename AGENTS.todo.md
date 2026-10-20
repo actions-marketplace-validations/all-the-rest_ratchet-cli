@@ -87,10 +87,6 @@ grow?" — the number is not a number anywhere, so it cannot be gated.
 
 **Open.**
 
-- `SPEC.md` gains a section for the findings registry (the file format, the
-  status semantics, the severity set, the interaction with `exclude`).
-- The binary must read the registry as a counter source; the counting itself
-  is a small, well-tested function.
 - Both projects need the migration of their existing findings into the
   registry — a project-level task, not a tool task.
 

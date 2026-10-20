@@ -14,6 +14,7 @@ pub mod drift;
 pub mod generate;
 pub mod git;
 pub mod path;
+pub mod registry;
 pub mod report;
 pub mod update;
 pub mod update_check;
@@ -458,7 +459,8 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
             }
         }
 
-        let run = match counter::run_counter(&rule.count, &context.root) {
+        let counter_path = format!("rules.{id}.count");
+        let run = match counter::run_counter(&rule.count, &context.root, &counter_path) {
             Ok(run) => run,
             Err(error) => {
                 counter_errors += 1;

@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::config::Counter;
 use crate::generate::Generator;
+use crate::registry::{Registry, Severity, Status};
 
 /// The value a counter produced.
 #[derive(Debug, Clone, Default)]
@@ -80,12 +81,15 @@ pub struct CounterRun {
 }
 
 /// Runs the counter and returns its value and the raw output.
-pub fn run_counter(counter: &Counter, root: &Path) -> Result<CounterRun, CounterError> {
+///
+/// `path` is the path of the counter in the config (`rules.a.count`): a
+/// counter that is misconfigured names it.
+pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<CounterRun, CounterError> {
     match counter {
         Counter::Command { command } => run_command(command, root),
         Counter::File {
             file,
-            path,
+            path: json_path,
             generate,
             output_arg,
         } => {
@@ -103,8 +107,19 @@ pub fn run_counter(counter: &Counter, root: &Path) -> Result<CounterRun, Counter
                 }
                 (None, _) => None,
             };
-            run_file(file, path.as_deref(), generator, root)
+            run_file(file, json_path.as_deref(), generator, root)
         }
+        Counter::Registry {
+            registry,
+            severities,
+            statuses,
+        } => run_registry(
+            registry,
+            severities.as_deref(),
+            statuses.as_deref(),
+            root,
+            path,
+        ),
     }
 }
 
@@ -311,6 +326,59 @@ fn run_file(
     })?;
 
     Ok(CounterRun { value, output })
+}
+
+/// Reads a findings registry and counts the findings that count (SPEC 13).
+///
+/// The registry is a counter source like every other artifact: it is read
+/// when the rule runs, and a registry that cannot be read or does not hold
+/// what it must hold is a configuration error — never a gate that reports
+/// zero findings.
+fn run_registry(
+    registry: &str,
+    severities: Option<&[Severity]>,
+    statuses: Option<&[Status]>,
+    root: &Path,
+    path: &str,
+) -> Result<CounterRun, CounterError> {
+    // The registry lives inside the repository root: a path that escapes it
+    // is a configuration error, not a file to read.
+    let full = crate::path::normalize(&root.join(registry));
+    if !full.starts_with(crate::path::normalize(root)) {
+        return Err(CounterError::config(format!(
+            "config error at {path}.registry: {registry} is outside the repository root"
+        )));
+    }
+
+    // Every path in the report is relative to the repository root.
+    let display = crate::path::display(Some(root), &full);
+    // The root itself has no relative name: the configured path names it.
+    let display = if display.is_empty() {
+        registry.to_string()
+    } else {
+        display
+    };
+    let text = fs::read_to_string(&full).map_err(|e| {
+        CounterError::config(format!(
+            "config error at {path}.registry: cannot read {display}: {e}"
+        ))
+    })?;
+
+    let registry = Registry::parse(&text, &display).map_err(|error| {
+        CounterError::config(format!(
+            "config error at {path}.registry: {}",
+            error.message
+        ))
+    })?;
+
+    let count = registry.count(severities, statuses);
+    Ok(CounterRun {
+        value: CounterValue {
+            count: Some(count),
+            items: None,
+        },
+        output: String::new(),
+    })
 }
 
 fn navigate<'a>(value: &'a Value, path: &str) -> Result<&'a Value, String> {

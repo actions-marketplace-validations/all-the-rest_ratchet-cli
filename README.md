@@ -21,7 +21,7 @@ declared direction — or, deliberately and with a reason, against it.
 
 The engine owns the baseline, the direction, the monotonicity and the
 reporting. The project owns the counting: a rule produces its number through a
-command or a JSON file.
+command, a JSON file or a findings registry.
 
 ## Install
 
@@ -179,6 +179,71 @@ fails, produces garbage or a negative number is a counter error.
 
 `exclude` needs a counter that yields items; a scalar counter plus `exclude` is
 a configuration error.
+
+### The findings registry
+
+A **registry** counter reads a findings registry — a JSON file in the project,
+`ratchet.findings.json` — and counts the findings that count:
+
+```jsonc
+"count": {
+  "registry": "ratchet.findings.json",
+  "severities": ["critical", "high"],
+  "statuses": ["open", "in-progress"]
+}
+```
+
+The file itself:
+
+```json
+{
+  "version": 1,
+  "findings": [
+    {
+      "id": "SEC-01",
+      "title": "org admins reassign foreign users",
+      "severity": "critical",
+      "status": "open",
+      "owner": "alice",
+      "ticket": "D-12"
+    },
+    {
+      "id": "SEC-02",
+      "title": "a closed one",
+      "severity": "high",
+      "status": "fixed",
+      "status_since": "2026-10-19",
+      "regression_test": "OrgAdminDelegationBoundaryTest"
+    }
+  ]
+}
+```
+
+* `id` (stable and unique), `title`, `severity` and `status` are required.
+  `status_since`, `owner`, `ticket`, `regression_test`, `path` and `note` are
+  optional — with one exception: **`owner` and `ticket` are mandatory for
+  every finding that is not `fixed`**. A closed finding has its commit and its
+  regression test, an open one has nobody — a graveyard entry.
+* The levels are `critical`, `high`, `medium`, `low` and `info`; the statuses
+  are `open`, `in-progress`, `fixed`, `accepted` and `wontfix`. A level or a
+  status outside these lists is an **error**, never a fallback.
+* The count is the number of the findings whose level is in `severities` —
+  every level counts without the list — and whose status is in `statuses` —
+  without the list the counting statuses, `open` and `in-progress`, count.
+  `accepted` and `wontfix` are decisions: they do not count, but they stay in
+  the file. A decision is not a deletion. `fixed` is resolved.
+* The registry is a counter source like every other artifact: the count comes
+  from the file, the baseline from the baseline file, the direction from the
+  rule. A rule with `direction: "ceiling"` and a baseline of `0` **is** the
+  boolean gate ("no open finding") — the same mechanic, no second kind of
+  gate.
+* A registry that cannot be read, that carries a version other than `1`, that
+  has a missing field, a duplicate `id` or an unknown level or status is a
+  **configuration error** (exit code 2) that names the offending entry. The
+  registry has to live inside the repository root.
+* The registry is a **view** of the prose findings, not a second source of
+  truth: the review log stays the human record, and the two are migrated in
+  the same commit.
 
 ### The globs
 
