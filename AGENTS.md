@@ -52,6 +52,7 @@ committing.
 
 ## Release
 
-`cargo build --release` + the GitHub Actions release workflow (tag `v*`).
-Artifacts are per-OS/arch tarballs with a `checksums.txt`; `ratchet update`
-verifies the checksum before replacing the binary.
+`cargo build --release` today; the GitHub Actions release workflow (tag `v*`)
+lands with a later task. Its artifacts are per-OS/arch tarballs with a
+`checksums.txt`; `ratchet update` verifies the checksum before replacing the
+binary.

@@ -16,7 +16,7 @@ direction, and **drift gates** for generated files.
 |---|---|
 | rule | one gate, one defect class |
 | class | the defect class the rule counts (e.g. *layer violation*) |
-| incident | the concrete past incident that proves the class exists |
+| incident | the incident that motivated the rule (see 3.2) |
 | unit | what one count unit is (e.g. *call sites*) |
 | direction | `ceiling` (count must not exceed the baseline) or `floor` (count must not fall below it) |
 | count | the current measurement |
@@ -39,11 +39,17 @@ lookup (only valid together with an explicit `--config`).
 The baseline path is fixed (`ratchet.baseline.json`, next to the config) unless
 the config sets `"baseline": "<path>"` in a top-level object.
 
+The baseline file must lie **inside the repository root**. A path outside it
+cannot be compared with the committed version, and a baseline that cannot be
+compared is a gate that does not gate. A config that points outside the root is
+a configuration error.
+
 ## 3. Config format
 
 The config is a **flat config** in the ESLint shape: an array of config
 objects. Multiple objects are merged; a later object overrides an earlier one
-for the same rule id.
+for the same rule id. A single config object at the root is accepted as
+shorthand for a one-element array.
 
 ```jsonc
 [
@@ -93,17 +99,25 @@ for the same rule id.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `class` | string | yes | the defect class |
-| `incident` | string | yes | the concrete past incident |
+| `incident` | string | yes | the incident that motivated the rule (see below) |
 | `unit` | string | yes | the count unit |
 | `direction` | `ceiling` \| `floor` | yes | the allowed direction of the baseline |
 | `tier` | `fast` \| `slow` | no (default `fast`) | which tier the rule belongs to |
 | `count` | object | yes | how the count is produced (see 3.4) |
-| `exclude` | string[] | no | glob patterns removed from the counted **items** |
+| `exclude` | string[] | no | glob patterns removed from the counted **items** (path-shaped exemptions only) |
 | `files` | string[] | no | glob scope of the rule; without it the rule always runs |
 | `description` | string | no | free text |
 
 `exclude` requires a counter that yields **items**; a scalar counter plus
 `exclude` is a configuration error.
+
+**The `incident` field.** For a rule whose class has already occurred, the
+incident names that concrete instance — it is what a later reader judges the
+rule against when the count moves. For a **prevention rule** (a class whose
+count is zero today), the incident says so plainly — for example *"prevention:
+no instance in this project yet"* — instead of naming an incident that did not
+happen. A gate that claims a history it does not have is worse than no gate:
+the next reader cannot tell a real regression from a remembered one.
 
 ### 3.3 Tiers
 
@@ -122,12 +136,28 @@ Exactly one of:
 ```jsonc
 { "command": ["node", "scripts/count.mjs", "--json"] }
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites" }
+{ "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites", "generate": ["node", "scripts/audit-inventory.mjs"], "output_arg": "--output" }
 ```
 
 * `command` — an argv array. **No shell** is involved; the arguments are passed
   through verbatim. The working directory is the repository root.
 * `file` — a JSON file, optionally with a dotted `path` into it. Without
   `path` the root value is used.
+* `generate` (only with `file`) — an argv array that regenerates the artifact.
+  The binary runs it **before** reading the count and appends the **temporary
+  output path** to the argv (`output_arg` is mandatory). The tree is never
+  touched, and the count always comes from the freshly generated artifact — a
+  count read from a stale artifact is a gate that lies.
+
+  `generate` without `output_arg` is a configuration error: a generator that
+  cannot write to a given path would have to write into the tree, and the tree
+  is not the engine's to write. The in-place mode exists only for the drift
+  gate (§7), which owns a verified restore.
+
+  Without `generate`, the artifact is read as it is; the project is then
+  responsible for its freshness. `output_arg` without `generate` is a
+  configuration error — a silently ignored argument is a rule that does not do
+  what it says.
 
 The value the counter produces may be:
 
@@ -157,11 +187,20 @@ The file is evaluated by `node`. If `node` is not on `PATH`, the error message
 names the alternative (`ratchet.config.jsonc`). The bridge evaluates the module
 and reads its default export; the result must be JSON-serialisable.
 
+Known limitation: a repository path containing a backslash cannot be loaded
+through the JS bridge (node rejects the percent-encoded backslash in a file
+URL). The failure is closed — the error names the cause. Use
+`ratchet.config.jsonc` in such a checkout.
+
 ### 3.7 Glob patterns
 
-`*` (any run of characters except `/`), `**` (any number of path segments),
+`*` (any run of characters except `/`), `**` (zero or more path segments),
 `?`, and `[...]` classes. Matched against repository-relative paths with `/`
 as the separator.
+
+A pattern that ends in `/**` also matches the directory itself: `src/**`
+matches `src` and everything below it. A scope that selects nothing is a
+failure, not a pass — the rule that would have run is not silently skipped.
 
 ## 4. Baseline file
 
@@ -221,6 +260,13 @@ The default command is `check`.
    * `ceiling` — the baseline must not have **increased** → `baseline-raised`, fail
    * `floor` — the baseline must not have **decreased** → `baseline-lowered`, fail
    * no git, or the file is not in `HEAD` → skipped, reported as a note, not a failure
+   * the committed baseline exists but cannot be parsed → **operational error**
+     (exit 2). A machine-written baseline that does not parse must not silently
+     disable the gate.
+
+   When the monotonicity check fails, it takes precedence over the count
+   comparison in the report: the baseline is the invalid artifact, and the
+   count comparison is reported only as an additional note.
 5. Tiers — `--tier` selects one tier. The number of **executed** checks in the
    selected tier must be ≥ the tier's `floor`, and must be > 0. Zero executed
    checks in the selected tier → fail ("empty selection").
@@ -230,7 +276,8 @@ The default command is `check`.
 `paths…` restrict the run to the rules whose counter is affected by those
 paths. A rule without a path scope always runs. A rule may declare
 `"files": ["src/**"]` to scope it; the rule is skipped when the selected paths
-do not intersect its scope.
+do not intersect its scope. A path that does not exist is an operational error
+(exit 2) — a typo must not silently narrow the run into a green one.
 
 ### 5.3 `count`
 
@@ -271,16 +318,53 @@ See §9.
 ### 6.1 `stylish` (default)
 
 ```
-ratchet — 3 rules, 1 failed
+ratchet — 3 rules, 2 failed
 
-  PASS  unwrapped-action-calls      9 ≤ 11  (call sites)
-  FAIL  unexpected-inner-html       7 > 5   (files)
-  FAIL  missing-baseline            no baseline for module-test-coverage
+  FAIL  missing-baseline              no baseline for module-test-coverage
+  FAIL  unexpected-inner-html         7 > 5  (files)
+  PASS  unwrapped-action-calls        9 ≤ 11  (call sites)
 
-COHERENT — 2 of 3 gates passed
+NOT COHERENT — 2 of 3 gates failed
 ```
 
-### 6.2 `json`
+The rules are sorted by id, the label column is the longest label plus six
+characters plus a two-space separator, and the unit is separated by two spaces.
+The example is the byte-exact output of the binary — the test
+`the_stylish_output_is_the_documented_one` compares the whole stdout against
+it, so the document cannot drift away from the implementation.
+
+Every path in the output is **relative to the repository root**. An absolute
+path, a machine name or a timestamp makes the same tree produce different
+bytes — the determinism rule is not negotiable.
+
+### 6.2 The report and the diagnostic channel
+
+The **report** — the stylish output and the JSON document — contains **only
+ratchet's own words**: a rule id, a status, a count, a baseline, a path
+relative to the repository root, the exit status of a failed subprocess.
+
+The output of a counter, a generator or `node` is **never relayed into the
+report**. A subprocess that prints a timestamp, a hostname or an absolute path
+would make the same tree produce different bytes, and no filter can be relied
+on to catch every form of it.
+
+A failed subprocess is therefore reported as *what* it was — **which rule and
+which exit status** — not as *what it printed*. The command line is **not** part
+of the report: an argument may be an absolute path, and §6.1 requires every path
+in the report to be relative. The argv belongs to the diagnostic channel.
+
+The same separation applies to a counter whose output cannot be parsed: the
+report says that the counter did not print a count; the offending output goes
+to the diagnostic channel.
+
+The **diagnostic channel** is `--debug`: it prints the resolved config, every
+counter invocation and the raw output of every subprocess — including the argv
+and everything a subprocess printed. It is a transcript for one human reading
+one run and is **explicitly exempt from the determinism rule**: two runs with
+`--debug` may differ. Without `--debug`, two runs over the same tree produce
+byte-identical output.
+
+### 6.3 `json`
 
 ```json
 {
@@ -307,6 +391,10 @@ Rule status values: `ok`, `over-baseline`, `under-floor`, `baseline-raised`,
 `baseline-lowered`, `missing-baseline`, `counter-error`.
 Generated status values: `ok`, `drift`, `new`.
 
+A rule entry may carry a `detail` field: the reason for a status that is not
+`ok`. It is absent when there is nothing to say. A machine consumer must be
+able to learn **why** a rule failed without parsing the human output.
+
 ## 7. Drift gates
 
 ```jsonc
@@ -316,9 +404,21 @@ Generated status values: `ok`, `drift`, `new`.
 The generator must be able to write to a **given path**:
 
 * with `output_arg` — the binary appends the temporary output path to the argv.
-* without `output_arg` — the binary snapshots the current file bytes, runs the
-  command (which overwrites the file in place), reads the produced bytes, and
-  **restores the original bytes** afterwards — also when the command fails.
+* without `output_arg` — the generator writes the file in place. The binary
+  then owns a **verified restore**:
+  1. snapshot the original bytes **and the file mode**;
+  2. run the generator;
+  3. read the produced bytes;
+  4. restore: write the snapshot to a **temporary file in the same directory**,
+     give it the original mode, and **rename** it over the target — a rename
+     replaces a symlink instead of writing through it, and it does not need
+     write permission on the target itself;
+  5. **verify** the restore (read the bytes back and compare);
+  6. a directory the generator created and left empty is removed.
+
+  If the restore fails, the run ends with an **operational error** that names
+  the file and says that the working tree was modified. A swallowed restore
+  error is a mutated tree that nobody was told about.
 
 The comparison is against the **committed** file (`git show HEAD:<path>`), not
 against the working-tree copy. The diff is a unified diff (committed →
@@ -338,6 +438,8 @@ fixed. `--fix` touches **only** the generated files, never hand-written text.
 * Committed generated file: `git show HEAD:<path>`.
 * No git, or not a repository → the committed comparisons are skipped, a note
   is printed, the gate still runs.
+* A committed file that exists but cannot be parsed is an **operational error**
+  (exit 2), not a skip — a broken reference must not disable a gate.
 
 ## 9. Self-update
 

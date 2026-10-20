@@ -1,0 +1,26 @@
+[package]
+name = "ratchet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Ratchet gates: a count compared against a baseline that may only move in one declared direction."
+license = "Apache-2.0"
+readme = "README.md"
+
+[lib]
+name = "ratchet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ratchet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+json5 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
