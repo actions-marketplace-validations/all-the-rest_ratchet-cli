@@ -9,6 +9,8 @@ pub mod baseline;
 pub mod check;
 pub mod config;
 pub mod counter;
+pub mod diff;
+pub mod drift;
 pub mod generate;
 pub mod git;
 pub mod path;
@@ -23,7 +25,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::baseline::{Baseline, BaselineRecord};
 use crate::check::{ActionKind, BaselineAction, Report};
-use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction};
+use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Tier};
 use crate::git::Git;
 
 /// The starter config `ratchet init` writes.
@@ -73,6 +75,17 @@ impl Error {
         Self {
             message: message.into(),
             output: None,
+        }
+    }
+
+    /// Creates an error with the raw output of a subprocess.
+    ///
+    /// The output belongs to the diagnostic channel (SPEC 6.2): the report
+    /// carries ratchet's own sentence, never what a subprocess printed.
+    pub fn with_output(message: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            output: Some(output.into()),
         }
     }
 
@@ -165,8 +178,18 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
             BaselineCommand::Init(args) => cmd_baseline(&cli, &cwd, false, args.reason.as_deref()),
             BaselineCommand::Update(args) => cmd_baseline(&cli, &cwd, true, args.reason.as_deref()),
         },
+        Command::Drift(args) => cmd_drift(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
     }
+}
+
+/// Compiles the `--ignore` patterns.
+///
+/// An invalid pattern is an error: a pattern that cannot be compiled would
+/// silently ignore nothing.
+fn compile_ignore(patterns: &[String]) -> Result<Vec<globset::GlobMatcher>, Error> {
+    config::compile_globs(patterns, "ignore")
+        .map_err(|error| Error::new(format!("--ignore: {}", error.message)))
 }
 
 fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
@@ -174,6 +197,23 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
     ensure_rule_exists(&context.config, cli.rule.as_deref())?;
     ensure_paths_exist(&args.paths, cwd, &context.root)?;
     let baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
+    let ignore = compile_ignore(&cli.ignore)?;
+
+    // The drift gates run first: a generator that cannot be run is an
+    // operational error, and the tree has to be whole before a counter reads
+    // it (SPEC 5.2).
+    let drift = drift::run(
+        &context.config,
+        &context.git,
+        &drift::Options {
+            root: &context.root,
+            fix: cli.fix,
+            path: None,
+            // The drift gates are tiered like the rules: a slow generator
+            // does not run in the fast tier (SPEC 7).
+            tier: args.tier,
+        },
+    )?;
 
     let mut notes = Vec::new();
     // A committed baseline that exists but cannot be parsed is an operational
@@ -191,20 +231,32 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
     }
 
     let paths = check::selected_paths(&args.paths, cwd, &context.root);
+    let selection = check::Selection {
+        rule: cli.rule.as_deref(),
+        tier: args.tier,
+        paths: &paths,
+        ignore: &ignore,
+    };
     let mut report = check::check(
         &context.config,
         &baseline,
         committed.as_ref(),
         &context.root,
-        cli.rule.as_deref(),
-        &paths,
+        &selection,
     );
+    report.generated = drift.entries;
     report.notes.extend(notes);
+    report.notes.extend(drift.notes);
+    report.debug.extend(drift.debug);
 
-    if report.executed == 0 {
+    // The floor of every tier that runs is enforced (SPEC 3.3).
+    let tier_notes = check::tier_notes(&context.config, &selection, &report);
+    report.notes.extend(tier_notes.iter().cloned());
+
+    if report.checks() == 0 && tier_notes.is_empty() {
         report
             .notes
-            .push("no rule was executed — an empty selection is never a pass".to_string());
+            .push("no check was executed — an empty selection is never a pass".to_string());
     }
     if report
         .rules
@@ -225,6 +277,12 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
             .push("hint: run with --debug to see the output of the counter".to_string());
     }
 
+    report.ok = report.failed() == 0
+        && report.counter_errors == 0
+        && report.drifted() == 0
+        && report.checks() > 0
+        && tier_notes.is_empty();
+
     if cli.debug {
         report.debug.insert(0, resolved_config(&context.config));
     }
@@ -233,9 +291,69 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
         Format::Json => println!("{}", report::render_json(&report)),
         Format::Stylish => print!("{}", report::render_stylish(&report, cli.quiet)),
     }
-    print_notes(&report, cli);
+    print_notes(&report.notes, &report.debug, cli);
 
     Ok(exit_code(&report))
+}
+
+/// Runs the drift gates: the generated files and nothing else.
+fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+    // `--ignore` applies to the rules' path scope; the drift command has no
+    // rules, so the option has no effect here.  It is still compiled: an
+    // invalid pattern is an error everywhere.
+    let _ignore = compile_ignore(&cli.ignore)?;
+
+    // The selected gate, relative to the repository root.
+    let selected = match &args.path {
+        Some(path) => check::selected_paths(std::slice::from_ref(path), cwd, &context.root)
+            .into_iter()
+            .next(),
+        None => None,
+    };
+
+    let outcome = drift::run(
+        &context.config,
+        &context.git,
+        &drift::Options {
+            root: &context.root,
+            fix: cli.fix,
+            path: selected.as_deref(),
+            // The drift command runs every tier: it has no `--tier`.
+            tier: None,
+        },
+    )?;
+
+    let drifted = outcome.drifted();
+    // An empty selection is never a pass: a drift command without a
+    // generated entry runs no check at all.
+    let ran = !outcome.entries.is_empty();
+    let ok = drifted == 0 && ran;
+
+    let mut debug = outcome.debug;
+    if cli.debug {
+        debug.insert(0, resolved_config(&context.config));
+    }
+    let mut notes = outcome.notes;
+    if !ran {
+        notes.push("no check was executed — an empty selection is never a pass".to_string());
+    }
+
+    match cli.format {
+        Format::Json => {
+            let report = Report {
+                generated: outcome.entries,
+                notes: notes.clone(),
+                ok,
+                ..Report::default()
+            };
+            println!("{}", report::render_json(&report));
+        }
+        Format::Stylish => print!("{}", report::render_drift(&outcome.entries, cli.quiet)),
+    }
+    print_notes(&notes, &debug, cli);
+
+    Ok(if ok { 0 } else { 1 })
 }
 
 /// The resolved config: the first line of the diagnostic channel.
@@ -267,7 +385,7 @@ fn cmd_count(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
         Format::Json => println!("{}", report::render_json(&report)),
         Format::Stylish => print!("{}", report::render_counts(&report)),
     }
-    print_notes(&report, cli);
+    print_notes(&report.notes, &report.debug, cli);
 
     if report.counter_errors > 0 {
         Ok(2)
@@ -661,12 +779,12 @@ fn read_committed_baseline(context: &Context) -> Result<Option<Baseline>, Error>
 }
 
 /// Prints the notes and the debug log to stderr.
-fn print_notes(report: &Report, cli: &Cli) {
-    for note in &report.notes {
+fn print_notes(notes: &[String], debug: &[String], cli: &Cli) {
+    for note in notes {
         eprintln!("ratchet: note: {note}");
     }
     if cli.debug {
-        for line in &report.debug {
+        for line in debug {
             eprintln!("ratchet: debug: {line}");
         }
     }
@@ -704,7 +822,12 @@ fn parent_dir(path: &Path) -> PathBuf {
 }
 
 /// The subcommands of the CLI.
-const SUBCOMMANDS: [&str; 4] = ["check", "count", "baseline", "init"];
+const SUBCOMMANDS: [&str; 5] = ["check", "count", "baseline", "drift", "init"];
+
+/// The options that take a value; the value is not a positional argument.
+const OPTIONS_WITH_VALUE: [&str; 7] = [
+    "config", "format", "rule", "tier", "ignore", "path", "reason",
+];
 
 /// Inserts the default command when the first argument is not a subcommand:
 /// `ratchet src/main.rs` means `ratchet check src/main.rs`.
@@ -751,7 +874,7 @@ fn first_positional(args: &[OsString]) -> Option<usize> {
                 index += 1;
                 continue;
             }
-            if matches!(name, "config" | "format" | "rule") {
+            if OPTIONS_WITH_VALUE.contains(&name) {
                 index += 2;
                 continue;
             }
@@ -796,6 +919,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "ID")]
     rule: Option<String>,
 
+    /// Apply the fixable: regenerate the generated files.
+    #[arg(long, global = true)]
+    fix: bool,
+
+    /// Exclude the paths that match this pattern from the run (repeatable).
+    #[arg(long, global = true, value_name = "PATTERN")]
+    ignore: Vec<String>,
+
     /// Print the resolved config and every counter invocation.
     #[arg(long, global = true)]
     debug: bool,
@@ -814,6 +945,8 @@ enum Command {
     Count(CountArgs),
     /// Read and write the baseline file.
     Baseline(BaselineArgs),
+    /// Run the drift gates: the generated files.
+    Drift(DriftArgs),
     /// Write a starter config.
     Init(InitArgs),
 }
@@ -824,6 +957,18 @@ struct CheckArgs {
     /// Restrict the run to the rules whose scope intersects these paths.
     #[arg(value_name = "PATH")]
     paths: Vec<String>,
+
+    /// Run only the rules of this tier.
+    #[arg(long, value_name = "TIER")]
+    tier: Option<Tier>,
+}
+
+/// The arguments of `drift`.
+#[derive(Args, Debug)]
+struct DriftArgs {
+    /// Run only the drift gate of this generated file.
+    #[arg(long, value_name = "PATH")]
+    path: Option<String>,
 }
 
 /// The arguments of `count`.
@@ -866,6 +1011,22 @@ enum Format {
     Stylish,
     /// Machine readable.
     Json,
+}
+
+/// The tier of a rule, on the command line.
+///
+/// The names are the ones of the config: `fast` and `slow`.
+impl ValueEnum for Tier {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Tier::Fast, Tier::Slow]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Tier::Fast => clap::builder::PossibleValue::new("fast"),
+            Tier::Slow => clap::builder::PossibleValue::new("slow"),
+        })
+    }
 }
 
 #[cfg(test)]

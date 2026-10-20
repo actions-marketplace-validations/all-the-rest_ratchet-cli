@@ -884,7 +884,7 @@ fn a_committed_baseline_that_does_not_parse_exits_two() {
 fn an_unknown_command_or_path_exits_two() {
     let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
 
-    for argument in ["drift", "update", "chek"] {
+    for argument in ["update", "chek", "driftt"] {
         let output = repo.run(&[argument]);
         assert_eq!(code(&output), 2, "{argument} must not be green");
         let text = stderr(&output);
@@ -1691,6 +1691,7 @@ fn the_debug_channel_prints_the_resolved_config_for_every_command() {
         vec!["count", "--debug"],
         vec!["baseline", "init", "--debug"],
         vec!["baseline", "update", "--debug"],
+        vec!["drift", "--debug"],
     ] {
         let output = repo.run(&arguments);
         let text = stderr(&output);
@@ -2434,4 +2435,1481 @@ fn an_empty_class_incident_or_unit_is_a_configuration_error() {
         );
         assert!(text.contains("must not be empty"), "{field}: {text}");
     }
+}
+
+// --- the drift gates ---------------------------------------------------------
+
+/// A config with one generated file and no rule.
+fn generated_config(command: &[&str], output_arg: Option<&str>) -> String {
+    let argv: Vec<String> = command.iter().map(|part| format!("\"{part}\"")).collect();
+    let mut entry = format!(
+        "{{ \"path\": \"docs/generated.md\", \"command\": [{}]",
+        argv.join(", ")
+    );
+    if let Some(output_arg) = output_arg {
+        entry.push_str(&format!(", \"output_arg\": \"{output_arg}\""));
+    }
+    entry.push_str(" }");
+    format!("[{{ \"rules\": {{}}, \"generated\": [{entry}] }}]")
+}
+
+/// The mode of a file in the repository.
+#[cfg(unix)]
+fn mode_of(repo: &Repo, name: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(repo.path().join(name))
+        .expect("the file exists")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// Sets the mode of a file in the repository.
+#[cfg(unix)]
+fn set_mode(repo: &Repo, name: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        repo.path().join(name),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .expect("the mode is set");
+}
+
+#[test]
+fn a_stale_generated_file_fails_with_a_unified_diff() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    // The diff shows the difference between the committed file and the
+    // produced one, with the repository-relative path.
+    assert!(text.contains("docs/generated.md"), "{text}");
+    assert!(text.contains("--- docs/generated.md"), "{text}");
+    assert!(text.contains("+++ docs/generated.md"), "{text}");
+    assert!(text.contains("-stale"), "{text}");
+    assert!(text.contains("+fresh"), "{text}");
+    assert!(text.contains("@@"), "{text}");
+}
+
+#[test]
+fn a_generated_file_in_sync_is_green() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "fresh\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
+#[test]
+fn a_generated_file_that_is_not_committed_is_new_and_not_a_failure() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["summary"]["drifted"], 0);
+    assert_eq!(report["generated"][0]["status"], "new");
+    assert_eq!(report["generated"][0]["path"], "docs/generated.md");
+    assert_eq!(report["generated"][0]["diff"], Value::Null);
+}
+
+#[test]
+fn the_fix_writes_the_generated_file_and_reports_it() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    // The produced content is in the working tree now.
+    assert_eq!(repo.read("docs/generated.md"), "fresh\n");
+    // The gate stays failed: the committed file is still stale (SPEC 7).
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The report says what it did.
+    let text = stdout(&output);
+    assert!(
+        text.contains("the produced content was written to the working tree"),
+        "{text}"
+    );
+    assert!(text.contains("docs/generated.md"), "{text}");
+    // The fix touches the generated file and nothing else.
+    assert_eq!(repo.status(), " M docs/generated.md\n");
+}
+
+#[test]
+fn the_fix_keeps_the_gate_failed_until_the_fix_is_committed() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--fix", "--format", "json"]);
+
+    // The status is still `drift`: the gate measures the committed artifact.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["generated"][0]["status"], "drift");
+    assert_eq!(report["summary"]["drifted"], 1);
+    let detail = report["generated"][0]["detail"]
+        .as_str()
+        .expect("the drift entry has a detail");
+    assert!(detail.contains("working tree"), "{detail}");
+    assert!(detail.contains("commit"), "{detail}");
+
+    // Once the fix is committed, the gate is green.
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "fixed"]);
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["generated"][0]["status"], "ok");
+    assert_eq!(report["summary"]["drifted"], 0);
+    assert_eq!(report["ok"], true);
+}
+
+#[test]
+fn the_fix_does_not_touch_hand_written_text() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.write("docs/hand-written.md", "mine\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    // The gate stays failed until the fix is committed.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert_eq!(repo.read("docs/hand-written.md"), "mine\n");
+    assert_eq!(repo.status(), " M docs/generated.md\n");
+}
+
+#[test]
+fn a_drift_run_leaves_the_tree_unchanged() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The tree is unchanged: the generator wrote to a temporary path.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/generated.md"), "stale\n");
+}
+
+#[test]
+fn the_in_place_generator_leaves_the_tree_byte_and_mode_identical() {
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    // The generator replaces the file — with a different mode.
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'produced\\n' > docs/generated.md\nchmod 700 docs/generated.md\n",
+    );
+    repo.write("docs/generated.md", "original\n");
+    #[cfg(unix)]
+    set_mode(&repo, "docs/generated.md", 0o644);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The engine restored the file: byte- and mode-identical.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/generated.md"), "original\n");
+    #[cfg(unix)]
+    assert_eq!(mode_of(&repo, "docs/generated.md"), 0o644);
+}
+
+#[test]
+fn an_in_place_generator_that_fails_halfway_leaves_the_tree_unchanged() {
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    // The generator writes the file and then fails.
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'broken\\n' > docs/generated.md\nexit 3\n",
+    );
+    repo.write("docs/generated.md", "original\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    // A generator that could not be run is an operational error.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("exited with status 3"),
+        "{}",
+        stderr(&output)
+    );
+    // The tree is unchanged nevertheless: the restore happens anyway.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/generated.md"), "original\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_generated_file_is_not_written_through() {
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'produced\\n' > docs/generated.md\n",
+    );
+    repo.write("docs/real.md", "original\n");
+    std::os::unix::fs::symlink("real.md", repo.path().join("docs/generated.md"))
+        .expect("the link is created");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "symlink"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The committed content of the file behind the link is not what the
+    // generator produces: the gate fails.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The file behind the link keeps its content: the engine never writes
+    // through a symbolic link.
+    assert_eq!(repo.read("docs/real.md"), "original\n");
+    // The link is still a link.
+    let metadata =
+        std::fs::symlink_metadata(repo.path().join("docs/generated.md")).expect("the link exists");
+    assert!(metadata.file_type().is_symlink());
+    // And the tree is unchanged.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+}
+
+#[test]
+fn a_generator_that_cannot_be_started_is_an_operational_error() {
+    let repo = Repo::new(
+        &generated_config(&["ratchet-generator-that-does-not-exist"], Some("--output")),
+        None,
+    );
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the generator for docs/generated.md could not be started"),
+        "{text}"
+    );
+    assert_deterministic(&text);
+}
+
+#[test]
+fn the_drift_gates_run_as_part_of_the_check() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": {
+            "class": "c",
+            "incident": "i",
+            "unit": "u",
+            "direction": "ceiling",
+            "count": { "command": ["echo", "1"] }
+          }
+        },
+        "generated": [
+          { "path": "docs/generated.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The rule passed, the generated file drifted.
+    assert_eq!(report["rules"][0]["status"], "ok");
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["summary"]["drifted"], 1);
+    assert_eq!(report["generated"][0]["status"], "drift");
+    assert_eq!(report["ok"], false);
+}
+
+#[test]
+fn two_drift_runs_produce_the_same_bytes() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let first = repo.run(&["drift"]);
+    let second = repo.run(&["drift"]);
+
+    assert_eq!(code(&first), 1, "{}", stderr(&first));
+    assert_eq!(stdout(&first), stdout(&second));
+    assert_eq!(stderr(&first), stderr(&second));
+    let text = format!("{}{}", stdout(&first), stderr(&first));
+    assert_deterministic(&text);
+}
+
+#[test]
+fn the_drift_command_selects_one_generated_file() {
+    let config = r#"[
+      {
+        "rules": {},
+        "generated": [
+          { "path": "docs/a.md", "command": ["sh", "generate.sh"], "output_arg": "--output" },
+          { "path": "docs/b.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/a.md", "stale\n");
+    repo.write("docs/b.md", "fresh\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--path", "docs/b.md"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("docs/b.md"), "{text}");
+    assert!(!text.contains("docs/a.md"), "{text}");
+}
+
+#[test]
+fn a_drift_path_without_a_gate_is_an_operational_error() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--path", "docs/typo.md"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no drift gate for docs/typo.md"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+// --- the tiers ---------------------------------------------------------------
+
+/// A config with two fast rules and one slow rule.
+fn tier_config(fast_floor: i64) -> String {
+    format!(
+        r#"[
+          {{
+            "tiers": {{ "fast": {{ "floor": {fast_floor} }}, "slow": {{ "floor": 1 }} }},
+            "rules": {{
+              "a": {{ "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                      "tier": "fast", "count": {{ "command": ["echo", "1"] }} }},
+              "b": {{ "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                      "tier": "fast", "count": {{ "command": ["echo", "1"] }} }},
+              "c": {{ "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                      "tier": "slow", "count": {{ "command": ["echo", "1"] }} }}
+            }}
+          }}
+        ]"#
+    )
+}
+
+/// A baseline with three records.
+fn three_baselines() -> String {
+    "{\n  \"version\": 1,\n  \"rules\": {\n    \"a\": { \"value\": 3 },\n    \"b\": { \"value\": 3 },\n    \"c\": { \"value\": 3 }\n  }\n}\n".to_string()
+}
+
+#[test]
+fn the_tier_selects_the_rules_of_that_tier() {
+    let repo = Repo::new(&tier_config(2), Some(&three_baselines()));
+
+    let output = repo.run(&["check", "--tier", "fast", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["rules"], 2);
+    assert_eq!(report["summary"]["executed"], 2);
+    let ids: Vec<&str> = report["rules"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|rule| rule["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(ids, vec!["a", "b"]);
+}
+
+#[test]
+fn the_slow_tier_selects_the_slow_rules() {
+    let repo = Repo::new(&tier_config(2), Some(&three_baselines()));
+
+    let output = repo.run(&["check", "--tier", "slow", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["rules"], 1);
+    assert_eq!(report["rules"][0]["id"], "c");
+}
+
+#[test]
+fn a_tier_below_its_floor_fails() {
+    // The floor of the fast tier is five, the tier has two rules.
+    let repo = Repo::new(&tier_config(5), Some(&three_baselines()));
+
+    let output = repo.run(&["check", "--tier", "fast"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the tier `fast`"), "{text}");
+    assert!(text.contains("the floor is 5"), "{text}");
+}
+
+#[test]
+fn an_empty_tier_selection_fails_with_a_note_naming_the_tier() {
+    let config = r#"[
+      {
+        "tiers": { "slow": { "floor": 1 } },
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "tier": "fast", "count": { "command": ["echo", "1"] } }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+
+    let output = repo.run(&["check", "--tier", "slow"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the tier `slow`"), "{text}");
+    assert!(text.contains("empty selection"), "{text}");
+    assert!(!stdout(&output).contains("PASS"), "{}", stdout(&output));
+}
+
+#[test]
+fn a_check_that_ran_and_failed_counts_as_executed() {
+    // The counter of the rule fails: the check ran, so the floor is reached.
+    let config = r#"[
+      {
+        "tiers": { "fast": { "floor": 1 } },
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "tier": "fast", "count": { "command": ["false"] } }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+
+    let output = repo.run(&["check", "--tier", "fast"]);
+
+    // The counter error is an operational error, not a floor failure.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("the counter exited with status 1"),
+        "{}",
+        stdout(&output)
+    );
+    // The check ran, so the floor of one is reached.
+    assert!(
+        !stderr(&output).contains("the floor is"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+// --- the path exclusion ------------------------------------------------------
+
+#[test]
+fn the_ignore_patterns_do_not_turn_a_failing_gate_green() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "count": { "command": ["echo", "2"] },
+                 "files": ["src/**"] }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 1)));
+    repo.write("src/main.rs", "fn main() {}");
+    repo.write("src/generated/out.rs", "generated");
+
+    let output = repo.run(&["check", "src/"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+
+    // Ignoring one path of the scope does not turn the gate green: the rule
+    // still runs on the rest.
+    let output = repo.run(&["check", "src/", "--ignore", "src/generated/**"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(stdout(&output).contains("2 > 1"), "{}", stdout(&output));
+}
+
+#[test]
+fn a_rule_whose_whole_scope_is_ignored_is_skipped() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "count": { "command": ["echo", "2"] },
+                 "files": ["src/generated/**"] }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 1)));
+    repo.write("src/generated/out.rs", "generated");
+
+    let output = repo.run(&["check", "--ignore", "src/generated/**"]);
+
+    // The rule is skipped: nothing is left to run on.  An empty selection is
+    // never a pass.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(!stdout(&output).contains("PASS"), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("empty selection"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn an_ignored_path_of_the_selection_leaves_nothing_to_run_on() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "count": { "command": ["echo", "2"] },
+                 "files": ["src/**"] }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 1)));
+    repo.write("src/main.rs", "fn main() {}");
+
+    let output = repo.run(&["check", "src/", "--ignore", "src/**"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(!stdout(&output).contains("PASS"), "{}", stdout(&output));
+}
+
+#[test]
+fn an_invalid_ignore_pattern_exits_two() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+
+    let output = repo.run(&["check", "--ignore", "src/["]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(stderr(&output).contains("--ignore"), "{}", stderr(&output));
+}
+
+#[test]
+fn the_diagnostic_channel_shows_the_argv_of_the_drift_generator() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--debug"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stderr(&output);
+    // The argv that was really executed — the output path included.
+    assert!(text.contains("sh generate.sh --output"), "{text}");
+    // And the resolved config.
+    assert!(text.contains("resolved config"), "{text}");
+}
+
+#[test]
+fn a_drift_generator_does_not_relay_its_output() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    // The generator prints the absolute path it was given.
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\necho \"cannot write to $2\" >&2\nexit 3\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    // The report carries ratchet's own words, never the output of the
+    // generator (SPEC 6.2).
+    assert!(!text.contains("cannot write to"), "{text}");
+    assert!(text.contains("exited with status 3"), "{text}");
+    assert_deterministic(&text);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failing_restore_is_an_operational_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'produced\\n' > docs/generated.md\n",
+    );
+    repo.write("docs/generated.md", "original\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // The directory of the generated file cannot be written: the restore
+    // cannot create its temporary file.
+    let directory = repo.path().join("docs");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made read-only");
+    let output = repo.run(&["drift"]);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    // The error names the file and says that the tree was modified.
+    assert!(
+        text.contains("the restore of docs/generated.md failed"),
+        "{text}"
+    );
+    assert!(text.contains("the working tree was modified"), "{text}");
+}
+
+#[test]
+fn the_fix_writes_a_generated_file_that_is_not_committed_yet() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The file is in the tree now and can be committed.
+    assert_eq!(repo.read("docs/generated.md"), "fresh\n");
+    assert!(repo.status().contains("docs"), "{}", repo.status());
+
+    // The status of a file that is not committed is `new` — not a failure.
+    let output = repo.run(&["drift", "--format", "json"]);
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["generated"][0]["status"], "new");
+}
+
+#[test]
+fn the_quiet_flag_prints_only_the_drift_failures() {
+    let config = r#"[
+      {
+        "rules": {},
+        "generated": [
+          { "path": "docs/a.md", "command": ["sh", "generate.sh"], "output_arg": "--output" },
+          { "path": "docs/b.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/a.md", "stale\n");
+    repo.write("docs/b.md", "fresh\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--quiet"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("docs/a.md"), "{text}");
+    assert!(!text.contains("docs/b.md"), "{text}");
+    assert!(!text.contains("ratchet —"), "{text}");
+}
+
+#[test]
+fn the_check_can_fix_the_generated_files() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": {
+            "class": "c",
+            "incident": "i",
+            "unit": "u",
+            "direction": "ceiling",
+            "count": { "command": ["echo", "1"] }
+          }
+        },
+        "generated": [
+          { "path": "docs/generated.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["check", "--fix"]);
+
+    // The drift gate stays failed: the committed file is still stale.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert_eq!(repo.read("docs/generated.md"), "fresh\n");
+    assert_eq!(repo.status(), " M docs/generated.md\n");
+}
+
+#[test]
+fn a_generated_file_outside_the_repository_root_is_an_operational_error() {
+    let config = r#"[
+      {
+        "rules": {},
+        "generated": [
+          { "path": "../outside.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must lie inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+// --- the fix round -----------------------------------------------------------
+
+#[test]
+fn a_slow_generated_file_is_skipped_in_the_fast_tier() {
+    let config = r#"[
+      {
+        "tiers": { "fast": { "floor": 1 } },
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "tier": "fast", "count": { "command": ["echo", "1"] } }
+        },
+        "generated": [
+          { "path": "docs/slow.md", "command": ["sh", "slow.sh"], "output_arg": "--output", "tier": "slow" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("slow.sh", "#!/bin/sh\nprintf 'slow\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    // The fast tier skips the slow generator: a fast tier that waits for a
+    // slow generator is not fast.
+    let output = repo.run(&["check", "--tier", "fast", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["generated"], 0);
+    // The note says why the gate did not run.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str()
+                .unwrap_or_default()
+                .contains("the drift gate docs/slow.md is skipped")
+        }),
+        "{notes:?}"
+    );
+
+    // Without `--tier` the slow generator runs.
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["generated"][0]["path"], "docs/slow.md");
+}
+
+#[test]
+fn a_generated_file_without_a_tier_is_a_fast_one() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "tier": "fast", "count": { "command": ["echo", "1"] } }
+        },
+        "generated": [
+          { "path": "docs/fast.md", "command": ["sh", "fast.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("fast.sh", "#!/bin/sh\nprintf 'fast\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    // The entry has no tier: it is a fast one and runs in the fast tier.
+    let output = repo.run(&["check", "--tier", "fast", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["generated"], 1);
+}
+
+#[test]
+fn the_ignore_patterns_do_not_exclude_a_drift_gate() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "count": { "command": ["echo", "1"] } }
+        },
+        "generated": [
+          { "path": "docs/generated.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // The pattern matches the generated file — and the drift gate runs anyway:
+    // a generated file is registered deliberately.
+    let output = repo.run(&["check", "--ignore", "docs/**", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["summary"]["drifted"], 1);
+    assert_eq!(report["generated"][0]["status"], "drift");
+}
+
+#[test]
+fn without_a_tier_the_floor_of_every_declared_tier_applies() {
+    // The floor of the fast tier is five, the tier has two rules.
+    let repo = Repo::new(&tier_config(5), Some(&three_baselines()));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The JSON says why the run is not green.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        notes.iter().any(|note| {
+            let note = note.as_str().unwrap_or_default();
+            note.contains("the tier `fast`") && note.contains("the floor is 5")
+        }),
+        "{notes:?}"
+    );
+    // The same note is on stderr.
+    assert!(
+        stderr(&output).contains("the floor is 5"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_declared_tier_without_a_rule_is_the_empty_selection() {
+    let config = r#"[
+      {
+        "tiers": { "slow": { "floor": 1 } },
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "tier": "fast", "count": { "command": ["echo", "1"] } }
+        }
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+
+    // The slow tier is declared and has no rule: it is the empty selection
+    // and fails, even though the fast tier is green.
+    let output = repo.run(&["check"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the tier `slow`"), "{text}");
+    assert!(text.contains("empty selection"), "{text}");
+}
+
+#[test]
+fn the_json_report_carries_the_notes() {
+    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The array is there — and empty when there is nothing to say.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[test]
+fn the_json_report_carries_the_notes_of_a_failing_run() {
+    let repo = Repo::new(ceiling_config(), None);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap_or_default().contains("baseline init")),
+        "{notes:?}"
+    );
+}
+
+// --- the floor counts the drift gates too ------------------------------------
+
+/// A config with one fast rule, one fast generator and one slow generator.
+fn tier_with_generators_config(fast_floor: i64, slow_floor: i64) -> String {
+    format!(
+        r#"[
+          {{
+            "tiers": {{ "fast": {{ "floor": {fast_floor} }}, "slow": {{ "floor": {slow_floor} }} }},
+            "rules": {{
+              "a": {{ "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                      "tier": "fast", "count": {{ "command": ["echo", "1"] }} }}
+            }},
+            "generated": [
+              {{ "path": "docs/fast.md", "command": ["sh", "fast.sh"], "output_arg": "--output" }},
+              {{ "path": "docs/slow.md", "command": ["sh", "slow.sh"], "output_arg": "--output", "tier": "slow" }}
+            ]
+          }}
+        ]"#
+    )
+}
+
+/// A repository with the two generators of the config above.
+fn repo_with_generators(config: &str) -> Repo {
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("fast.sh", "#!/bin/sh\nprintf 'fast\\n' > \"$2\"\n");
+    repo.write("slow.sh", "#!/bin/sh\nprintf 'slow\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generators"]);
+    repo
+}
+
+#[test]
+fn a_drift_gate_counts_as_a_check_of_its_tier() {
+    // One rule and one fast generator: two checks, and the floor is two.
+    let repo = repo_with_generators(&tier_with_generators_config(2, 1));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The floor is met: no note says otherwise.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[test]
+fn the_floor_counts_the_drift_gates_beyond_the_rules() {
+    // One rule and one fast generator: two checks, and the floor is three.
+    let repo = repo_with_generators(&tier_with_generators_config(3, 1));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The note names the tier and the floor — and the number it counted.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        notes.iter().any(|note| {
+            let note = note.as_str().unwrap_or_default();
+            note.contains("the tier `fast`") && note.contains("the floor is 3")
+        }),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap_or_default()
+            .contains("executed 2 check")),
+        "{notes:?}"
+    );
+    // The same note is on stderr.
+    assert!(
+        stderr(&output).contains("the floor is 3"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_slow_generator_counts_towards_the_slow_tier_only() {
+    // The fast floor is three: the rule and the fast generator are two, and
+    // the slow generator is skipped in the fast tier.
+    let repo = repo_with_generators(&tier_with_generators_config(3, 1));
+
+    let output = repo.run(&["check", "--tier", "fast", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    // The fast tier is short of its floor: the slow generator does not count.
+    assert!(
+        notes.iter().any(|note| {
+            let note = note.as_str().unwrap_or_default();
+            note.contains("the tier `fast`") && note.contains("the floor is 3")
+        }),
+        "{notes:?}"
+    );
+
+    // Without `--tier` the slow generator runs — and counts towards the slow
+    // tier, whose floor of one is met.
+    let output = repo.run(&["check", "--format", "json"]);
+
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        !notes.iter().any(|note| note
+            .as_str()
+            .unwrap_or_default()
+            .contains("the tier `slow`")),
+        "{notes:?}"
+    );
+    // The fast tier is still short of its floor: two checks, not three.
+    assert!(
+        notes.iter().any(|note| {
+            let note = note.as_str().unwrap_or_default();
+            note.contains("the tier `fast`") && note.contains("executed 2 check")
+        }),
+        "{notes:?}"
+    );
+}
+
+// --- the findings of the verification round ----------------------------------
+
+/// True when `patch` is on the PATH.
+fn patch_available() -> bool {
+    Command::new("patch")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// The object a committed path points at.
+fn head_object(repo: &Repo, path: &str) -> String {
+    let output = Command::new("git")
+        .args(["ls-tree", "HEAD", "--", path])
+        .current_dir(repo.path())
+        .output()
+        .expect("git runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .nth(2)
+        .expect("the tree entry has an object")
+        .to_string()
+}
+
+/// Removes the loose object of a committed path.
+fn remove_loose_object(repo: &Repo, path: &str) {
+    let sha = head_object(repo, path);
+    let object = repo
+        .path()
+        .join(".git/objects")
+        .join(&sha[..2])
+        .join(&sha[2..]);
+    std::fs::remove_file(&object).expect("the loose object is removed");
+}
+
+#[test]
+fn a_committed_file_that_cannot_be_read_is_an_operational_error() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // The file is in the committed tree, but its blob is gone: a partial
+    // clone or a damaged repository.
+    remove_loose_object(&repo, "docs/generated.md");
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    // The gate does not go green: a broken reference must not disable it.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the committed file docs/generated.md cannot be read"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_directory_in_the_committed_tree_is_an_operational_error() {
+    let config = r#"[
+      {
+        "rules": {},
+        "generated": [
+          { "path": "docs", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/inner.md", "inner\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the committed path docs is a directory, not a file"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_difference_that_is_only_the_trailing_newline_is_shown() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    // The generator produces the same lines — without the newline at the end.
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'one\\ntwo' > \"$2\"\n");
+    repo.write("docs/generated.md", "one\ntwo\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    // The gate fails: the files differ.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let diff = report["generated"][0]["diff"]
+        .as_str()
+        .expect("the drift entry has a diff");
+    // The difference shows up: the marker stands behind the line it describes.
+    assert!(diff.contains("\\ No newline at end of file"), "{diff}");
+    assert!(diff.contains("-two"), "{diff}");
+    assert!(diff.contains("+two"), "{diff}");
+    assert!(diff.contains("@@"), "{diff}");
+}
+
+#[test]
+fn the_diff_is_a_patch_that_patch_accepts() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'one\\ntwo' > \"$2\"\n");
+    repo.write("docs/generated.md", "one\ntwo\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift", "--format", "json"]);
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let diff = report["generated"][0]["diff"]
+        .as_str()
+        .expect("the drift entry has a diff");
+
+    if !patch_available() {
+        eprintln!(
+            "*** SKIPPED: patch is not on the PATH — this test did NOT check that the \
+             diff is a patch that patch(1) accepts. ***"
+        );
+        return;
+    }
+
+    // The diff is a patch: patch(1) applies it to the committed file.
+    let patch_file = repo.path().join("the.patch");
+    std::fs::write(&patch_file, diff).expect("the patch is written");
+    let status = Command::new("patch")
+        .args(["-p0", "-s", "-i", "the.patch"])
+        .current_dir(repo.path())
+        .status()
+        .expect("patch runs");
+    assert!(status.success(), "patch rejected the diff:\n{diff}");
+
+    // The file carries the produced content now.
+    assert_eq!(
+        std::fs::read(repo.path().join("docs/generated.md")).expect("the file is readable"),
+        b"one\ntwo"
+    );
+}
+
+#[test]
+fn a_project_whose_only_gate_is_a_drift_gate_is_green() {
+    let config = r#"[
+      {
+        "tiers": { "fast": { "floor": 1 } },
+        "rules": {},
+        "generated": [
+          { "path": "docs/generated.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "fresh\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["summary"]["generated"], 1);
+    // The summary counts the drift gate as an executed check.
+    assert_eq!(report["summary"]["executed"], 1);
+    // And the floor of the tier is met by the drift gate alone.
+    let notes = report["notes"].as_array().expect("the notes are an array");
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.as_str().unwrap_or_default().contains("the tier")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_drift_command_without_a_generated_entry_fails() {
+    let repo = Repo::new("[]", None);
+
+    let output = repo.run(&["drift"]);
+
+    // An empty selection is never a pass.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("empty selection"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_generator_that_writes_nothing_is_an_operational_error() {
+    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    // The generator succeeds and leaves the file alone.
+    repo.write("generate.sh", "#!/bin/sh\nexit 0\n");
+    repo.write("docs/generated.md", "original\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the generator for docs/generated.md produced nothing"),
+        "{text}"
+    );
+    // The tree is unchanged nevertheless.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/generated.md"), "original\n");
+}
+
+#[test]
+fn the_summary_counts_the_drift_gates_as_executed_checks() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": { "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                 "count": { "command": ["echo", "1"] } }
+        },
+        "generated": [
+          { "path": "docs/a.md", "command": ["sh", "generate.sh"], "output_arg": "--output" },
+          { "path": "docs/b.md", "command": ["sh", "generate.sh"], "output_arg": "--output" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // One rule and two drift gates: three executed checks.
+    assert_eq!(report["summary"]["rules"], 1);
+    assert_eq!(report["summary"]["generated"], 2);
+    assert_eq!(report["summary"]["executed"], 3);
+}
+
+// --- the damaged repository --------------------------------------------------
+
+/// The commit the repository is at.
+fn head_commit(repo: &Repo) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Removes the loose object with the given name.
+fn remove_loose(repo: &Repo, sha: &str) {
+    let object = repo
+        .path()
+        .join(".git/objects")
+        .join(&sha[..2])
+        .join(&sha[2..]);
+    std::fs::remove_file(&object).expect("the loose object is removed");
+}
+
+#[test]
+fn a_damaged_repository_is_an_operational_error() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // The commit object is gone: HEAD cannot be resolved, and the ref that
+    // names it is still there.  The repository is damaged, not empty.
+    let commit = head_commit(&repo);
+    remove_loose(&repo, &commit);
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    // The gate does not go green.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the committed file docs/generated.md cannot be read"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_unborn_head_has_nothing_committed_yet() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // HEAD points at a branch that has no commit yet, while another branch
+    // does: the decision is made on the ref HEAD points to, and that ref
+    // does not exist — nothing is committed on it.
+    repo.git(&["checkout", "--orphan", "feature"]);
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["generated"][0]["status"], "new");
+    assert_eq!(report["ok"], true);
+}
+
+#[test]
+fn a_detached_head_with_a_broken_commit_is_an_operational_error() {
+    let repo = Repo::new(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generated"]);
+
+    // A detached HEAD points at a commit: the commit object is gone.
+    repo.git(&["checkout", "--detach", "HEAD"]);
+    let commit = head_commit(&repo);
+    remove_loose(&repo, &commit);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the committed file docs/generated.md cannot be read"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_repository_without_a_commit_has_nothing_committed_yet() {
+    let repo = Repo::plain(
+        &generated_config(&["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.git(&["init", "-q", "."]);
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.write("docs/generated.md", "stale\n");
+
+    let output = repo.run(&["drift", "--format", "json"]);
+
+    // Nothing was ever committed: the file is new, not a failure.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["generated"][0]["status"], "new");
+    assert_eq!(report["ok"], true);
 }

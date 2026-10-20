@@ -200,16 +200,11 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// True when the rule is in scope for the given repository-relative paths.
+    /// The compiled scope of the rule: the paths it covers.
     ///
-    /// A rule without a `files` scope always runs.
-    pub fn in_scope(&self, paths: &[String]) -> bool {
-        if paths.is_empty() || self.file_globs.is_empty() {
-            return true;
-        }
-        paths
-            .iter()
-            .any(|path| self.file_globs.iter().any(|glob| glob.is_match(path)))
+    /// A rule without a `files` scope covers every path.
+    pub fn in_scope(&self, path: &str) -> bool {
+        self.file_globs.is_empty() || self.file_globs.iter().any(|glob| glob.is_match(path))
     }
 }
 
@@ -221,8 +216,7 @@ pub struct TierSettings {
     pub floor: Option<i64>,
 }
 
-/// A drift gate entry. The drift gates themselves are not part of this task;
-/// the entries are parsed and validated so that configs stay loadable.
+/// A drift gate entry: a generated file and the generator that produces it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Generated {
     /// The generated file, relative to the repository root.
@@ -232,6 +226,12 @@ pub struct Generated {
     /// The argument the generator writes its output to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_arg: Option<String>,
+    /// The tier of the drift gate; `fast` by default.
+    ///
+    /// A generator that needs a database, a browser or the network belongs to
+    /// the slow tier: a fast tier that waits for it is a fast tier that is
+    /// not fast (SPEC §7).
+    pub tier: Tier,
 }
 
 /// A merged config.
@@ -445,7 +445,7 @@ fn merge_generated(config: &mut Config, value: &Value) -> Result<(), ConfigError
     for (index, item) in items.iter().enumerate() {
         let path = format!("generated[{index}]");
         let map = expect_object(item, &path)?;
-        check_unknown(map, &["path", "command", "output_arg"], &path)?;
+        check_unknown(map, &["path", "command", "output_arg", "tier"], &path)?;
         let file = require_string(map, "path", &path)?;
         let command = require_string_array(map, "command", &path)?;
         if command.is_empty() {
@@ -458,10 +458,24 @@ fn merge_generated(config: &mut Config, value: &Value) -> Result<(), ConfigError
             None => None,
             Some(value) => Some(expect_string(value, &format!("{path}.output_arg"))?),
         };
+        let tier = match map.get("tier") {
+            None => Tier::Fast,
+            Some(value) => match expect_string(value, &format!("{path}.tier"))?.as_str() {
+                "fast" => Tier::Fast,
+                "slow" => Tier::Slow,
+                other => {
+                    return Err(ConfigError::new(
+                        format!("{path}.tier"),
+                        format!("expected \"fast\" or \"slow\", found \"{other}\""),
+                    ));
+                }
+            },
+        };
         let entry = Generated {
             path: file,
             command,
             output_arg,
+            tier,
         };
         // A later entry for the same path overrides the earlier one.
         match config.generated.iter_mut().find(|g| g.path == entry.path) {
@@ -643,7 +657,11 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
     }
 }
 
-fn compile_globs(patterns: &[String], path: &str) -> Result<Vec<GlobMatcher>, ConfigError> {
+/// Compiles glob patterns into matchers.
+///
+/// The patterns are the ones of a config (`exclude`, `files`) and the ones of
+/// the command line (`--ignore`); the same rules apply to all of them.
+pub fn compile_globs(patterns: &[String], path: &str) -> Result<Vec<GlobMatcher>, ConfigError> {
     let mut compiled = Vec::new();
     for original in patterns {
         for pattern in glob_patterns(original) {
@@ -901,7 +919,7 @@ mod tests {
             "direction": "ceiling", "count": { "command": ["echo", "1"] } } } }]"#;
         let config = parse_config_str(text).expect("config parses");
         let rule = config.rules.get("a").expect("rule exists");
-        assert!(rule.in_scope(&["src/other.rs".to_string()]));
+        assert!(rule.in_scope("src/other.rs"));
     }
 
     #[test]
@@ -911,8 +929,8 @@ mod tests {
             "files": ["src/**"] } } }]"#;
         let config = parse_config_str(text).expect("config parses");
         let rule = config.rules.get("a").expect("rule exists");
-        assert!(rule.in_scope(&["src/app/main.rs".to_string()]));
-        assert!(!rule.in_scope(&["docs/readme.md".to_string()]));
+        assert!(rule.in_scope("src/app/main.rs"));
+        assert!(!rule.in_scope("docs/readme.md"));
     }
 
     #[test]
@@ -923,11 +941,11 @@ mod tests {
         let config = parse_config_str(text).expect("config parses");
         let rule = config.rules.get("a").expect("rule exists");
         // `src/**` matches `src` and everything below it (SPEC 3.7).
-        assert!(rule.in_scope(&["src".to_string()]));
-        assert!(rule.in_scope(&["src/".to_string()]));
-        assert!(rule.in_scope(&["src/nested/deep/file.rs".to_string()]));
-        assert!(!rule.in_scope(&["srcs/file.rs".to_string()]));
-        assert!(!rule.in_scope(&["docs/readme.md".to_string()]));
+        assert!(rule.in_scope("src"));
+        assert!(rule.in_scope("src/"));
+        assert!(rule.in_scope("src/nested/deep/file.rs"));
+        assert!(!rule.in_scope("srcs/file.rs"));
+        assert!(!rule.in_scope("docs/readme.md"));
     }
 
     #[test]

@@ -1,8 +1,11 @@
 //! The check: count against baseline, plus the monotonicity of the baseline.
 
+use globset::GlobMatcher;
+
 use crate::baseline::Baseline;
 use crate::config::{Config, Direction, Rule, Tier};
 use crate::counter;
+use crate::drift::DriftEntry;
 use crate::git::Git;
 
 /// The status of one rule.
@@ -95,6 +98,8 @@ impl RuleResult {
 pub struct Report {
     /// One entry per evaluated rule, sorted by rule id.
     pub rules: Vec<RuleResult>,
+    /// One entry per generated file, sorted by path.
+    pub generated: Vec<DriftEntry>,
     /// The number of rules that were executed.
     pub executed: usize,
     /// The number of rules whose counter failed.
@@ -111,6 +116,7 @@ impl Default for Report {
     fn default() -> Self {
         Self {
             rules: Vec::new(),
+            generated: Vec::new(),
             executed: 0,
             counter_errors: 0,
             notes: Vec::new(),
@@ -128,6 +134,97 @@ impl Report {
             .filter(|rule| rule.status.is_failure())
             .count()
     }
+
+    /// The number of generated files that drifted.
+    pub fn drifted(&self) -> usize {
+        self.generated
+            .iter()
+            .filter(|entry| entry.status.is_failure())
+            .count()
+    }
+
+    /// The number of gates of the run: the rules and the generated files.
+    pub fn gates(&self) -> usize {
+        self.rules.len() + self.generated.len()
+    }
+
+    /// The number of checks that ran: the rules and the drift gates.
+    ///
+    /// A check is a rule **or a drift gate** (SPEC 3.3): the floor counts
+    /// them, the run-level empty selection counts them, and the summary
+    /// counts them.
+    pub fn checks(&self) -> usize {
+        self.executed + self.generated.len()
+    }
+}
+
+/// What a run selects: the rules that are part of it.
+#[derive(Debug, Default)]
+pub struct Selection<'a> {
+    /// The one rule to run.
+    pub rule: Option<&'a str>,
+    /// The one tier to run.
+    pub tier: Option<Tier>,
+    /// The paths the run is scoped to; empty means "every path".
+    pub paths: &'a [String],
+    /// The paths to exclude from the selection.
+    pub ignore: &'a [GlobMatcher],
+}
+
+impl Selection<'_> {
+    /// True when the rule is part of the selection.
+    pub fn selects(&self, rule: &Rule) -> bool {
+        if let Some(tier) = self.tier {
+            if rule.tier != tier {
+                return false;
+            }
+        }
+        self.in_paths(rule)
+    }
+
+    /// True when the scope of the rule intersects the selected paths.
+    ///
+    /// A rule without a scope always runs.  A rule whose scope is covered by
+    /// the ignored paths is skipped: the paths it would have run on are gone.
+    ///
+    /// Ignoring a path never turns a failing gate green: a rule that would
+    /// have run on the ignored path still runs on the rest (SPEC 5.1).
+    fn in_paths(&self, rule: &Rule) -> bool {
+        if self.paths.is_empty() {
+            // The selection is unrestricted: only a scope that is covered by
+            // the ignored paths empties it.
+            if rule.files.is_empty() {
+                return true;
+            }
+            return !self.ignored_scope(rule);
+        }
+
+        let remaining: Vec<&String> = self
+            .paths
+            .iter()
+            .filter(|path| !self.ignored(path))
+            .collect();
+        if remaining.is_empty() {
+            // Nothing is left to run on: an empty selection is never a pass.
+            return false;
+        }
+        remaining.iter().any(|path| rule.in_scope(path))
+    }
+
+    /// True when the path matches one of the ignored patterns.
+    fn ignored(&self, path: &str) -> bool {
+        self.ignore.iter().any(|glob| glob.is_match(path))
+    }
+
+    /// True when every pattern of the scope of the rule is ignored.
+    ///
+    /// The patterns of the scope are the probe: a pattern that is covered by
+    /// an ignored pattern covers every path below it.  A pattern that is not
+    /// covered keeps its rule — a rule that runs when it should not is a
+    /// false red, a rule that does not run when it should is a false green.
+    fn ignored_scope(&self, rule: &Rule) -> bool {
+        rule.files.iter().all(|pattern| self.ignored(pattern))
+    }
 }
 
 /// Runs the gates: count every rule, compare with the baseline and check that
@@ -137,20 +234,19 @@ pub fn check(
     baseline: &Baseline,
     committed: Option<&Baseline>,
     root: &std::path::Path,
-    rule_filter: Option<&str>,
-    paths: &[String],
+    selection: &Selection<'_>,
 ) -> Report {
     let mut report = Report::default();
 
     for (id, rule) in &config.rules {
-        if let Some(filter) = rule_filter {
+        if let Some(filter) = selection.rule {
             if filter != id {
                 continue;
             }
         }
-        if !rule.in_scope(paths) {
+        if !selection.selects(rule) {
             report.debug.push(format!(
-                "rule {id} is out of scope for the selected paths — skipped"
+                "rule {id} is out of scope for the selection — skipped"
             ));
             continue;
         }
@@ -258,6 +354,96 @@ pub fn check(
     // An empty selection is never a pass.
     report.ok = report.failed() == 0 && report.counter_errors == 0 && report.executed > 0;
     report
+}
+
+/// The notes about the tiers that did not reach their floor.
+///
+/// The floor is the minimum number of checks that must **execute** in the
+/// tier.  A check is a rule **or a drift gate** that runs in the tier: a
+/// check that ran and failed counts as executed — it fails anyway; a check
+/// that was never selected does not (SPEC 3.3).
+///
+/// The floor of **every tier that runs** is enforced: with `--tier` that is
+/// the selected tier, without it every tier of the config — a tier that
+/// executes no check at all is the empty selection and fails.
+pub fn tier_notes(config: &Config, selection: &Selection<'_>, report: &Report) -> Vec<String> {
+    let mut notes = Vec::new();
+    for tier in tiers_that_run(config, selection) {
+        let executed = executed_checks(report, tier);
+        let floor = config
+            .tiers
+            .get(&tier)
+            .and_then(|settings| settings.floor)
+            .unwrap_or(0);
+
+        if executed == 0 {
+            notes.push(format!(
+                "the tier `{}` executed no check — an empty selection is never a pass",
+                tier.as_str()
+            ));
+            continue;
+        }
+        if (executed as i64) < floor {
+            notes.push(format!(
+                "the tier `{}` executed {}, the floor is {floor}",
+                tier.as_str(),
+                plural(executed, "check")
+            ));
+        }
+    }
+    notes
+}
+
+/// The checks that executed in a tier: its rules and its drift gates.
+///
+/// A drift gate that was skipped — because of its tier — is not in the
+/// report and does not count.
+fn executed_checks(report: &Report, tier: Tier) -> usize {
+    let rules = report
+        .rules
+        .iter()
+        .filter(|rule| rule.tier == Some(tier))
+        .count();
+    let gates = report
+        .generated
+        .iter()
+        .filter(|entry| entry.tier == tier)
+        .count();
+    rules + gates
+}
+
+/// The tiers that a run executes.
+///
+/// * with `--tier` — the selected tier and nothing else;
+/// * without it — every tier of the config: the declared ones and the ones
+///   its rules and its drift gates belong to.  A tier that runs and has no
+///   check is the empty selection and fails.
+fn tiers_that_run(config: &Config, selection: &Selection<'_>) -> Vec<Tier> {
+    if let Some(tier) = selection.tier {
+        return vec![tier];
+    }
+    let mut tiers: Vec<Tier> = config.tiers.keys().copied().collect();
+    for rule in config.rules.values() {
+        if !tiers.contains(&rule.tier) {
+            tiers.push(rule.tier);
+        }
+    }
+    for entry in &config.generated {
+        if !tiers.contains(&entry.tier) {
+            tiers.push(entry.tier);
+        }
+    }
+    tiers.sort();
+    tiers
+}
+
+/// The count with its unit, in the singular and in the plural.
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("{count} {word}")
+    } else {
+        format!("{count} {word}s")
+    }
 }
 
 /// Records a counter that did not deliver a usable count.

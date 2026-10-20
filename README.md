@@ -52,9 +52,11 @@ implemented in this build yet — until it is, replace the binary by hand.
 ratchet                 # the same as `ratchet check`
 ratchet check           # run every gate
 ratchet check src/      # run the gates whose scope touches src/
+ratchet check --tier fast # run the gates of one tier
 ratchet count           # print the current count per rule
 ratchet baseline init   # write the current count as the baseline
 ratchet baseline update # pay a ceiling down / a floor up — in that direction only
+ratchet drift           # run the drift gates: the generated files
 ratchet init            # write a starter config
 ```
 
@@ -202,6 +204,93 @@ into the tree, and the tree is not the engine's to write. `generate` without
 `output_arg` is a configuration error, and so is `output_arg` without
 `generate`. The working tree stays exactly as it was.
 
+### The drift gates
+
+A **generated file** is a file that a generator produces. The `generated`
+entries of the config name them:
+
+```jsonc
+"generated": [
+  { "path": "docs/MISSING_FEATURES.md", "command": ["npm", "run", "docs:gaps"], "output_arg": "--output" }
+]
+```
+
+The gate compares the **committed** file (`git show HEAD:<path>`) with what
+the generator produces: a stale committed file is the defect, and the gate
+fails with the unified diff of the difference:
+
+```
+--- docs/MISSING_FEATURES.md
++++ docs/MISSING_FEATURES.md
+@@ -1,3 +1,3 @@
+ # Title
+ 
+-stale content
++fresh content
+```
+
+The diff is a **patch**: `patch -p0` applies it to the committed file. The
+newline at the end of a file is part of the file, so a file that ends with a
+newline and one that does not differ — and the difference shows up in the
+diff.
+
+The status of a generated file is `ok` (in sync), `drift` (the committed file
+differs — a failed gate) or `new` (not committed yet — informational, not a
+failure). A generator that cannot be run — or that runs and produces
+nothing — is an **operational error** (exit 2), not a failed gate. So is a
+committed file that cannot be read: a broken reference must not disable a
+gate, and a committed path that is a directory is not a file at all. A
+repository whose `HEAD` points at a branch that has no commit yet has nothing
+committed yet (`new`); a repository whose `HEAD` names a commit that cannot be
+read is damaged, and that is an operational error as well.
+
+A `generated[]` entry may declare a `tier` (`fast` | `slow`, default `fast`).
+`--tier fast` skips the slow generators: a generator that needs a database, a
+browser or the network belongs to the slow tier, and a fast tier that waits
+for it is a fast tier that is not fast.
+
+Two generator modes exist:
+
+- **with `output_arg`** — the generator writes to a temporary path; the tree
+  is never touched.
+- **without `output_arg`** — the generator writes the file **in place**. The
+  binary then owns a **verified restore**: it snapshots the original bytes,
+  the file mode *and* the time the file was written last, runs the
+  generator, reads the produced bytes, writes the snapshot to a temporary
+  file in the same directory, gives it the original mode and time and
+  **renames** it over the target — a rename replaces a symbolic link instead
+  of writing through it — verifies the restore and removes a directory the
+  generator created and left empty. If the target **is** a symbolic link, the
+  restore writes the file **behind** the link and recreates the link: a
+  rename over the link would replace it with a regular file and change the
+  tree, and the tree must not change. A restore that fails ends the run with
+  an operational error that names the file and says that the working tree was
+  modified: a swallowed restore error is a mutated tree that nobody was told
+  about.
+
+  Before the generator runs, the file is touched with an **old** time — an
+  hour into the past. The engine can then tell whether the generator wrote
+  the file — a generator that leaves it alone produced nothing, and the
+  comparison of the committed file with itself would be a green that says
+  nothing. The marker works on every filesystem, whatever its timestamp
+  granularity is.
+
+  The generator sees an input that is an hour older than it is. A generator
+  that compares the time of its input with the time of its output therefore
+  regenerates instead of skipping — and a generator that embeds the time of
+  its input in its output would produce a permanent drift, which the
+  determinism rule forbids anyway. The tree is restored exactly afterwards:
+  the bytes, the mode **and** the time.
+
+`ratchet drift` runs the drift gates alone; `ratchet check` runs them as part
+of the whole run. A drift command without a generated entry fails: an empty
+selection is never a pass. `--fix` writes the produced content into the
+generated files — and only into the generated files, never into hand-written
+text. The gate stays **failed**: the committed file is still stale, because
+the gate measures the **committed** artifact. It turns green once the fix is
+committed. A run with `--fix` in a pipeline is therefore never green against a
+stale HEAD; that is deliberate, not a bug.
+
 ### The JavaScript config
 
 `ratchet.config.mjs` / `ratchet.config.cjs` exports the same JSON shape as its
@@ -252,6 +341,7 @@ rules are sorted by id, so the file is a stable diff.
 | `ratchet count` | Prints the current count per rule, without a comparison. |
 | `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. |
 | `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. |
+| `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
 
 ### Options
@@ -262,12 +352,56 @@ rules are sorted by id, so the file is a stable diff.
 | `--no-config` | Do not look for a config; only valid together with `--config`. |
 | `--format <stylish\|json>` | The output format, `stylish` by default. |
 | `--rule <id>` | Restrict the run to one rule. |
+| `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. |
+| `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. |
+| `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |
 | `--quiet` | Only print failures. |
 | `--version`, `--help` | |
 
 `baseline init` and `baseline update` accept `--reason <text>`, which is stored
 in the baseline record.
+
+### The tiers
+
+The config names the tiers and their **floor** — the minimum number of checks
+that must *execute* in that tier:
+
+```jsonc
+"tiers": { "fast": { "floor": 5 }, "slow": { "floor": 1 } }
+```
+
+`--tier fast` runs the rules of the fast tier only; without it, every rule
+runs. The floor of **every tier that runs** is enforced: with `--tier` that is
+the selected tier, without it every tier of the config. A tier that executes
+fewer checks than its floor fails, and a tier that executes **no** check fails
+as well — an empty selection is never a pass. A check that ran and failed
+counts as executed (it fails anyway); a check that was never selected does
+not.
+
+The floor is what stops a tier from being quietly narrowed — a narrowing that
+only shows up when somebody selects the tier by hand is a narrowing that
+survives.
+
+The floor counts the **checks** that execute in the tier, and a check is a
+rule **or a drift gate**: a rule that ran and failed counts as executed, and
+so does a generator that ran. A tier that declares a floor therefore needs
+that many rules and generators — a tier whose promised checks are all missing
+is exactly the narrowing the floor exists to catch.
+
+The drift gates are tiered like the rules: a `generated[]` entry belongs to
+the `fast` tier unless it says otherwise.
+
+### The path exclusion
+
+`--ignore` takes glob patterns of paths to exclude from the selection. A rule
+whose scope does not intersect the remaining paths is skipped. Ignoring a
+path never turns a failing gate green: a rule that would have run on the
+ignored path still runs on the rest.
+
+`--ignore` applies to the **rules' path scope**. It does not exclude a drift
+gate: a generated file is registered deliberately, and a pattern that happens
+to match it must not silently disable the gate.
 
 ## The output
 
@@ -324,7 +458,8 @@ log go to stderr:
       "tier": "fast"
     }
   ],
-  "generated": []
+  "generated": [],
+  "notes": []
 }
 ```
 
@@ -348,6 +483,32 @@ learn **why** a rule failed without parsing the human output.
 }
 ```
 
+The `generated` array carries one entry per generated file: its `path`, its
+`status` (`ok`, `drift` or `new`) and the unified `diff` — absent when there
+is none. `summary.generated` counts the generated files, `summary.drifted`
+the ones that drifted. `summary.executed` counts the **checks** that ran: the
+rules and the drift gates.
+
+```
+{
+  "path": "docs/MISSING_FEATURES.md",
+  "status": "drift",
+  "diff": "--- docs/MISSING_FEATURES.md\n+++ docs/MISSING_FEATURES.md\n@@ -1,3 +1,3 @@\n # Title\n \n-stale content\n+fresh content\n",
+  "detail": "differs from the committed file"
+}
+```
+
+The `notes` array carries the same notes the human output prints on stderr —
+the tier floor, the skipped monotonicity comparison, a skipped drift gate. It
+is empty when there is nothing to say. A machine consumer must be able to
+learn why the run is not green **without** the note being only on stderr: a
+report that says `ok: false` and gives no reason is a report that cannot be
+acted on.
+
+```
+"notes": ["the tier `fast` executed 2 checks, the floor is 5"]
+```
+
 A baseline that moved against its committed counterpart is reported as
 `baseline-raised` / `baseline-lowered` — even when the count comparison failed
 as well: the baseline itself is the invalid artifact, and the count comparison
@@ -359,7 +520,7 @@ Every path in the output is relative to the repository root: an absolute path,
 a machine name or a timestamp would make the same tree produce different bytes.
 
 The `count`, `baseline` and `init` commands use the same envelope
-(`schema`, `ok`, `summary`, `rules`, `generated`); `count` reports the count
+(`schema`, `ok`, `summary`, `rules`, `generated`, `notes`); `count` reports the count
 without a baseline (`"baseline": null`), and the `baseline` commands report one
 entry per rule with an `action` (`added`, `kept`, `updated`, `refused`).
 
@@ -426,10 +587,10 @@ In CI the same gate runs on both matrix legs (ubuntu and macos) as the step
 
 What the gates do **not** cover, named here rather than in a footnote:
 
-- **The drift between `SPEC.md`, this README and `--help`.** The drift gates
-  arrive with the next task. Until then the test suite checks the documented
-  **stylish report example** in this README and in `SPEC.md` byte for byte;
-  `--help` is covered by neither the gate nor the tests.
+- **The drift between `SPEC.md`, this README and `--help`.** The test suite
+  checks the documented **stylish report example** in this README and in
+  `SPEC.md` byte for byte; `--help` is covered by neither the gate nor the
+  tests.
 - **The engine writes to the terminal.** A source-level gate for it has to
   decide which code is *compiled* — test modules, `cfg` conditions,
   attributes, macros — and that is a Rust parser, not a text scan. A scan
@@ -467,12 +628,10 @@ What the gates do **not** cover, named here rather than in a footnote:
 
 ## Not implemented yet
 
-`SPEC.md` describes more than this binary does today. The drift gates
-(`ratchet drift`, `--fix`), the tier floors (`--tier`), the path exclusion
-(`--ignore`) and the self-update (`ratchet update`) are specified but not
-implemented — a config may already contain `tiers` and `generated` entries,
-they are simply not evaluated yet. The release workflow does not exist either:
-there is no GitHub Release to download yet, build the binary from source.
+`SPEC.md` describes more than this binary does today. The self-update
+(`ratchet update`) is specified but not implemented, and the release workflow
+does not exist either: there is no GitHub Release to download yet, build the
+binary from source.
 
 ## Specification
 

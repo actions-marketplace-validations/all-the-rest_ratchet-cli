@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::check::{BaselineAction, Report, RuleResult, RuleStatus};
 use crate::config::Direction;
+use crate::drift::DriftEntry;
 
 /// The JSON schema version of the report.
 pub const SCHEMA: u32 = 1;
@@ -12,11 +13,14 @@ pub const SCHEMA: u32 = 1;
 pub fn render_stylish(report: &Report, quiet: bool) -> String {
     let mut out = String::new();
     let failed = report.failed();
+    let drifted = report.drifted();
 
     if !quiet {
         out.push_str(&format!(
-            "ratchet — {}, {failed} failed\n\n",
-            plural(report.rules.len(), "rule")
+            "ratchet — {}{}, {} failed\n\n",
+            plural(report.rules.len(), "rule"),
+            generated_suffix(report),
+            failed + drifted
         ));
     }
 
@@ -38,19 +42,120 @@ pub fn render_stylish(report: &Report, quiet: bool) -> String {
         ));
     }
 
+    let generated: Vec<&DriftEntry> = report
+        .generated
+        .iter()
+        .filter(|entry| !quiet || entry.status.is_failure())
+        .collect();
+    if !generated.is_empty() {
+        out.push_str("\ngenerated files:\n\n");
+        for entry in generated {
+            let status = if entry.status.is_failure() {
+                "FAIL"
+            } else {
+                "PASS"
+            };
+            out.push_str(&format!(
+                "  {status}  {:<width$}  {}\n",
+                entry.path,
+                entry.detail.clone().unwrap_or_default(),
+                width = width
+            ));
+            if let Some(diff) = &entry.diff {
+                // The diff is a unified diff of its own: its lines start with
+                // a sign, and indenting them would change their meaning.
+                out.push('\n');
+                out.push_str(diff);
+            }
+        }
+    }
+
     if !quiet {
         out.push('\n');
         if report.ok {
             out.push_str(&format!(
                 "COHERENT — {} of {} gates passed\n",
-                report.rules.len(),
-                report.rules.len()
+                report.gates(),
+                report.gates()
             ));
         } else {
             out.push_str(&format!(
                 "NOT COHERENT — {} of {} gates failed\n",
-                report.failed(),
-                report.rules.len()
+                failed + drifted,
+                report.gates()
+            ));
+        }
+    }
+
+    out
+}
+
+/// The part of the headline that names the generated files.
+fn generated_suffix(report: &Report) -> String {
+    if report.generated.is_empty() {
+        return String::new();
+    }
+    format!(", {}", plural(report.generated.len(), "generated file"))
+}
+
+/// Renders the human readable output of the drift command.
+///
+/// The drift command runs the generated files only: there are no rules in its
+/// report, and the headline names the generated files alone.
+pub fn render_drift(entries: &[DriftEntry], quiet: bool) -> String {
+    let mut out = String::new();
+    let drifted = entries
+        .iter()
+        .filter(|entry| entry.status.is_failure())
+        .count();
+
+    if !quiet {
+        out.push_str(&format!(
+            "ratchet — {}, {drifted} failed\n\n",
+            plural(entries.len(), "generated file")
+        ));
+    }
+
+    let width = entries
+        .iter()
+        .map(|entry| entry.path.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 6;
+    let shown: Vec<&DriftEntry> = entries
+        .iter()
+        .filter(|entry| !quiet || entry.status.is_failure())
+        .collect();
+    for entry in shown {
+        let status = if entry.status.is_failure() {
+            "FAIL"
+        } else {
+            "PASS"
+        };
+        out.push_str(&format!(
+            "  {status}  {:<width$}  {}\n",
+            entry.path,
+            entry.detail.clone().unwrap_or_default(),
+            width = width
+        ));
+        if let Some(diff) = &entry.diff {
+            out.push('\n');
+            out.push_str(diff);
+        }
+    }
+
+    if !quiet {
+        out.push('\n');
+        if drifted == 0 {
+            out.push_str(&format!(
+                "COHERENT — {} of {} gates passed\n",
+                entries.len(),
+                entries.len()
+            ));
+        } else {
+            out.push_str(&format!(
+                "NOT COHERENT — {drifted} of {} gates failed\n",
+                entries.len()
             ));
         }
     }
@@ -107,12 +212,13 @@ pub fn render_json(report: &Report) -> String {
         summary: JsonSummary {
             rules: report.rules.len(),
             failed: report.failed(),
-            executed: report.executed,
-            generated: 0,
-            drifted: 0,
+            executed: report.checks(),
+            generated: report.generated.len(),
+            drifted: report.drifted(),
         },
         rules: report.rules.iter().map(JsonRule::from).collect(),
-        generated: Vec::new(),
+        generated: report.generated.iter().map(JsonGenerated::from).collect(),
+        notes: &report.notes,
     };
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
 }
@@ -131,6 +237,7 @@ pub fn render_baseline_json(command: &str, actions: &[BaselineAction], failed: u
         },
         rules: actions.iter().map(JsonBaselineAction::from).collect(),
         generated: Vec::new(),
+        notes: &[],
         baseline: JsonBaseline {
             command: command.to_string(),
         },
@@ -152,6 +259,7 @@ pub fn render_init_json(config: &str) -> String {
         },
         rules: Vec::new(),
         generated: Vec::new(),
+        notes: &[],
         config: config.to_string(),
     };
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
@@ -168,13 +276,19 @@ fn label(rule: &RuleResult) -> &str {
 
 /// The width of the label column.
 fn label_width(report: &Report) -> usize {
-    report
+    let rules = report
         .rules
         .iter()
         .map(|rule| label(rule).chars().count())
         .max()
-        .unwrap_or(0)
-        + 6
+        .unwrap_or(0);
+    let generated = report
+        .generated
+        .iter()
+        .map(|entry| entry.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    rules.max(generated) + 6
 }
 
 /// The detail of a rule in the human readable output.
@@ -227,7 +341,12 @@ struct JsonReport<'a> {
     ok: bool,
     summary: JsonSummary,
     rules: Vec<JsonRule<'a>>,
-    generated: Vec<serde_json::Value>,
+    generated: Vec<JsonGenerated<'a>>,
+    /// The notes the human output prints on stderr: the tier floor, the
+    /// skipped monotonicity comparison, a skipped drift gate.  A machine
+    /// consumer must be able to learn why the run is not green without the
+    /// note being only on stderr (SPEC 6.3).
+    notes: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -237,6 +356,29 @@ struct JsonSummary {
     executed: usize,
     generated: usize,
     drifted: usize,
+}
+
+/// One generated file of the report.
+#[derive(Serialize)]
+struct JsonGenerated<'a> {
+    path: &'a str,
+    status: &'a str,
+    /// The unified diff (committed → produced); absent when there is none.
+    diff: Option<&'a str>,
+    /// The reason for a status that is not `ok` (SPEC 6.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+impl<'a> From<&'a DriftEntry> for JsonGenerated<'a> {
+    fn from(entry: &'a DriftEntry) -> Self {
+        Self {
+            path: &entry.path,
+            status: entry.status.as_str(),
+            diff: entry.diff.as_deref(),
+            detail: entry.detail.as_deref(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -277,6 +419,7 @@ struct JsonBaselineReport {
     summary: JsonSummary,
     rules: Vec<JsonBaselineAction>,
     generated: Vec<serde_json::Value>,
+    notes: &'static [String],
     baseline: JsonBaseline,
 }
 
@@ -292,6 +435,7 @@ struct JsonInitReport {
     summary: JsonSummary,
     rules: Vec<serde_json::Value>,
     generated: Vec<serde_json::Value>,
+    notes: &'static [String],
     config: String,
 }
 

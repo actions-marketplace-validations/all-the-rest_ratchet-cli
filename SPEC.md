@@ -129,6 +129,24 @@ the next reader cannot tell a real regression from a remembered one.
 Below the floor the tier fails. A tier that executes **zero** checks always
 fails — an empty selection is never a pass.
 
+A check that ran and failed counts as executed: it fails anyway (exit 2), so
+the floor only says how many checks the tier has to run. A check that was
+never selected does not count — that is the empty selection, and it fails.
+
+A **check** is a rule **or a drift gate** that runs in the tier. A tier that
+declares a floor therefore needs that many rules and generators: a tier whose
+promised checks are all missing is exactly the narrowing the floor exists to
+catch.
+
+The run as a whole fails when **no check ran at all** — the empty selection is
+never a pass, whether the selection consists of rules, of drift gates, or of
+both.
+
+The floor of **every tier that runs** is enforced. Without `--tier`, every
+declared tier's floor applies — the floor is what stops a tier from being
+quietly narrowed, and a narrowing that only shows up when somebody selects
+the tier by hand is a narrowing that survives.
+
 ### 3.4 Counter
 
 Exactly one of:
@@ -247,6 +265,15 @@ The default command is `check`.
 | `--quiet` | only print failures |
 | `--version`, `--help` | |
 
+`--ignore` takes glob patterns of paths to exclude from the selection. A rule
+whose scope does not intersect the remaining paths is skipped. Ignoring a path
+never turns a failing gate green: a rule that would have run on the ignored
+path still runs on the rest.
+
+`--ignore` applies to the **rules' path scope**. It does not exclude a drift
+gate: a generated file is registered deliberately, and a pattern that happens to
+match it must not silently disable the gate.
+
 ### 5.2 `check`
 
 1. Load and validate the config.
@@ -270,7 +297,10 @@ The default command is `check`.
 5. Tiers — `--tier` selects one tier. The number of **executed** checks in the
    selected tier must be ≥ the tier's `floor`, and must be > 0. Zero executed
    checks in the selected tier → fail ("empty selection").
-6. Drift — the drift gates run as part of `check` (§7).
+6. Drift — the drift gates run as part of `check` (§7); `ratchet drift` runs
+   only them. A drift is a **gate failure** (exit 1) — a stale committed file
+   is the defect — while a generator that could not be run is an **operational
+   error** (exit 2).
 7. Exit code: `0` all green, `1` at least one gate failed, `2` operational error.
 
 `paths…` restrict the run to the rules whose counter is affected by those
@@ -383,7 +413,8 @@ byte-identical output.
       "tier": "fast"
     }
   ],
-  "generated": [{ "path": "docs/MISSING_FEATURES.md", "status": "ok", "diff": null }]
+  "generated": [{ "path": "docs/MISSING_FEATURES.md", "status": "ok", "diff": null }],
+  "notes": ["the tier `slow` executed 2 checks, the floor is 5"]
 }
 ```
 
@@ -395,11 +426,22 @@ A rule entry may carry a `detail` field: the reason for a status that is not
 `ok`. It is absent when there is nothing to say. A machine consumer must be
 able to learn **why** a rule failed without parsing the human output.
 
+The `notes` array carries the same notes the human output prints on stderr —
+the tier floor, the skipped monotonicity comparison, a skipped drift gate. It
+is empty when there is nothing to say. A machine consumer must be able to learn
+why the run is not green **without** the note being only on stderr: a report
+that says `ok: false` and gives no reason is a report that cannot be acted on.
+
 ## 7. Drift gates
 
 ```jsonc
 { "generated": [ { "path": "docs/MISSING_FEATURES.md", "command": ["npm", "run", "docs:gaps"], "output_arg": "--output" } ] }
 ```
+
+A `generated[]` entry may declare a `tier` (`fast` | `slow`, default `fast`).
+`--tier fast` skips the slow generators: a generator that needs a database, a
+browser or the network belongs to the slow tier, and a fast tier that waits for
+it is a fast tier that is not fast.
 
 The generator must be able to write to a **given path**:
 
@@ -412,7 +454,10 @@ The generator must be able to write to a **given path**:
   4. restore: write the snapshot to a **temporary file in the same directory**,
      give it the original mode, and **rename** it over the target — a rename
      replaces a symlink instead of writing through it, and it does not need
-     write permission on the target itself;
+     write permission on the target itself. If the target **is** a symbolic
+     link, the restore writes the file **behind** the link and recreates the
+     link: a rename over the link would replace it with a regular file and
+     change the tree, and the tree must not change;
   5. **verify** the restore (read the bytes back and compare);
   6. a directory the generator created and left empty is removed.
 
@@ -427,8 +472,12 @@ produced) with repository-relative paths.
 A file that is not in `HEAD` yet has the status `new` — informational, not a
 failure.
 
-`--fix` writes the produced content to the target path and reports the gate as
-fixed. `--fix` touches **only** the generated files, never hand-written text.
+`--fix` writes the produced content to the target path and reports what it
+did. The gate stays **failed**: the committed file is still stale — the gate
+measures the **committed** artifact, and it only turns green once the fix is
+committed. A run with `--fix` in a pipeline is therefore never green against a
+stale HEAD; that is deliberate, not a bug. `--fix` touches **only** the
+generated files, never hand-written text.
 
 ## 8. Git
 
