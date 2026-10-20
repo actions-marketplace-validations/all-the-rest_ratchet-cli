@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "rules": {
+    "dependency-count": {
+      "value": 6
+    },
+    "no-machine-path-in-source": {
+      "value": 0
+    },
+    "no-panic-in-source": {
+      "value": 0
+    },
+    "no-unfinished-marker": {
+      "value": 0
+    },
+    "no-unsafe-in-source": {
+      "value": 0
+    }
+  }
+}

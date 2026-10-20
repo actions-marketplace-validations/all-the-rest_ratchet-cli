@@ -371,6 +371,100 @@ entry per rule with an `action` (`added`, `kept`, `updated`, `refused`).
 | `1` | at least one gate failed |
 | `2` | operational error: invalid config, missing config, crashed counter, unreadable file, unknown command or path, a committed baseline that does not parse |
 
+## This repo gates itself
+
+The repository is gated with the binary it ships. `ratchet.config.jsonc` holds
+the rules, `scripts/count.sh` holds the counters, `ratchet.baseline.json` holds
+the baselines — the baseline file is written by the tool, never by hand.
+
+| Rule | Class | Unit | Direction | Value today |
+|---|---|---|---|---|
+| `dependency-count` | supply-chain debt | dependency entries | ceiling | 6 |
+| `no-machine-path-in-source` | a machine-specific path baked into the source | occurrences | ceiling | 0 |
+| `no-panic-in-source` | crash instead of a clean failure | occurrences | ceiling | 0 |
+| `no-unfinished-marker` | unfinished work | occurrences | ceiling | 0 |
+| `no-unsafe-in-source` | unsafe code | occurrences | ceiling | 0 |
+
+Four of the five rules count zero today: they are **boolean gates** — *no
+occurrence may appear* — and their baseline must never move. `dependency-count`
+is the only ratchet: its baseline of 6 dependency entries may only decrease,
+and `ratchet baseline update` is the only way to move it.
+
+The counters live in `scripts/count.sh`, one case per counter name; each one
+prints exactly one integer. They are plain `sh` and the tools every unix has
+— grep, awk, find, sort, wc and tr. The constructs beyond POSIX are `grep -o`
+and the word boundary `\b` in the patterns: GNU grep documents the word
+boundary, BSD grep supports it, and both target platforms (macOS and ubuntu)
+have them.
+
+The counters rest on three assumptions, stated here so that the class and the
+count describe the same thing:
+
+- The four source counters match every `*.rs` file under `src/` — the crate's
+  own sources, the inline `#[cfg(test)]` modules included. The integration
+  tests under `tests/` are a separate crate and are **not** counted. The match
+  is **textual**: the word in a comment or in a string counts as well, so the
+  count can only be too high, never too low.
+- The counted files are Rust sources. A NUL byte in one of them means the
+  crate does not build; BSD grep prints `Binary file <path> matches` on stdout
+  for such a file, so the counter would count that line as one occurrence — a
+  false red, never a false green.
+- The dependency counter counts **entries**: a key at the start of a line. A
+  multi-line inline table whose continuation starts at column 0 is counted
+  twice, and a manifest with CRLF line endings counts its blank lines as
+  entries. Both over-count, which is the safe direction.
+
+Locally, after a build:
+
+```sh
+cargo build
+./target/debug/ratchet check
+```
+
+In CI the same gate runs on both matrix legs (ubuntu and macos) as the step
+*Self-gate: ratchet check*.
+
+What the gates do **not** cover, named here rather than in a footnote:
+
+- **The drift between `SPEC.md`, this README and `--help`.** The drift gates
+  arrive with the next task. Until then the test suite checks the documented
+  **stylish report example** in this README and in `SPEC.md` byte for byte;
+  `--help` is covered by neither the gate nor the tests.
+- **The engine writes to the terminal.** A source-level gate for it has to
+  decide which code is *compiled* — test modules, `cfg` conditions,
+  attributes, macros — and that is a Rust parser, not a text scan. A scan
+  produces false greens: a multi-line attribute that rustfmt keeps
+  multi-line —
+
+  ```rust
+  #[cfg(any(
+      feature = "alpha",
+      feature = "beta"
+  ))]
+  ```
+
+  — swallows the rest of the file, and a `println!` behind it counts zero:
+  the gate reports green. It also produces false reds: a `#[test] fn` at file
+  scope breaks a scanner that looks for a `mod` behind the attribute, and the
+  counter fails on ordinary Rust. A gate that can be silently defeated is
+  worse than no gate, so the class is not gated. What covers it instead: the
+  test `the_stylish_output_is_the_documented_one` compares the **whole
+  stdout** of `ratchet check` byte for byte with the documented example, so a
+  stray print that reaches the report path fails the test — and CI runs the
+  test on every push to `main` and on every pull request targeting `main`. A
+  print in a path that no test exercises is not caught.
+- **A panic that is not a `panic!`.** The `no-panic-in-source` gate counts
+  `panic!` and `unreachable!` only. `unwrap()`, `expect()` and `assert!` are
+  not counted — 65 such occurrences exist in `src/`, all of them inside the
+  `#[cfg(test)]` modules, while the gate reports 0. A ceiling on them would
+  turn every new test red, so the class stays open and is named here.
+- **The integration tests.** The four source counters match every `*.rs` file
+  under `src/`; the integration tests under `tests/` are a separate crate and
+  stay outside the count. A panic in a test is how a test fails, so the class
+  *crash instead of a clean failure* does not apply to them — the class is
+  about the tool's runtime behaviour. The price is named: the `panic!` in
+  `tests/cli.rs` is not counted.
+
 ## Not implemented yet
 
 `SPEC.md` describes more than this binary does today. The drift gates

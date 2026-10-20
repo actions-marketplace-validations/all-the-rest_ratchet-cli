@@ -45,3 +45,12 @@ jobs:
 
       - name: Run the tests
         run: cargo test
+
+      - name: "Self-gate: ratchet check"
+        # The repository gates itself with the binary it ships: the rules are
+        # in ratchet.config.jsonc, the counters in scripts/count.sh, the
+        # baselines in ratchet.baseline.json.  The binary has to exist before
+        # the gate runs.
+        run: |
+          cargo build
+          ./target/debug/ratchet check
