@@ -116,6 +116,57 @@ fn node_available() -> bool {
         .unwrap_or(false)
 }
 
+/// A directory outside the repository root.
+///
+/// The directory is removed again when it goes out of scope: a temporary is
+/// removed, and a test that fails must not leave anything behind.  The name
+/// carries the process id: a run that lets the engine write into it — a
+/// defect, a mutation — must not make the next run fail.
+struct Outside {
+    path: PathBuf,
+}
+
+impl Outside {
+    /// Creates the directory.
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ratchet-outside-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the directory is created");
+        Self { path }
+    }
+
+    /// The path of the directory.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The path of a file in the directory.
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for Outside {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A chain of two links: `name` → `middle` → `target`.
+///
+/// The chain is what carries a path out of the root: `canonicalize` follows a
+/// chain whose final target **exists**, but a chain that ends at a missing
+/// file has to be followed by hand — and that is the shape that makes a
+/// *write* succeed outside the repository.
+#[cfg(unix)]
+fn link_chain(name: &Path, middle: &Path, target: &Path) {
+    let directory = middle.parent().expect("a parent directory");
+    std::fs::create_dir_all(directory).expect("the directory is created");
+    std::os::unix::fs::symlink(target, middle).expect("the second link is made");
+    std::os::unix::fs::symlink(middle, name).expect("the first link is made");
+}
+
 /// The stdout of a run.
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -556,6 +607,88 @@ fn the_starter_config_is_valid() {
 }
 
 #[test]
+fn init_writes_the_starter_config_in_a_fresh_directory() {
+    // A fresh directory has no config yet: the path is inside it, and the
+    // command writes the starter config.
+    let repo = Repo::plain(ceiling_config(), None);
+    std::fs::remove_file(repo.path().join("ratchet.config.jsonc")).expect("the config is removed");
+
+    let output = repo.run(&["init"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        repo.read("ratchet.config.jsonc").contains("\"rules\""),
+        "the starter config was not written"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_through_a_link_outside_the_repository_root_is_refused() {
+    // The config is a path the project names: a link at that position that
+    // leads out of the tree would take the starter config with it.
+    let repo = Repo::new(ceiling_config(), None);
+    std::fs::remove_file(repo.path().join("ratchet.config.jsonc")).expect("the config is removed");
+    let outside = Outside::new("init");
+    std::os::unix::fs::symlink(
+        outside.file("ratchet.config.jsonc"),
+        repo.path().join("ratchet.config.jsonc"),
+    )
+    .expect("the link is made");
+
+    let output = repo.run(&["init"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the config file ratchet.config.jsonc"),
+        "{text}"
+    );
+    assert!(
+        text.contains("must lie inside the repository root"),
+        "{text}"
+    );
+    // And the starter config was not written outside the root.
+    assert!(
+        !outside.file("ratchet.config.jsonc").exists(),
+        "the starter config was written outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_behind_a_chain_of_links_is_refused() {
+    // The config is a chain: `ratchet.config.jsonc` → `real/config.jsonc` →
+    // a file outside the root that is not there.
+    let repo = Repo::new(ceiling_config(), None);
+    std::fs::remove_file(repo.path().join("ratchet.config.jsonc")).expect("the config is removed");
+    let outside = Outside::new("init-chain");
+    link_chain(
+        &repo.path().join("ratchet.config.jsonc"),
+        &repo.path().join("real/config.jsonc"),
+        &outside.file("shared-config.jsonc"),
+    );
+
+    let output = repo.run(&["init"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the config file ratchet.config.jsonc"),
+        "{text}"
+    );
+    assert!(
+        text.contains("must lie inside the repository root"),
+        "{text}"
+    );
+    // And the starter config was not written outside the root.
+    assert!(
+        !outside.file("shared-config.jsonc").exists(),
+        "the starter config was written outside the repository root"
+    );
+}
+
+#[test]
 fn a_missing_baseline_file_is_an_empty_baseline() {
     let repo = Repo::new(ceiling_config(), None);
 
@@ -595,6 +728,446 @@ fn a_file_counter_reads_a_json_document() {
     assert_eq!(code(&output), 1, "{}", stderr(&output));
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
     assert_eq!(report["rules"][0]["count"], 2);
+}
+
+#[test]
+fn a_file_counter_outside_the_repository_root_is_refused() {
+    // The artifact is outside the root — and it is there: a counter that
+    // reads it would count a file the repository does not own.
+    let outside = Outside::new("file");
+    std::fs::write(outside.file("audit.json"), r#"{"count": 1}"#).expect("the file is written");
+    let relative = format!(
+        "../{}/audit.json",
+        outside
+            .path()
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+    );
+    let repo = Repo::new(
+        &format!(
+            r#"[
+          {{
+            "rules": {{
+              "a": {{
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": {{ "file": "{relative}" }}
+              }}
+            }}
+          }}
+        ]"#
+        ),
+        Some(&baseline("a", 1)),
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // A counter that reads a file outside the root is an operational error.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    // The refusal is a **configuration** error, and it names the configured
+    // path: the user has to see which path of the config was refused.
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains(&relative), "{detail}");
+    assert!(
+        detail.contains("is outside the repository root"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_through_a_linked_directory_outside_the_root_is_refused() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "docs/audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    // The directory inside the root is a link that points out of it: the file
+    // behind the link is a file the repository does not own.
+    let outside = Outside::new("file-link");
+    std::fs::write(outside.file("audit.json"), r#"{"count": 1}"#).expect("the file is written");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The counter does not read through the link.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("docs/audit.json"), "{detail}");
+    assert!(
+        detail.contains("is outside the repository root"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_that_is_a_link_to_a_file_outside_the_root_is_refused() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    // The artifact itself is a link to a file outside the root: the counter
+    // would read a file the repository does not own.
+    let outside = Outside::new("file-target");
+    std::fs::write(outside.file("audit.json"), r#"{"count": 7}"#).expect("the file is written");
+    std::os::unix::fs::symlink(outside.file("audit.json"), repo.path().join("audit.json"))
+        .expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The counter does not read through the link.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("audit.json"), "{detail}");
+    assert!(
+        detail.contains("is outside the repository root"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_through_a_link_and_a_parent_is_refused() {
+    // "link/../audit.json" is ambiguous: the operating system reads it as
+    // the parent of the link's **target**, a reader of the config as the
+    // parent of the named directory.  The tool does not choose one.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "link/../audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    let outside = Outside::new("parent-file");
+    std::fs::write(outside.file("audit.json"), r#"{"count": 42}"#).expect("the file is written");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("is ambiguous"), "{detail}");
+    // And the file outside the root was not read.
+    assert!(report["rules"][0]["count"].is_null(), "{report}");
+}
+
+#[test]
+fn a_file_counter_with_an_absolute_path_is_refused() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "/etc/audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("has to be a relative path"), "{detail}");
+}
+
+#[test]
+fn a_file_counter_with_a_parent_that_follows_no_link_still_resolves() {
+    // The carve-out stays: a ".." that follows no link is not ambiguous, and
+    // the path resolves as it always did.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "docs/../audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    repo.write("docs/keep.md", "keep\n");
+    repo.write("audit.json", r#"{"count": 1}"#);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The counter reads the file the path names.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_behind_a_chain_longer_than_the_bound_is_refused() {
+    // Forty links: the operating system refuses to follow more than 32, and
+    // the tool refuses the path with it.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    let outside = Outside::new("long-chain");
+    let mut previous = outside.file("shared-audit.json");
+    for index in (1..=40).rev() {
+        let link = repo.path().join(format!("l{index}"));
+        std::os::unix::fs::symlink(&previous, &link).expect("the link is made");
+        previous = link;
+    }
+    std::os::unix::fs::symlink(&previous, repo.path().join("audit.json"))
+        .expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("could not be resolved"), "{detail}");
+    // And the file outside the root was not read.
+    assert!(report["rules"][0]["count"].is_null(), "{report}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_that_is_a_link_to_a_file_inside_the_root_is_read() {
+    // The carve-out stays: the file may be a link as long as its target
+    // lies inside the root.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    repo.write("real.json", r#"{"count": 1}"#);
+    std::os::unix::fs::symlink("real.json", repo.path().join("audit.json"))
+        .expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The counter reads the file behind the link.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_counter_through_a_chain_of_links_outside_the_root_is_refused() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": { "file": "audit.json" }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    // The artifact is a chain: `audit.json` → `real/audit.json` → a file
+    // outside the root that is not there.
+    let outside = Outside::new("file-chain");
+    link_chain(
+        &repo.path().join("audit.json"),
+        &repo.path().join("real/audit.json"),
+        &outside.file("shared-audit.json"),
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The counter does not read through the chain.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("audit.json"), "{detail}");
+    assert!(
+        detail.contains("is outside the repository root"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_file_counter_with_a_generator_and_a_path_outside_the_root_is_refused() {
+    // The rule is about the path the project **names**, not about what the
+    // run reads from it: with `generate` the count comes from a temporary
+    // path, and the configured path is still the project's.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": {
+                  "file": "../outside/audit.json",
+                  "generate": ["sh", "generate.sh"],
+                  "output_arg": "--output"
+                }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf '{\"count\": 1}' > \"$2\"\n",
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    let detail = report["rules"][0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("config error at rules.a.count.file:"),
+        "{detail}"
+    );
+    assert!(detail.contains("../outside/audit.json"), "{detail}");
+    assert!(
+        detail.contains("is outside the repository root"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_file_counter_with_a_generator_and_a_path_inside_the_root_counts() {
+    // The carve-out stays: a path inside the root is counted, generator or
+    // not.
+    let repo = Repo::new(
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": {
+                  "file": "docs/audit.json",
+                  "generate": ["sh", "generate.sh"],
+                  "output_arg": "--output"
+                }
+              }
+            }
+          }
+        ]"#,
+        Some(&baseline("a", 1)),
+    );
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf '{\"count\": 1}' > \"$2\"\n",
+    );
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 1);
 }
 
 #[test]
@@ -1952,7 +2525,7 @@ fn a_baseline_outside_the_repository_root_is_a_configuration_error() {
 }
 
 #[test]
-fn an_absolute_baseline_outside_the_repository_root_is_a_configuration_error() {
+fn an_absolute_baseline_is_a_configuration_error() {
     let repo = Repo::new(
         r#"[
           {
@@ -1975,11 +2548,141 @@ fn an_absolute_baseline_outside_the_repository_root_is_a_configuration_error() {
 
     assert_eq!(code(&output), 2, "{}", stderr(&output));
     let text = stderr(&output);
+    // The path of a project is relative: the message says what is wrong.
+    assert!(text.contains("has to be a relative path"), "{text}");
+    assert!(!text.contains("baseline must be inside"), "{text}");
+    assert!(!text.contains("monotonicity skipped"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_baseline_through_a_linked_directory_outside_the_root_is_refused() {
+    // The directory of the baseline is a link that points out of the root:
+    // the baseline would be written there, and it would never be committed —
+    // the monotonicity gate would be silently off.
+    let repo = Repo::new(
+        r#"[
+          {
+            "baseline": "linked/ratchet.baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+    let outside = Outside::new("baseline");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("linked"))
+        .expect("the link is made");
+
+    let output = repo.run(&["baseline", "init"]);
+
+    // The refusal is a configuration error, and the gate is not silently
+    // disabled.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
     assert!(
         text.contains("baseline must be inside the repository root"),
         "{text}"
     );
     assert!(!text.contains("monotonicity skipped"), "{text}");
+    // And the baseline was not written outside the root.
+    assert!(
+        !outside.file("ratchet.baseline.json").exists(),
+        "the baseline was written outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_baseline_through_a_chain_of_links_outside_the_root_is_refused() {
+    // The chain is what carries the path out: `ratchet.baseline.json` →
+    // `real/baseline.json` → a file outside the root that is not there.  A
+    // single link is refused already; the chain is the shape that slips
+    // through — and it is the shape that writes outside.
+    let repo = Repo::new(
+        r#"[
+          {
+            "baseline": "ratchet.baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+    let outside = Outside::new("baseline-chain");
+    link_chain(
+        &repo.path().join("ratchet.baseline.json"),
+        &repo.path().join("real/baseline.json"),
+        &outside.file("shared-baseline.json"),
+    );
+
+    let output = repo.run(&["baseline", "init"]);
+
+    // The refusal names the reason, and the gate is not silently disabled.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("baseline must be inside the repository root"),
+        "{text}"
+    );
+    assert!(!text.contains("monotonicity skipped"), "{text}");
+    // And the baseline was not written outside the root.
+    assert!(
+        !outside.file("shared-baseline.json").exists(),
+        "the baseline was written outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_baseline_behind_a_cycle_of_links_is_refused() {
+    // The links do not end: the path cannot be resolved, and a path that
+    // cannot be resolved is not inside the root.  The run must not hang.
+    let repo = Repo::new(
+        r#"[
+          {
+            "baseline": "ratchet.baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+    std::os::unix::fs::symlink("b", repo.path().join("ratchet.baseline.json"))
+        .expect("the first link is made");
+    std::os::unix::fs::symlink("ratchet.baseline.json", repo.path().join("b"))
+        .expect("the second link is made");
+
+    let output = repo.run(&["baseline", "init"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("could not be resolved"), "{text}");
+    assert!(
+        text.contains("the links of the path could not be followed to the end"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -2129,30 +2832,28 @@ fn a_generator_that_writes_nothing_leaves_no_temporary_directory_behind() {
 
 #[test]
 fn the_report_shows_a_repository_relative_path_for_the_generator() {
-    let outside = tempfile::tempdir().expect("a temporary directory");
-    let artifact = outside.path().join("ratchet-probe-outside.json");
+    // The artifact is a path of the repository: a path that leaves the root
+    // is refused by the rule, before the generator runs (the file counter
+    // with a `generate` is no exception).
     let repo = Repo::new(
-        &format!(
-            r#"[
-              {{
-                "rules": {{
-                  "a": {{
-                    "class": "c",
-                    "incident": "i",
-                    "unit": "files",
-                    "direction": "ceiling",
-                    "count": {{
-                      "file": "{}",
-                      "path": "coherence.items",
-                      "generate": ["sh", "generate.sh"],
-                      "output_arg": "--output"
-                    }}
-                  }}
-                }}
-              }}
-            ]"#,
-            artifact.display()
-        ),
+        r#"[
+          {
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "files",
+                "direction": "ceiling",
+                "count": {
+                  "file": "docs/ratchet-probe.json",
+                  "path": "coherence.items",
+                  "generate": ["sh", "generate.sh"],
+                  "output_arg": "--output"
+                }
+              }
+            }
+          }
+        ]"#,
         Some(&baseline("a", 3)),
     );
     repo.write("generate.sh", "#!/bin/sh\nexit 2\n");
@@ -2163,13 +2864,13 @@ fn the_report_shows_a_repository_relative_path_for_the_generator() {
 
     assert_eq!(code(&output), 2, "{}", stderr(&output));
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    // The report shows the file name, never the absolute path of the config.
+    // The report shows the repository-relative path, never an absolute one.
     assert!(
-        text.contains("the generator for ratchet-probe-outside.json"),
+        text.contains("the generator for docs/ratchet-probe.json"),
         "{text}"
     );
     assert!(
-        !text.contains(&artifact.display().to_string()),
+        !text.contains(&repo.path().display().to_string()),
         "the report contains the absolute path: {text}"
     );
     assert_deterministic(&text);
@@ -2590,9 +3291,14 @@ fn an_empty_class_incident_or_unit_is_a_configuration_error() {
 
 /// A config with one generated file and no rule.
 fn generated_config(command: &[&str], output_arg: Option<&str>) -> String {
+    generated_config_at("docs/generated.md", command, output_arg)
+}
+
+/// A config with one generated file at `path` and no rule.
+fn generated_config_at(path: &str, command: &[&str], output_arg: Option<&str>) -> String {
     let argv: Vec<String> = command.iter().map(|part| format!("\"{part}\"")).collect();
     let mut entry = format!(
-        "{{ \"path\": \"docs/generated.md\", \"command\": [{}]",
+        "{{ \"path\": \"{path}\", \"command\": [{}]",
         argv.join(", ")
     );
     if let Some(output_arg) = output_arg {
@@ -4952,8 +5658,9 @@ fn an_absolute_snapshot_path_is_refused() {
     let output = repo.run(&["verify"]);
 
     assert_eq!(code(&output), 2, "{}", stderr(&output));
+    // The path of a project is relative: the message says what is wrong.
     assert!(
-        stderr(&output).contains("must lie inside the repository root"),
+        stderr(&output).contains("has to be a relative path"),
         "{}",
         stderr(&output)
     );
@@ -5499,6 +6206,73 @@ fn a_snapshot_that_leaves_the_root_through_a_link_is_refused() {
     assert!(!outside.path().join("benchmark.txt").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_snapshot_through_a_link_and_a_parent_is_refused() {
+    // "link/../snap.txt" is ambiguous: the operating system reads it as the
+    // parent of the link's **target**, and `--update` would write there.
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "link/../snap.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    let outside = Outside::new("parent-snapshot");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "link"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the check benchmark"), "{text}");
+    assert!(text.contains("is ambiguous"), "{text}");
+    // Nothing was written outside the tree.
+    assert!(
+        !outside.file("snap.txt").exists(),
+        "the snapshot was written outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_snapshot_behind_a_chain_of_links_is_refused() {
+    // The snapshot is a chain: `snap.txt` → `real/snap.txt` → a file outside
+    // the root that is not there.
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh", "<out>"], "snap.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    let outside = Outside::new("snapshot-chain");
+    link_chain(
+        &repo.path().join("snap.txt"),
+        &repo.path().join("real/snap.txt"),
+        &outside.file("shared-snap.txt"),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "link"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the check benchmark"), "{text}");
+    assert!(
+        text.contains("must lie inside the repository root"),
+        "{text}"
+    );
+    // Nothing was written outside the tree.
+    assert!(
+        !outside.file("shared-snap.txt").exists(),
+        "the snapshot was written outside the repository root"
+    );
+}
+
 #[test]
 fn an_empty_directory_the_command_created_is_removed() {
     let repo = Repo::new(
@@ -5585,4 +6359,425 @@ fn the_diagnostic_channel_shows_the_argv_of_the_check() {
     assert!(text.contains("sh bench.sh"), "{text}");
     // And the resolved config.
     assert!(text.contains("resolved config"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_linked_directory_outside_the_root_is_refused() {
+    // The directory inside the root is a link that points out of it: the
+    // write would leave the tree the engine owns.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("drift");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_linked_directory_and_a_new_directory_is_refused() {
+    // The directory of the generated file does not exist yet, and the
+    // directory above it is a link that points out of the root: the engine
+    // would create the directory — and write the file — outside the tree it
+    // owns.
+    let repo = Repo::new(
+        &generated_config_at(
+            "docs/sub/generated.md",
+            &["sh", "gen.sh", "docs/sub/generated.md"],
+            None,
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("drift-nested");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was created outside the root.
+    assert!(
+        !outside.path().join("sub").exists(),
+        "the gate created a directory outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_chain_of_links_outside_the_root_is_refused() {
+    // The generated file is a chain: `docs/generated.md` → `docs/real.md` →
+    // a file outside the root that is not there.  The in-place generator
+    // would write through it.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("drift-chain");
+    link_chain(
+        &repo.path().join("docs/generated.md"),
+        &repo.path().join("docs/real.md"),
+        &outside.file("shared-generated.md"),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("shared-generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_temporary_output_through_a_chain_is_refused() {
+    // The same chain, in the mode where the generator writes to a temporary
+    // path: the tree is never touched, and the gate is still refused.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], Some("--output")),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$2\"\n");
+    let outside = Outside::new("drift-chain-temp");
+    link_chain(
+        &repo.path().join("docs/generated.md"),
+        &repo.path().join("docs/real.md"),
+        &outside.file("shared-generated.md"),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("shared-generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_link_and_a_parent_is_refused() {
+    // "link/../generated.md" is ambiguous: the operating system reads it as
+    // the parent of the link's **target** — and the generator would write
+    // there.
+    let repo = Repo::new(
+        &generated_config_at(
+            "link/../generated.md",
+            &["sh", "gen.sh", "link/../generated.md"],
+            None,
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("parent-drift");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is ambiguous"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_temporary_output_through_a_link_and_a_parent_is_refused() {
+    // The same shape, in the mode where the generator writes to a temporary
+    // path: the tree is never touched, and the gate is still refused.
+    let repo = Repo::new(
+        &generated_config_at(
+            "link/../generated.md",
+            &["sh", "gen.sh", "link/../generated.md"],
+            Some("--output"),
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$2\"\n");
+    let outside = Outside::new("parent-drift-temp");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is ambiguous"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_fix_through_a_link_and_a_parent_is_refused() {
+    // The `--fix` mode writes the produced content into the generated file:
+    // the path has to be refused before that happens.
+    let repo = Repo::new(
+        &generated_config_at(
+            "link/../generated.md",
+            &["sh", "gen.sh", "link/../generated.md"],
+            None,
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("parent-drift-fix");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is ambiguous"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[test]
+fn a_drift_gate_with_an_absolute_path_is_refused() {
+    let repo = Repo::new(
+        &generated_config_at(
+            "/etc/generated.md",
+            &["sh", "gen.sh", "/etc/generated.md"],
+            None,
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("has to be a relative path"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_chain_in_a_directory_of_the_path_is_refused() {
+    // The chain is in a directory of the path, not at the file position:
+    // `docs` → `real` → a directory outside the root that is not there.  The
+    // engine would create the directory — and write the file — outside.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    let outside = Outside::new("drift-chain-directory");
+    link_chain(
+        &repo.path().join("docs"),
+        &repo.path().join("real"),
+        &outside.path().join("sub"),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was created outside the root.
+    assert!(
+        !outside.path().join("sub").exists(),
+        "the gate created a directory outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_target_that_is_a_link_outside_the_root_is_refused() {
+    // The generated file itself is a link to a file outside the root: the
+    // generator would write through it, and the comparison would follow it
+    // out of the tree the engine owns.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    std::fs::create_dir_all(repo.path().join("docs")).expect("the directory is created");
+    let outside = Outside::new("drift-target");
+    std::os::unix::fs::symlink(
+        outside.file("generated.md"),
+        repo.path().join("docs/generated.md"),
+    )
+    .expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing was written outside the root.
+    assert!(
+        !outside.file("generated.md").exists(),
+        "the gate wrote outside the repository root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_dangling_link_is_refused() {
+    // The generated file is a link that points at nothing: the generator
+    // would create the file behind it, and the restore cannot take that
+    // file back — the tree would change.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    std::fs::create_dir_all(repo.path().join("docs")).expect("the directory is created");
+    // The link points at a file inside the root that is not there: the path
+    // itself is inside the root, and the link is the problem.
+    std::os::unix::fs::symlink("real.md", repo.path().join("docs/generated.md"))
+        .expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The error names the file and the reason.
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("docs/generated.md"), "{text}");
+    assert!(text.contains("points at nothing"), "{text}");
+    // Nothing was created behind the link.
+    assert!(
+        !repo.path().join("docs/real.md").exists(),
+        "the gate created the file behind the dangling link"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_dangling_link_and_a_temporary_output_is_refused() {
+    // The same link, in the mode where the generator writes to a temporary
+    // path: the tree is never touched, so the reason is the comparison —
+    // the message must not blame the generator.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], Some("--output")),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$2\"\n");
+    std::fs::create_dir_all(repo.path().join("docs")).expect("the directory is created");
+    std::os::unix::fs::symlink("real.md", repo.path().join("docs/generated.md"))
+        .expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("points at nothing"), "{text}");
+    assert!(
+        text.contains("the comparison would follow it to a file that is not there"),
+        "{text}"
+    );
+    // The generator never writes through the link in this mode.
+    assert!(
+        !text.contains("the generator would write through it"),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_a_target_that_is_a_link_inside_the_root_is_allowed() {
+    // The carve-out stays: the file may be a link as long as its target
+    // lies inside the root — the comparison follows the link.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.write("docs/real.md", "generated\n");
+    std::os::unix::fs::symlink("real.md", repo.path().join("docs/generated.md"))
+        .expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate compares the file behind the link.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert_eq!(repo.read("docs/real.md"), "generated\n");
 }

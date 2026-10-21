@@ -951,10 +951,68 @@ fn a_symlinked_changelog_outside_the_root_is_refused() {
     let output = repo.run(&["release"]);
 
     assert_eq!(code(&output), 2, "{}", stderr(&output));
+    // The refusal names the reason: the path leaves the root.  It does not
+    // blame a link — the reason is the same for every path that leaves the
+    // root.
     assert!(
-        stderr(&output).contains("symbolic link"),
+        stderr(&output).contains("must lie inside the repository root"),
         "{}",
         stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("symbolic link"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_changelog_behind_a_chain_of_links_is_refused() {
+    let repo = Repo::new(
+        r#"[{ "release": { "changelog": "CHANGELOG.md",
+             "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" } } }]"#,
+    );
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"ratchet\"\nversion = \"0.1.0\"\n",
+    );
+    repo.commit("the manifest");
+    repo.git(&["tag", "v0.1.0"]);
+    repo.commit("feat: a feature");
+
+    // The changelog is a chain: `CHANGELOG.md` → `real/CHANGELOG.md` → a file
+    // outside the repository that is not there.
+    let outside = repo
+        .path()
+        .parent()
+        .expect("a parent directory")
+        .join("outside-changelog-chain.md");
+    // The name is fixed, so a run that wrote there — a mutation, not the
+    // tool — would leave a file behind and the next run would find a link
+    // that is not dangling any more.  The file is removed first.
+    let _ = std::fs::remove_file(&outside);
+    std::fs::create_dir_all(repo.path().join("real")).expect("the directory is created");
+    std::os::unix::fs::symlink(&outside, repo.path().join("real/CHANGELOG.md"))
+        .expect("the second link is made");
+    std::os::unix::fs::symlink(
+        repo.path().join("real/CHANGELOG.md"),
+        repo.path().join("CHANGELOG.md"),
+    )
+    .expect("the first link is made");
+
+    let output = repo.run(&["release"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must lie inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+    // And nothing was written outside the repository.
+    assert!(
+        !outside.exists(),
+        "the changelog was written outside the repository root"
     );
 }
 

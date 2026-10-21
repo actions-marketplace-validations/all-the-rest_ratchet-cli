@@ -35,6 +35,9 @@ use crate::check::{ActionKind, BaselineAction, Report};
 use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Rule, Tier};
 use crate::git::Git;
 
+/// The name of the config `ratchet init` writes.
+const CONFIG_FILE_STARTER: &str = "ratchet.config.jsonc";
+
 /// The starter config `ratchet init` writes.
 const STARTER_CONFIG: &str = r#"// ratchet — starter config.
 //
@@ -473,26 +476,16 @@ fn cmd_release(cli: &Cli, args: &ReleaseArgs, cwd: &Path) -> Result<i32, Error> 
 /// outside it would let the engine write outside the tree it owns, and the
 /// report is a file of the repository — the drift gate reads it there.
 ///
-/// The check is **not** only lexical: a symbolic link inside the root can
-/// point outside it, and the report would follow the link.  The path is
-/// therefore resolved — the existing part of it, the rest is kept — and the
-/// resolved path has to lie inside the resolved root.
+/// The path is **relative** — the paths of a project are relative (SPEC §6)
+/// — and the check resolves it: a symbolic link inside the root can point
+/// outside it, and the report would follow the link.
 fn report_path(root: &Path, raw: &str) -> Result<(PathBuf, String), Error> {
+    if let Some(refusal) = path::inside_repository(root, raw)
+        .refusal("the report", "must be written inside the repository root")
+    {
+        return Err(Error::new(format!("config error at --output: {refusal}")));
+    }
     let full = path::normalize(&root.join(Path::new(raw)));
-    if !full.starts_with(path::normalize(root)) {
-        return Err(Error::new(
-            "config error at --output: the report must be written inside the repository root",
-        ));
-    }
-    // The link is resolved: a path that leaves the root through a symbolic
-    // link is a path outside the root.
-    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if !path::resolve(&full).starts_with(&resolved_root) {
-        return Err(Error::new(
-            "config error at --output: the report must be written inside the repository root — \
-             the path leaves it through a symbolic link",
-        ));
-    }
     let relative = path::relative_to(root, &full).unwrap_or_default();
     if relative.is_empty() {
         return Err(Error::new(
@@ -1106,7 +1099,16 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
         .root()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cwd.to_path_buf());
-    let path = directory.join("ratchet.config.jsonc");
+    // The config is a path the project names: the rule applies to it as well.
+    // A link at that position that leads out of the tree is refused — the
+    // starter config would be written outside it.
+    if let Some(refusal) = path::inside_repository(&directory, CONFIG_FILE_STARTER).refusal(
+        &format!("the config file {CONFIG_FILE_STARTER}"),
+        "must lie inside the repository root",
+    ) {
+        return Err(Error::new(refusal));
+    }
+    let path = directory.join(CONFIG_FILE_STARTER);
     fs::write(&path, STARTER_CONFIG).map_err(|e| {
         Error::new(format!(
             "cannot write {}: {e}",
@@ -1216,19 +1218,16 @@ fn load_context(cli: &Cli, cwd: &Path) -> Result<Context, Error> {
         .baseline
         .clone()
         .unwrap_or_else(|| DEFAULT_BASELINE_FILE.to_string());
-    let baseline_path = path::normalize(&if Path::new(&baseline_rel).is_absolute() {
-        PathBuf::from(&baseline_rel)
-    } else {
-        config_dir.join(&baseline_rel)
-    });
 
     // The baseline has to be comparable with its committed version, and that
-    // only works inside the repository root (SPEC 2).
-    if !baseline_path.starts_with(path::normalize(&root)) {
-        return Err(Error::new(
-            "config error at baseline: the baseline must be inside the repository root",
-        ));
+    // only works inside the repository root (SPEC 2).  The check resolves the
+    // path — a link cannot carry it out of the root.
+    if let Some(refusal) = path::inside_root(&root, &config_dir, &baseline_rel)
+        .refusal("the baseline", "must be inside the repository root")
+    {
+        return Err(Error::new(format!("config error at baseline: {refusal}")));
     }
+    let baseline_path = path::normalize(&config_dir.join(&baseline_rel));
 
     let baseline_rel = path::relative_to(&root, &baseline_path);
 

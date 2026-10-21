@@ -128,11 +128,11 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
     for entry in entries {
         // The snapshot lies inside the repository root: a path that points
         // outside it would let the engine write outside the tree it owns.
-        if !inside(options.root, &entry.snapshot) {
-            return Err(Error::new(format!(
-                "the check {}: the snapshot {} must lie inside the repository root",
-                entry.name, entry.snapshot
-            )));
+        let subject = format!("the check {}: the snapshot {}", entry.name, entry.snapshot);
+        if let Some(refusal) = path::inside_repository(options.root, &entry.snapshot)
+            .refusal(&subject, "must lie inside the repository root")
+        {
+            return Err(Error::new(refusal));
         }
         if let Some(filter) = options.name {
             if filter != entry.name {
@@ -249,25 +249,6 @@ fn run_one(
         diff,
         detail,
     })
-}
-
-/// True when the path lies inside the repository root.
-///
-/// The check is **not** only lexical: a symbolic link inside the root can
-/// point outside it, and `--update` would write through that link.  The path
-/// is therefore resolved — the existing part of it, the rest is kept — and
-/// the resolved path has to lie inside the resolved root.
-fn inside(root: &Path, relative: &str) -> bool {
-    let path = Path::new(relative);
-    if path.is_absolute() {
-        return false;
-    }
-    let full = root.join(path);
-    if !path::normalize(&full).starts_with(path::normalize(root)) {
-        return false;
-    }
-    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    path::resolve(&full).starts_with(&resolved_root)
 }
 
 /// Runs the command of a check and returns the bytes it produced.

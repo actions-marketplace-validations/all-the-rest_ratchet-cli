@@ -281,24 +281,18 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
 /// The path of a file the run writes, resolved against the repository root.
 ///
 /// The path has to lie **inside** the root: a path that leaves it would let
-/// the engine write outside the tree it owns.  The check is not only lexical
-/// — a symbolic link inside the root can point outside it, and the write
-/// would follow the link.
+/// the engine write outside the tree it owns.  The path is **relative** — the
+/// paths of a project are relative (SPEC §6) — and the check resolves it: a
+/// symbolic link inside the root can point outside it, and the write would
+/// follow the link.
 fn inside_root(root: &Path, relative: &str) -> Result<PathBuf, Error> {
-    let full = crate::path::normalize(&root.join(Path::new(relative)));
-    if !full.starts_with(crate::path::normalize(root)) {
-        return Err(Error::new(format!(
-            "the path {relative} must lie inside the repository root"
-        )));
+    let subject = format!("the path {relative}");
+    if let Some(refusal) = crate::path::inside_repository(root, relative)
+        .refusal(&subject, "must lie inside the repository root")
+    {
+        return Err(Error::new(refusal));
     }
-    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if !crate::path::resolve(&full).starts_with(&resolved_root) {
-        return Err(Error::new(format!(
-            "the path {relative} must lie inside the repository root — it leaves it through a \
-             symbolic link"
-        )));
-    }
-    Ok(full)
+    Ok(crate::path::normalize(&root.join(Path::new(relative))))
 }
 
 /// Parses a commit of the history.

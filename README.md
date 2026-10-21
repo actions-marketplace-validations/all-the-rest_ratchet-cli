@@ -77,7 +77,58 @@ root is accepted as shorthand for a one-element array.
 The baseline file lives next to the config and must lie **inside the
 repository root**: a baseline that cannot be compared with its committed
 version is a gate that does not gate. A config that points outside the root is
-a configuration error.
+an operational error.
+
+Every path a project names — the baseline, the artifact of a counter, the
+registry, a generated file, the snapshot of a check, the output of the report,
+the config of `init`, the files of the release — follows **one rule**: it is
+**relative**, and it lies **inside the repository root**, **resolved**.
+
+- **relative** — a committed config has to work on every machine: the same
+  repository is checked out in different places, and an absolute path names
+  one of them. A path of a project is therefore relative to the **repository
+  root** — to the **directory of the config** for the baseline, which lives
+  next to the config.
+- **inside** — a path outside the root names a file the project does not own.
+  The engine would read it, write it, or compare it with the committed
+  version — and none of that is the engine's business.
+- **resolved** — the path is resolved **component by component**, the way the
+  operating system resolves it, and the **whole** path is compared with the
+  resolved root: `.` is skipped, `..` pops the resolved prefix, and a name
+  that is a symbolic link is **followed** — its target is resolved the same
+  way, and the walk continues from there.
+
+  Neither a link in a directory of the path nor a link at the file position
+  can therefore carry the path out of the root. The **chain** of links is
+  followed to its **final** target: the target of a link may be a link itself,
+  and a link that points at a link that points out of the root carries the
+  path out of it.
+
+**A `..` directly after a link is refused.** The operating system reads
+`link/..` as the parent of the link's **target**, a reader of the config as
+the parent of the named directory: the two readings differ, and the tool does
+not pick one. A `..` that does not follow a link keeps working as it always
+did (`docs/../x` stays `x`; `link/sub/..` is the parent of the link's target,
+and there both readings agree).
+
+**A path that cannot be resolved is refused.** The links of the path could
+not be followed to the end: a cycle (`a → b → a`) or a chain that is longer
+than the bound. The tool follows at most **32** links and refuses a path with
+more — the system's own limit is smaller on some systems (15 on Darwin) and
+larger on others (40 on Linux): where the system refuses earlier, the
+operation fails with `ELOOP`. The tool refuses a path it cannot resolve, and
+the system refuses a path it cannot open; both fail closed. A link the engine
+cannot even **read** — one in a directory it may not search — is not seen as a
+link at all: the path is treated as a plain name, and the operation that
+follows fails with the permission error of the system.
+
+The file itself may be a **link**, as long as its **target** lies inside the
+root: there the comparison follows the link. A path that breaks the rule is an
+**operational error** — the run ends with exit code 2. A counter whose path
+breaks the rule reports its rule as a `counter-error`: the same exit code, and
+the same kind of failure. The **wording** is the subject's own: the baseline,
+the report, a counter, the drift gate, the pre-release check, `init` and the
+release step each name the path in their own words.
 
 The file is `ratchet.config.jsonc` (JSON with comments and trailing commas);
 `ratchet.config.json`, `ratchet.config.mjs` and `ratchet.config.cjs` are
@@ -191,6 +242,14 @@ then as JSON in the shapes above. The command runs in the repository root,
 without a shell — the arguments are passed through verbatim. A counter that
 fails, produces garbage or a negative number is a counter error.
 
+A **file** counter reads a JSON file of the repository — optionally a dotted
+`path` into it. The file follows the **one rule**: it is relative and it lies
+inside the repository root — resolved. The rule is about the path the project
+**names**, not about what the run reads from it: with `generate` the count
+comes from a temporary path, and the configured path is still the project's. A
+path that breaks the rule is an **operational error**, and the message names
+the **configured** path.
+
 `exclude` needs a counter that yields items; a scalar counter plus `exclude` is
 a configuration error.
 
@@ -254,7 +313,9 @@ The file itself:
 * A registry that cannot be read, that carries a version other than `1`, that
   has a missing field, a duplicate `id` or an unknown level or status is a
   **configuration error** (exit code 2) that names the offending entry. The
-  registry has to live inside the repository root.
+  registry follows the **one rule** too: it is relative and it lies inside the
+  repository root — resolved. A path that breaks the rule is an operational
+  error, and the message names the **configured** path.
 * The registry is a **view** of the prose findings, not a second source of
   truth: the review log stays the human record, and the two are migrated in
   the same commit.
@@ -337,6 +398,20 @@ A `generated[]` entry may declare a `tier` (`fast` | `slow`, default `fast`).
 browser or the network belongs to the slow tier, and a fast tier that waits
 for it is a fast tier that is not fast.
 
+The generated file follows the **one rule**: it is relative and it lies inside
+the repository root — resolved, the file included. A path that leaves the root
+would let the engine write outside the tree it owns, and a link that points
+out of it would take the write with it. The file itself may be a link, as long
+as its **target** lies inside the root: there the file is the subject, and the
+comparison follows the link.
+
+A **dangling** link at the file position is refused with a named error. In the
+in-place mode the generator would write through it and create the file behind
+it, and the restore cannot take that file back — the tree would change. In the
+temporary-output mode the tree is never touched, but the comparison would
+follow the link to a file that is not there, and it would say nothing about
+the generated file.
+
 Two generator modes exist:
 
 - **with `output_arg`** — the generator writes to a temporary path; the tree
@@ -348,10 +423,13 @@ Two generator modes exist:
   file in the same directory, gives it the original mode and time and
   **renames** it over the target — a rename replaces a symbolic link instead
   of writing through it — verifies the restore and removes a directory the
-  generator created and left empty. If the target **is** a symbolic link, the
-  restore writes the file **behind** the link and recreates the link: a
+  generator created and left empty. If the target **is** a symbolic link,
+  the restore writes the file **behind** the link and recreates the link: a
   rename over the link would replace it with a regular file and change the
-  tree, and the tree must not change. A restore that fails ends the run with
+  tree, and the tree must not change. A generator writes **behind** a link, so
+  the file behind the link is the one that changes — a file created behind a
+  **dangling** link is not removed, which is why a dangling link is refused. A
+  restore that fails ends the run with
   an operational error that names the file and says that the working tree was
   modified: a swallowed restore error is a mutated tree that nobody was told
   about.
@@ -410,6 +488,8 @@ The `verify` entries of the config name the checks:
 
 * The **snapshot** is a committed file, machine-written, the same discipline as
   the baseline: never hand-edited, the diff is the review artifact.
+* The path of the snapshot follows the **one rule** too: it is relative and it
+  lies inside the repository root — resolved.
 * The command runs with the working directory set to the **repository root**
   and writes to a **temporary path** — the check does not modify the tree.
 * The comparison is against the **committed** snapshot
@@ -563,7 +643,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet report` | Renders the run into a **Markdown report**: the summary with the verdict, one row per rule, the findings that count and the notes of the run. The drift gates are not in it — a report that held the result of the comparison with itself would be a regress. `--output <path>` writes it into the repository instead of stdout. See [the Markdown report](#the-markdown-report). |
 | `ratchet release` | Computes the next version from the commits since the last release tag and renders the changelog block of that version. It writes the version into the manifest of the project and appends the block to the changelog — and it writes **no tag**: a tag is a promise, and a promise is not made by a tool. `--from <tag>` computes the release from another tag, `--dry-run` prints the release and changes nothing. See [the release step](#the-release-step). |
 | `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
-| `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
+| `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. The config is a path the project names: the **one rule** applies to it, and a link at that position that leads out of the tree is refused. |
 
 ### Options
 
@@ -807,6 +887,12 @@ The Markdown report is the default of the `report` command — `--format md` say
 it explicitly, and the other commands print the stylish output or the JSON
 document.
 
+The path of `--output` follows the **one rule**: it is relative and it lies
+inside the repository root — resolved. A path that breaks the rule is an
+operational error. The **directory** of the output has to exist: the command
+writes one file and changes nothing else, and it does not create a directory
+that the project did not have.
+
 The report is a **rendering of a run**, not a second run: the same counters and
 the same numbers. The report runs the **rules** only — the drift gates are
 gates over the *generated* files, and the report is one of them, so a report
@@ -873,7 +959,7 @@ exist. The report is a function of the **rules** alone: a generated file that
 drifts does not change it.
 
 `--output <path>` writes the file; the path is relative to the repository
-root, and a path outside it is a configuration error. The command writes that
+root, and a path outside it is an operational error. The command writes that
 one file and touches nothing else: the directory of the report has to exist —
 the command does not create it.
 
@@ -1212,10 +1298,11 @@ The generator **appends** one block; it never rewrites the file. Below
 a block for a version below it and says so. From that version on, every block
 is machine-written.
 
-The command writes **two** files: the version file and the changelog. It
-writes **no tag**: the tag is the decision of the human, and the release
-workflow publishes what the tag names. `--dry-run` prints the release and
-changes nothing.
+The command writes **two** files: the version file and the changelog. Both
+paths follow the **one rule**: they are relative and they lie inside the
+repository root — resolved. It writes **no tag**: the tag is the decision of
+the human, and the release workflow publishes what the tag names. `--dry-run`
+prints the release and changes nothing.
 
 ## This repo gates itself
 

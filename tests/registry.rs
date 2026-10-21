@@ -123,6 +123,59 @@ fn code(output: &Output) -> i32 {
     output.status.code().expect("the process exited normally")
 }
 
+/// A directory outside the repository root.
+///
+/// The directory is removed again when it goes out of scope: a temporary is
+/// removed, and a test that fails must not leave anything behind.  The name
+/// carries the process id: a run that lets the engine write into it — a
+/// defect, a mutation — must not make the next run fail.
+#[cfg(unix)]
+struct Outside {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Outside {
+    /// Creates the directory.
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ratchet-outside-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the directory is created");
+        Self { path }
+    }
+
+    /// The path of the directory.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The path of a file in the directory.
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.path.join(name)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Outside {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A chain of two links: `name` → `middle` → `target`.
+///
+/// The chain is what carries a path out of the root: `canonicalize` follows a
+/// chain whose final target **exists**, but a chain that ends at a missing
+/// file has to be followed by hand.
+#[cfg(unix)]
+fn link_chain(name: &Path, middle: &Path, target: &Path) {
+    let directory = middle.parent().expect("a parent directory");
+    std::fs::create_dir_all(directory).expect("the directory is created");
+    std::os::unix::fs::symlink(target, middle).expect("the second link is made");
+    std::os::unix::fs::symlink(middle, name).expect("the first link is made");
+}
+
 /// A registry with one finding of every level and every status.
 ///
 /// The counting findings are `SEC-01` (critical, open) and `SEC-02` (high,
@@ -495,9 +548,91 @@ fn a_registry_outside_the_repository_root_is_a_configuration_error() {
 }
 
 #[test]
-fn an_absolute_registry_outside_the_repository_root_is_a_configuration_error() {
+fn an_absolute_registry_is_a_configuration_error() {
     let repo = Repo::new(&config(r#"{ "registry": "/etc/ratchet.findings.json" }"#));
     repo.write("ratchet.baseline.json", &baseline("open-findings", 0));
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    let message = detail_of(&output);
+    // The path of a project is relative: the message says what is wrong.
+    assert!(message.contains("has to be a relative path"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registry_through_a_linked_directory_outside_the_root_is_a_configuration_error() {
+    let repo = Repo::new(&config(r#"{ "registry": "docs/ratchet.findings.json" }"#));
+    repo.write("ratchet.baseline.json", &baseline("open-findings", 0));
+    // The directory inside the root is a link that points out of it: the
+    // registry behind the link is a file the repository does not own.
+    let outside = Outside::new("registry");
+    std::fs::write(outside.file("ratchet.findings.json"), MIXED).expect("the file is written");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    let message = detail_of(&output);
+    assert!(message.contains("outside the repository root"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registry_that_is_a_link_to_a_file_outside_the_root_is_refused() {
+    let repo = Repo::new(&config(r#"{ "registry": "ratchet.findings.json" }"#));
+    repo.write("ratchet.baseline.json", &baseline("open-findings", 0));
+    // The registry itself is a link to a file outside the root: the counter
+    // would read a file the repository does not own.
+    let outside = Outside::new("registry-target");
+    std::fs::write(outside.file("ratchet.findings.json"), MIXED).expect("the file is written");
+    std::os::unix::fs::symlink(
+        outside.file("ratchet.findings.json"),
+        repo.path().join("ratchet.findings.json"),
+    )
+    .expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    let message = detail_of(&output);
+    assert!(message.contains("outside the repository root"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registry_through_a_link_and_a_parent_is_refused() {
+    // "link/../findings.json" is ambiguous: the operating system reads it as
+    // the parent of the link's **target**.
+    let repo = Repo::new(&config(
+        r#"{ "registry": "link/../ratchet.findings.json" }"#,
+    ));
+    repo.write("ratchet.baseline.json", &baseline("open-findings", 0));
+    let outside = Outside::new("parent-registry");
+    std::fs::write(outside.file("ratchet.findings.json"), MIXED).expect("the file is written");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("the link is made");
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    let message = detail_of(&output);
+    assert!(message.contains("is ambiguous"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registry_through_a_chain_of_links_outside_the_root_is_refused() {
+    let repo = Repo::new(&config(r#"{ "registry": "ratchet.findings.json" }"#));
+    repo.write("ratchet.baseline.json", &baseline("open-findings", 0));
+    // The registry is a chain: `ratchet.findings.json` → `real/findings.json`
+    // → a file outside the root that is not there.
+    let outside = Outside::new("registry-chain");
+    link_chain(
+        &repo.path().join("ratchet.findings.json"),
+        &repo.path().join("real/findings.json"),
+        &outside.file("shared-findings.json"),
+    );
 
     let output = repo.run(&["check", "--format", "json"]);
 

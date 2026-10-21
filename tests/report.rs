@@ -590,6 +590,30 @@ fn a_path_outside_the_repository_root_is_a_configuration_error() {
     );
 }
 
+#[test]
+fn an_absolute_output_inside_the_repository_root_is_refused() {
+    let repo = fixture();
+    // The path is inside the repository — but it is absolute, and the paths
+    // of a project are relative.
+    let absolute = repo.path().join("report.md");
+
+    let output = repo.run(&[
+        "report",
+        "--format",
+        "md",
+        "--output",
+        absolute.to_str().expect("a path"),
+    ]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    let text = stderr(&output);
+    // The message says what is wrong — and it does not blame a link.
+    assert!(text.contains("has to be a relative path"), "{text}");
+    assert!(!text.contains("symbolic link"), "{text}");
+    // And nothing was written.
+    assert_eq!(repo.status(), "");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_output_does_not_escape_the_repository_root_through_a_symlink() {
@@ -623,6 +647,47 @@ fn the_output_does_not_escape_the_repository_root_through_a_symlink() {
     );
     // And nothing inside either: only the link the test created.
     assert_eq!(repo.status(), "?? link.md\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_chain_of_links_does_not_carry_the_report_out_of_the_repository_root() {
+    let repo = fixture();
+    // The chain is what carries the path out: `report.md` → `real/report.md`
+    // → a file outside the repository that is not there.
+    let outside = repo
+        .path()
+        .parent()
+        .expect("a parent directory")
+        .join(format!(
+            "{}-chain.md",
+            repo.path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+    std::fs::create_dir_all(repo.path().join("real")).expect("the directory is created");
+    std::os::unix::fs::symlink(&outside, repo.path().join("real/report.md"))
+        .expect("the second link is made");
+    std::os::unix::fs::symlink(
+        repo.path().join("real/report.md"),
+        repo.path().join("report.md"),
+    )
+    .expect("the first link is made");
+
+    let output = repo.run(&["report", "--format", "md", "--output", "report.md"]);
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    assert!(
+        stderr(&output).contains("must be written inside the repository root"),
+        "{}",
+        said(&output)
+    );
+    // Nothing was written outside the repository.
+    assert!(
+        !outside.exists(),
+        "the report was written outside the repository"
+    );
 }
 
 #[cfg(unix)]

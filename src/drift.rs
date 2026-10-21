@@ -125,10 +125,27 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
         // The generated file lies inside the repository root: a path that
         // points outside it would let the engine write outside the tree it
         // owns.
-        if !inside(options.root, &entry.path) {
+        let subject = format!("the generated file {}", entry.path);
+        if let Some(refusal) = path::inside_repository(options.root, &entry.path)
+            .refusal(&subject, "must lie inside the repository root")
+        {
+            return Err(Error::new(refusal));
+        }
+        // A **dangling** link at the file position is refused.  The reason
+        // depends on the mode: the in-place generator would write through the
+        // link and create the file behind it — and the restore cannot take
+        // that file back — while the temporary-output mode never touches
+        // the tree, but the comparison would follow the link to a file that
+        // is not there.
+        if is_dangling_link(options.root, &entry.path) {
+            let reason = if entry.output_arg.is_some() {
+                "the comparison would follow it to a file that is not there"
+            } else {
+                "the generator would write through it, and the restore could not take the file \
+                 back"
+            };
             return Err(Error::new(format!(
-                "the generated file {} must lie inside the repository root",
-                entry.path
+                "{subject} is a symbolic link that points at nothing — {reason}"
             )));
         }
         if let Some(filter) = options.path {
@@ -258,13 +275,21 @@ fn run_one(
     })
 }
 
-/// True when the path lies inside the repository root.
-fn inside(root: &Path, relative: &str) -> bool {
-    let path = Path::new(relative);
-    if path.is_absolute() {
+/// True when the path is a symbolic link that points at nothing.
+///
+/// The generator would write through such a link and create the file behind
+/// it — and the restore cannot take that file back: the tree would change,
+/// and nobody was told about it.
+fn is_dangling_link(root: &Path, relative: &str) -> bool {
+    let target = root.join(relative);
+    let Ok(metadata) = fs::symlink_metadata(&target) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
         return false;
     }
-    path::normalize(&root.join(path)).starts_with(path::normalize(root))
+    // The link is followed: a link that points at nothing fails here.
+    fs::metadata(&target).is_err()
 }
 
 /// The path the comparison is made against.

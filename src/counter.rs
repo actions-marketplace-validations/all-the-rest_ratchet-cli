@@ -113,7 +113,7 @@ pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<Counter
                 }
                 (None, _) => None,
             };
-            run_file(file, json_path.as_deref(), generator, root)
+            run_file(file, json_path.as_deref(), generator, root, path)
         }
         Counter::Registry {
             registry,
@@ -285,9 +285,24 @@ fn run_file(
     json_path: Option<&str>,
     generate: Option<Generator>,
     root: &Path,
+    path: &str,
 ) -> Result<CounterRun, CounterError> {
     // Every path in the report is relative to the repository root.
     let display = crate::path::display(Some(root), &root.join(file));
+
+    // The artifact is a file of the repository: a path that leaves the root
+    // would name a file the repository does not own.  The rule is about the
+    // path the project **names**, not about what the run reads from it: with
+    // `generate` the count comes from a temporary path, and the configured
+    // path is still the project's.  The message names the **configured**
+    // path — the user has to see which path of the config was refused.
+    if let Some(refusal) =
+        crate::path::inside_repository(root, file).refusal(file, "is outside the repository root")
+    {
+        return Err(CounterError::config(format!(
+            "config error at {path}.file: {refusal}"
+        )));
+    }
 
     let (text, output) = match generate {
         Some(generator) => {
@@ -356,13 +371,16 @@ fn run_registry(
     path: &str,
 ) -> Result<CounterRun, CounterError> {
     // The registry lives inside the repository root: a path that escapes it
-    // is a configuration error, not a file to read.
-    let full = crate::path::normalize(&root.join(registry));
-    if !full.starts_with(crate::path::normalize(root)) {
+    // is a configuration error, not a file to read.  The check resolves the
+    // whole path — a link cannot carry it out.
+    if let Some(refusal) = crate::path::inside_repository(root, registry)
+        .refusal(registry, "is outside the repository root")
+    {
         return Err(CounterError::config(format!(
-            "config error at {path}.registry: {registry} is outside the repository root"
+            "config error at {path}.registry: {refusal}"
         )));
     }
+    let full = root.join(registry);
 
     // Every path in the report is relative to the repository root.
     let display = crate::path::display(Some(root), &full);
