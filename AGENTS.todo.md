@@ -24,8 +24,9 @@ first release).
 major tag), and nothing moves it: every change to `action.yml` or `action/`
 needs a `git tag -f v1 && git push -f origin v1`, and a forgotten move is
 invisible — a consumer on `all-the-rest/ratchet-cli@v1` silently runs an old
-action. The tag was pushed with the first release (`v0.1.0`); the drift is
-the open part.
+action. The tag was pushed with the first release (`v0.1.0`) and moved with
+the release of `0.2.0`; the drift is the open part — nothing does it
+automatically.
 
 **Open.**
 
@@ -33,11 +34,3 @@ the open part.
   a check that fails when the tag and the action disagree. A project that
   pins the tag by its commit SHA — as the portal does, because its
   supply-chain contract allows no moving tag — is not affected.
-
-## Not open here
-
-- The **migration of the findings** of the two projects that use the binary:
-  the website's UI findings and the portal's security findings into
-  `ratchet.findings.json`, and the registration of the Markdown report in a
-  project's `generated[]`. The tool owns the mechanic (§13, §14); the projects
-  own the migration — it is a project-level task, not a tool task.
