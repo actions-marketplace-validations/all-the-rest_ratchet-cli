@@ -190,6 +190,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
             BaselineCommand::Raise(args) => cmd_baseline_raise(&cli, args, &cwd),
         },
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
+        Command::Report(args) => cmd_report(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
         Command::Update(args) => cmd_update(&cli, args),
     }
@@ -208,29 +209,81 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
     let context = load_context(cli, cwd)?;
     ensure_rule_exists(&context.config, cli.rule.as_deref())?;
     ensure_paths_exist(&args.paths, cwd, &context.root)?;
+
+    let paths = check::selected_paths(&args.paths, cwd, &context.root);
+    let report = run_gates(
+        cli,
+        &context,
+        &Run {
+            paths: &paths,
+            tier: args.tier,
+            fix: args.fix,
+            drift: true,
+        },
+    )?;
+    match format_of(cli)? {
+        Output::Json => println!("{}", report::render_json(&report)),
+        Output::Stylish => print!("{}", report::render_stylish(&report, cli.quiet)),
+    }
+    print_notes(&report.notes, &report.debug, cli);
+    check_for_a_new_version(cli);
+
+    Ok(exit_code(&report))
+}
+
+/// What a run selects and what it leaves out.
+#[derive(Default)]
+struct Run<'a> {
+    /// The paths the run is scoped to.
+    paths: &'a [String],
+    /// The tier the run executes.
+    tier: Option<Tier>,
+    /// The produced content is written into the generated files.
+    fix: bool,
+    /// The run executes the drift gates.
+    ///
+    /// The report does not: the drift gates are gates over the *generated*
+    /// files, and the report — which is a generated file — cannot be part of
+    /// a comparison with itself (SPEC 14).
+    drift: bool,
+}
+
+/// Runs the gates: the drift gates, the counters, the comparison with the
+/// baseline and the floors of the tiers.
+///
+/// The check and the report use the **same** function: the numbers of the
+/// report are the numbers of the run, and a report that counted the gates
+/// again could contradict them (SPEC 14).
+fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Report, Error> {
     let baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
     let ignore = compile_ignore(&cli.ignore)?;
 
     // The drift gates run first: a generator that cannot be run is an
     // operational error, and the tree has to be whole before a counter reads
     // it (SPEC 5.2).
-    let drift = drift::run(
-        &context.config,
-        &context.git,
-        &drift::Options {
-            root: &context.root,
-            fix: cli.fix,
-            path: None,
-            // The drift gates are tiered like the rules: a slow generator
-            // does not run in the fast tier (SPEC 7).
-            tier: args.tier,
-        },
-    )?;
+    let drift = if run.drift {
+        drift::run(
+            &context.config,
+            &context.git,
+            &drift::Options {
+                root: &context.root,
+                fix: run.fix,
+                path: None,
+                // The drift gates are tiered like the rules: a slow generator
+                // does not run in the fast tier (SPEC 7).
+                tier: run.tier,
+            },
+        )?
+    } else {
+        // The report runs no drift gate: the drift gates' verdicts belong to
+        // the check (SPEC 14).
+        drift::Outcome::default()
+    };
 
     let mut notes = Vec::new();
     // A committed baseline that exists but cannot be parsed is an operational
     // error: a broken reference must not disable the gate (SPEC 5.2, 8).
-    let committed = read_committed_baseline(&context)?;
+    let committed = read_committed_baseline(context)?;
     if let Some(note) = check::monotonicity_note(
         &context.git,
         context
@@ -242,11 +295,10 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
         notes.push(note);
     }
 
-    let paths = check::selected_paths(&args.paths, cwd, &context.root);
     let selection = check::Selection {
         rule: cli.rule.as_deref(),
-        tier: args.tier,
-        paths: &paths,
+        tier: run.tier,
+        paths: run.paths,
         ignore: &ignore,
     };
     let mut report = check::check(
@@ -299,14 +351,206 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
         report.debug.insert(0, resolved_config(&context.config));
     }
 
-    match cli.format {
-        Format::Json => println!("{}", report::render_json(&report)),
-        Format::Stylish => print!("{}", report::render_stylish(&report, cli.quiet)),
+    Ok(report)
+}
+
+/// Renders the run into a Markdown report (SPEC 14).
+///
+/// The report is a **rendering of a run**: the same counters and the same
+/// numbers.  It runs the **rules** only: the drift gates are gates over the
+/// *generated* files, and the report — which is a generated file — cannot be
+/// part of a comparison with itself.
+///
+/// The exit code is the exit code of the **command**: 0 when the report was
+/// produced, 2 when it could not be produced.  The verdict of the run is in
+/// the **content**: the report is a generator, and a generator that failed
+/// because the run is red would fail the drift gate that invoked it.
+fn cmd_report(cli: &Cli, args: &ReportArgs, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+    ensure_rule_exists(&context.config, cli.rule.as_deref())?;
+    report_format(cli)?;
+
+    // The path of the report, relative to the repository root.
+    let output = match &args.output {
+        Some(path) => Some(report_path(&context.root, path)?),
+        None => None,
+    };
+
+    // The report runs the rules only: the drift gates are gates over the
+    // generated files, and the report is one of them (SPEC 14).
+    let report = run_gates(
+        cli,
+        &context,
+        &Run {
+            paths: &[],
+            tier: None,
+            // The report writes one file and changes nothing else.
+            fix: false,
+            // The report runs no drift gate.
+            drift: false,
+        },
+    )?;
+    let markdown = report::render_markdown(&report);
+
+    match output {
+        None => {
+            // The report is the only thing on stdout.
+            print!("{markdown}");
+        }
+        Some((full, relative)) => {
+            // The report writes one file and nothing else: the directory of
+            // the report has to exist, the command does not create it.
+            if let Some(parent) = full.parent() {
+                if !parent.is_dir() {
+                    return Err(Error::new(format!(
+                        "cannot write {}: the directory {} does not exist",
+                        relative,
+                        path::display(Some(&context.root), parent)
+                    )));
+                }
+            }
+            fs::write(&full, &markdown).map_err(|e| {
+                Error::new(format!(
+                    "cannot write {}: {e}",
+                    path::display(Some(&context.root), &full)
+                ))
+            })?;
+            println!("ratchet: wrote {relative}");
+        }
     }
     print_notes(&report.notes, &report.debug, cli);
     check_for_a_new_version(cli);
 
-    Ok(exit_code(&report))
+    // The report was produced: the command succeeded.  The verdict of the
+    // run is in the report, not in the exit code.
+    Ok(0)
+}
+
+/// The path of the report: the absolute path and the repository-relative one.
+///
+/// The report is written **inside** the repository root: a path that points
+/// outside it would let the engine write outside the tree it owns, and the
+/// report is a file of the repository — the drift gate reads it there.
+///
+/// The check is **not** only lexical: a symbolic link inside the root can
+/// point outside it, and the report would follow the link.  The path is
+/// therefore resolved — the existing part of it, the rest is kept — and the
+/// resolved path has to lie inside the resolved root.
+fn report_path(root: &Path, raw: &str) -> Result<(PathBuf, String), Error> {
+    let full = path::normalize(&root.join(Path::new(raw)));
+    if !full.starts_with(path::normalize(root)) {
+        return Err(Error::new(
+            "config error at --output: the report must be written inside the repository root",
+        ));
+    }
+    // The link is resolved: a path that leaves the root through a symbolic
+    // link is a path outside the root.
+    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !resolve(&full).starts_with(&resolved_root) {
+        return Err(Error::new(
+            "config error at --output: the report must be written inside the repository root — \
+             the path leaves it through a symbolic link",
+        ));
+    }
+    let relative = path::relative_to(root, &full).unwrap_or_default();
+    if relative.is_empty() {
+        return Err(Error::new(
+            "config error at --output: the report is the repository root — it is not a file",
+        ));
+    }
+    Ok((full, relative))
+}
+
+/// The path with its symbolic links resolved: the existing part of it is
+/// resolved, the rest is kept.
+///
+/// A file that does not exist yet has no link to resolve: the walk stops at
+/// the first component that is not there, and the rest is appended to the
+/// resolved parent.  A link that points at nothing is resolved by hand:
+/// `canonicalize` cannot follow it, and the report would create its target.
+fn resolve(path: &Path) -> PathBuf {
+    // The deepest part of the path that is there — a link counts as there.
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if fs::symlink_metadata(&existing).is_ok() {
+            break;
+        }
+        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        rest.push(name);
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+    }
+
+    let mut resolved = match fs::canonicalize(&existing) {
+        Ok(resolved) => resolved,
+        // A link that points at nothing: its target is read by hand.
+        Err(_) => match fs::read_link(&existing) {
+            Ok(target) => {
+                let parent = existing.parent().map(Path::to_path_buf).unwrap_or_default();
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    parent.join(target)
+                };
+                let directory = target.parent().map(Path::to_path_buf).unwrap_or_default();
+                let directory = fs::canonicalize(&directory).unwrap_or(directory);
+                match target.file_name() {
+                    Some(name) => directory.join(name),
+                    None => directory,
+                }
+            }
+            Err(_) => path.to_path_buf(),
+        },
+    };
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
+/// The format of a command that prints a report.
+///
+/// The Markdown report belongs to the `report` command: the other commands
+/// print the stylish output or the JSON document.
+fn format_of(cli: &Cli) -> Result<Output, Error> {
+    match cli.format {
+        None | Some(Format::Stylish) => Ok(Output::Stylish),
+        Some(Format::Json) => Ok(Output::Json),
+        Some(Format::Md) => Err(Error::new(
+            "the Markdown report is written by `ratchet report --format md`",
+        )),
+    }
+}
+
+/// The format of the `report` command: the Markdown report and nothing else.
+fn report_format(cli: &Cli) -> Result<(), Error> {
+    match cli.format {
+        None | Some(Format::Md) => Ok(()),
+        Some(_) => Err(Error::new(
+            "the report command writes the Markdown report — `ratchet report --format md`",
+        )),
+    }
+}
+
+/// The format of a command that prints one line and nothing else.
+///
+/// The `baseline path` and the `update` have no JSON document and no Markdown
+/// report: a format they cannot honour is **refused**, not ignored — a
+/// silently ignored argument is an argument that does not do what it says.
+fn plain_format(cli: &Cli) -> Result<(), Error> {
+    match cli.format {
+        None | Some(Format::Stylish) => Ok(()),
+        Some(Format::Json) => Err(Error::new(
+            "this command prints one line — it has no JSON output",
+        )),
+        Some(Format::Md) => Err(Error::new(
+            "the Markdown report is written by `ratchet report --format md`",
+        )),
+    }
 }
 
 /// Asks the release API whether there is a newer version.
@@ -347,7 +591,7 @@ fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
         &context.git,
         &drift::Options {
             root: &context.root,
-            fix: cli.fix,
+            fix: args.fix,
             path: selected.as_deref(),
             // The drift command runs every tier: it has no `--tier`.
             tier: None,
@@ -369,8 +613,8 @@ fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
         notes.push("no check was executed — an empty selection is never a pass".to_string());
     }
 
-    match cli.format {
-        Format::Json => {
+    match format_of(cli)? {
+        Output::Json => {
             let report = Report {
                 generated: outcome.entries,
                 notes: notes.clone(),
@@ -379,7 +623,7 @@ fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
             };
             println!("{}", report::render_json(&report));
         }
-        Format::Stylish => print!("{}", report::render_drift(&outcome.entries, ok, cli.quiet)),
+        Output::Stylish => print!("{}", report::render_drift(&outcome.entries, ok, cli.quiet)),
     }
     print_notes(&notes, &debug, cli);
 
@@ -411,9 +655,9 @@ fn cmd_count(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
             .push("hint: run with --debug to see the output of the counter".to_string());
     }
 
-    match cli.format {
-        Format::Json => println!("{}", report::render_json(&report)),
-        Format::Stylish => print!("{}", report::render_counts(&report)),
+    match format_of(cli)? {
+        Output::Json => println!("{}", report::render_json(&report)),
+        Output::Stylish => print!("{}", report::render_counts(&report)),
     }
     print_notes(&report.notes, &report.debug, cli);
 
@@ -585,7 +829,7 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
     }
 
     let command = if update { "update" } else { "init" };
-    print_baseline(cli, &context, command, &actions, failed);
+    print_baseline(cli, &context, command, &actions, failed)?;
 
     if counter_errors > 0 {
         Ok(2)
@@ -739,7 +983,7 @@ fn cmd_baseline_raise(cli: &Cli, args: &BaselineRaiseArgs, cwd: &Path) -> Result
         }
     }
 
-    print_baseline(cli, &context, "raise", &actions, failed);
+    print_baseline(cli, &context, "raise", &actions, failed)?;
     Ok(if failed > 0 { 1 } else { 0 })
 }
 
@@ -750,13 +994,14 @@ fn print_baseline(
     command: &str,
     actions: &[BaselineAction],
     failed: usize,
-) {
+) -> Result<(), Error> {
     // The path that was written — relative to the repository root.
     let path = path::display(Some(&context.root), &context.baseline_path);
-    match cli.format {
-        Format::Json => println!("{}", report::render_baseline_json(command, actions, failed)),
-        Format::Stylish => print!("{}", report::render_baseline(command, &path, actions)),
+    match format_of(cli)? {
+        Output::Json => println!("{}", report::render_baseline_json(command, actions, failed)),
+        Output::Stylish => print!("{}", report::render_baseline(command, &path, actions)),
     }
+    Ok(())
 }
 
 /// The path of the baseline file: the answer to "which file is my baseline?".
@@ -771,6 +1016,9 @@ fn print_baseline(
 /// The path is repository-relative and nothing else is printed: the output is
 /// meant for a shell.
 fn cmd_baseline_path(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
+    // The command prints one line: a format it cannot honour is refused
+    // before anything else happens.
+    plain_format(cli)?;
     let context = load_context(cli, cwd)?;
     let Some(relative) = context.baseline_rel.as_deref() else {
         return Err(Error::new(
@@ -799,9 +1047,9 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
                 Err(error) => eprintln!("ratchet: debug: {error}"),
             }
         }
-        match cli.format {
-            Format::Json => println!("{}", report::render_init_json(&format!("{name} (exists)"))),
-            Format::Stylish => println!("ratchet: {name} already exists — nothing to do"),
+        match format_of(cli)? {
+            Output::Json => println!("{}", report::render_init_json(&format!("{name} (exists)"))),
+            Output::Stylish => println!("ratchet: {name} already exists — nothing to do"),
         }
         return Ok(0);
     }
@@ -826,9 +1074,9 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     if cli.debug {
         eprintln!("ratchet: debug: wrote {}", path::display(git.root(), &path));
     }
-    match cli.format {
-        Format::Json => println!("{}", report::render_init_json("ratchet.config.jsonc")),
-        Format::Stylish => println!("ratchet: wrote ratchet.config.jsonc"),
+    match format_of(cli)? {
+        Output::Json => println!("{}", report::render_init_json("ratchet.config.jsonc")),
+        Output::Stylish => println!("ratchet: wrote ratchet.config.jsonc"),
     }
     Ok(0)
 }
@@ -837,7 +1085,10 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
 ///
 /// The command needs no config and no repository: it replaces the binary and
 /// touches nothing else (SPEC 9).
-fn cmd_update(_cli: &Cli, _args: &UpdateArgs) -> Result<i32, Error> {
+fn cmd_update(cli: &Cli, _args: &UpdateArgs) -> Result<i32, Error> {
+    // The command prints a few lines: a format it cannot honour is refused
+    // before the network is touched.
+    plain_format(cli)?;
     let options = update::Options {
         current: update::current_version()?,
         api_base: update::api_base(),
@@ -1079,11 +1330,13 @@ fn parent_dir(path: &Path) -> PathBuf {
 }
 
 /// The subcommands of the CLI.
-const SUBCOMMANDS: [&str; 6] = ["check", "count", "baseline", "drift", "init", "update"];
+const SUBCOMMANDS: [&str; 7] = [
+    "check", "count", "baseline", "drift", "report", "init", "update",
+];
 
 /// The options that take a value; the value is not a positional argument.
-const OPTIONS_WITH_VALUE: [&str; 8] = [
-    "config", "format", "rule", "tier", "ignore", "path", "reason", "value",
+const OPTIONS_WITH_VALUE: [&str; 9] = [
+    "config", "format", "rule", "tier", "ignore", "path", "reason", "value", "output",
 ];
 
 /// Inserts the default command when the first argument is not a subcommand:
@@ -1169,16 +1422,15 @@ struct Cli {
     no_config: bool,
 
     /// The output format.
-    #[arg(long, global = true, value_enum, default_value_t = Format::Stylish, value_name = "FORMAT")]
-    format: Format,
+    ///
+    /// The format is optional: a command that prints a report uses the
+    /// stylish output, the report command writes the Markdown report.
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    format: Option<Format>,
 
     /// Restrict the run to one rule.
     #[arg(long, global = true, value_name = "ID")]
     rule: Option<String>,
-
-    /// Apply the fixable: regenerate the generated files.
-    #[arg(long, global = true)]
-    fix: bool,
 
     /// Exclude the paths that match this pattern from the run (repeatable).
     #[arg(long, global = true, value_name = "PATTERN")]
@@ -1208,10 +1460,23 @@ enum Command {
     Baseline(BaselineArgs),
     /// Run the drift gates: the generated files.
     Drift(DriftArgs),
+    /// Render the run into a Markdown report.
+    Report(ReportArgs),
     /// Write a starter config.
     Init(InitArgs),
     /// Update the binary to the newest release.
     Update(UpdateArgs),
+}
+
+/// The arguments of `report`.
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// Write the report to this file instead of stdout.
+    ///
+    /// The path is relative to the repository root; a path outside it is a
+    /// configuration error.
+    #[arg(long, value_name = "PATH")]
+    output: Option<String>,
 }
 
 /// The arguments of `check`.
@@ -1224,6 +1489,10 @@ struct CheckArgs {
     /// Run only the rules of this tier.
     #[arg(long, value_name = "TIER")]
     tier: Option<Tier>,
+
+    /// Apply the fixable: regenerate the generated files.
+    #[arg(long)]
+    fix: bool,
 }
 
 /// The arguments of `drift`.
@@ -1232,6 +1501,10 @@ struct DriftArgs {
     /// Run only the drift gate of this generated file.
     #[arg(long, value_name = "PATH")]
     path: Option<String>,
+
+    /// Apply the fixable: write the produced content into the generated files.
+    #[arg(long)]
+    fix: bool,
 }
 
 /// The arguments of `count`.
@@ -1297,6 +1570,21 @@ enum Format {
     /// Human readable.
     Stylish,
     /// Machine readable.
+    Json,
+    /// The Markdown report.
+    Md,
+}
+
+/// The output of a command that prints a report.
+///
+/// The Markdown format is not one of them: the `report` command writes the
+/// Markdown report, the other commands print the stylish output or the JSON
+/// document.
+#[derive(Clone, Copy)]
+enum Output {
+    /// The human readable output.
+    Stylish,
+    /// The JSON document.
     Json,
 }
 

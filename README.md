@@ -62,6 +62,7 @@ ratchet baseline update # pay a ceiling down / a floor up — in that direction 
 ratchet baseline path   # print the path of the baseline file
 ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
 ratchet drift           # run the drift gates: the generated files
+ratchet report --format md # render the run into a Markdown report
 ratchet update          # update the binary to the newest release
 ratchet init            # write a starter config
 ```
@@ -430,6 +431,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet baseline path` | Prints the **repository-relative path** of the baseline file — the path the binary itself uses, and nothing else. It is the answer to "which file is my baseline?" for a script outside the binary: the resolution lives in one place, and a second implementation answers a different question than the binary. |
 | `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
+| `ratchet report` | Renders the run into a **Markdown report**: the summary with the verdict, one row per rule, the findings that count and the notes of the run. The drift gates are not in it — a report that held the result of the comparison with itself would be a regress. `--output <path>` writes it into the repository instead of stdout. See [the Markdown report](#the-markdown-report). |
 | `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
 
@@ -439,9 +441,9 @@ reason travels with the record, so the diff on the baseline file carries it.
 |---|---|
 | `--config <path>` | Use this config file. |
 | `--no-config` | Do not look for a config; only valid together with `--config`. |
-| `--format <stylish\|json>` | The output format, `stylish` by default. |
+| `--format <stylish\|json\|md>` | The output format, `stylish` by default. `md` belongs to the `report` command: the other commands print the stylish output or the JSON document. |
 | `--rule <id>` | Restrict the run to one rule. |
-| `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. |
+| `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. A `check` and a `drift` option — the `report` writes a report and changes nothing else. |
 | `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. A `check` option: `ratchet drift` runs every tier. |
 | `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |
@@ -506,14 +508,18 @@ The floor is what stops a tier from being quietly narrowed — a narrowing that
 only shows up when somebody selects the tier by hand is a narrowing that
 survives.
 
-The floor counts the **checks** that execute in the tier, and a check is a
-rule **or a drift gate**: a rule that ran and failed counts as executed, and
-so does a generator that ran. A tier that declares a floor therefore needs
-that many rules and generators — a tier whose promised checks are all missing
-is exactly the narrowing the floor exists to catch.
+The floor counts the **rules** that execute in the tier: a check is a rule, and
+a drift gate is not a check — it is a gate over a generated file, and the
+report (which is a generated file) cannot be part of the count that decides
+whether the report is coherent. A rule that ran and failed counts as executed,
+and a generator that ran does not. A tier that declares a floor therefore
+needs that many rules — a tier whose promised rules are all missing is exactly
+the narrowing the floor exists to catch.
 
 The drift gates are tiered like the rules: a `generated[]` entry belongs to
-the `fast` tier unless it says otherwise.
+the `fast` tier unless it says otherwise. Their tier decides **when** they run
+(`--tier fast` skips the slow generators); it does not add to the floor, and a
+tier that holds nothing but a generator is not a tier that runs.
 
 ### The path exclusion
 
@@ -609,8 +615,8 @@ learn **why** a rule failed without parsing the human output.
 The `generated` array carries one entry per generated file: its `path`, its
 `status` (`ok`, `drift` or `new`) and the unified `diff` — absent when there
 is none. `summary.generated` counts the generated files, `summary.drifted`
-the ones that drifted. `summary.executed` counts the **checks** that ran: the
-rules and the drift gates.
+the ones that drifted. `summary.executed` counts the **checks** that ran — the
+rules: a drift gate is not a check.
 
 ```
 {
@@ -639,9 +645,10 @@ count comparison is reported as an additional note. With a reason the move is
 accepted: the reason is in the file and therefore in the diff, so the run
 carries a note that names the move and its reason instead of a failure. A run
 that executes no **check** at all fails as well: an empty selection is never a
-pass. A check is a rule **or a drift gate**, so a project whose only gates are
-drift gates is green. A `count` over a config without rules is a successful
-run.
+pass. A check is a **rule** — the drift gates are not counted, they are gates
+over the *generated* files — so a project whose only gates are drift gates
+runs no check at all and is red. A `count` over a config without rules is a
+successful run.
 
 Every path in the output is relative to the repository root: an absolute path,
 a machine name or a timestamp would make the same tree produce different bytes.
@@ -651,6 +658,104 @@ The `count`, `baseline` and `init` commands use the same envelope
 without a baseline (`"baseline": null`), and the `baseline` commands report one
 entry per rule with an `action` (`added`, `kept`, `updated`, `refused`).
 
+### The Markdown report
+
+`ratchet report --format md` renders the run into **one Markdown file**: the
+summary with the verdict of the run, one row per rule, the findings that count
+and the notes of the run.
+
+```
+ratchet report --format md                    # to stdout
+ratchet report --format md --output docs/ratchet.md
+```
+
+The Markdown report is the default of the `report` command — `--format md` says
+it explicitly, and the other commands print the stylish output or the JSON
+document.
+
+The report is a **rendering of a run**, not a second run: the same counters and
+the same numbers. The report runs the **rules** only — the drift gates are
+gates over the *generated* files, and the report is one of them, so a report
+that held the result of the comparison with itself would be a regress. The
+drift gates' verdicts belong to the `check` and to the diff the gate prints.
+
+**The report of a red run is not green.** The report carries the run's
+**verdict** and its **notes**, and the row of a rule that is not green carries
+the **reason**: the file alone says why.
+
+**The exit code is the exit code of the command**: `0` when the report was
+produced, `2` when it could not be produced. The verdict of the run is in the
+**content**: the report is a generator, and a generator that failed because
+the run is red would fail the drift gate that invoked it.
+
+```markdown
+# Ratchet report
+
+## Summary
+
+**Verdict: COHERENT**
+
+| Rules | Failed | Executed |
+|---|---|---|
+| 2 | 0 | 2 |
+
+## Rules
+
+| Rule | Class | Direction | Tier | Count | Baseline | Status | Detail |
+|---|---|---|---|---|---|---|---|
+| open-findings | open security findings | ceiling | fast | 2 | 3 | ok | — |
+| todo-markers | unfinished work | ceiling | fast | 3 | 5 | ok | — |
+
+## Findings
+
+### open-findings
+
+| Id | Severity | Status | Title | Owner | Ticket |
+|---|---|---|---|---|---|
+| SEC-01 | critical | open | org admins reassign foreign users | alice | D-12 |
+| SEC-02 | high | in-progress | a high one | bob | D-13 |
+```
+
+A red run says so — the verdict, the notes and the reason of every rule that
+is not green:
+
+```markdown
+**Verdict: NOT COHERENT** — the notes below say why.
+
+| todo-markers | unfinished work | ceiling | fast | 3 | 2 | over-baseline | count 3 > baseline 2 |
+```
+
+The findings are **the findings the number was made of**: the registry is read
+once, the count is the number of the findings that count, and the report shows
+those findings. A report that counted them again could contradict the number
+it claims to report.
+
+The generator is **deterministic**: the rows are sorted, and there is no
+timestamp, no absolute path and no machine name. The same tree produces the
+same bytes — otherwise the drift gate would report a difference that does not
+exist. The report is a function of the **rules** alone: a generated file that
+drifts does not change it.
+
+`--output <path>` writes the file; the path is relative to the repository
+root, and a path outside it is a configuration error. The command writes that
+one file and touches nothing else: the directory of the report has to exist —
+the command does not create it.
+
+**The report is drift-checked like every other derived artifact.** The project
+registers it in `generated[]`, and the drift gate compares the committed file
+with the produced one — the tool checks its own output:
+
+```jsonc
+"generated": [
+  { "path": "docs/ratchet.md",
+    "command": ["ratchet", "report", "--format", "md", "--output", "docs/ratchet.md"] }
+]
+```
+
+Because the report holds no drift verdict, the comparison has no regress: the
+committed report and the generated one agree, and a hand-edited committed
+report is reported as drift.
+
 ## The exit codes
 
 | Code | Meaning |
@@ -658,6 +763,12 @@ entry per rule with an `action` (`added`, `kept`, `updated`, `refused`).
 | `0` | green |
 | `1` | at least one gate failed |
 | `2` | operational error: invalid config, missing config, crashed counter, unreadable file, unknown command or path, a committed baseline that does not parse, a failed self-update |
+
+The **report** is the exception: it exits `0` whenever it produced a report,
+even when the run is red. It is a generator: a generator that failed because
+the run is red would fail the drift gate that invoked it. The verdict of the
+run is in the **content** of the report — and the `check` on the same tree
+exits `1`.
 
 ## The self-update
 

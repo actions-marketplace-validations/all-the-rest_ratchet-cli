@@ -69,11 +69,6 @@ pub struct DriftEntry {
     pub diff: Option<String>,
     /// A human readable explanation, if there is something to say.
     pub detail: Option<String>,
-    /// The tier of the drift gate.
-    ///
-    /// A drift gate is a **check** of its tier: it counts towards the floor
-    /// of that tier (SPEC 3.3).
-    pub tier: Tier,
 }
 
 /// What a drift run does.
@@ -260,7 +255,6 @@ fn run_one(
         status,
         diff,
         detail,
-        tier: entry.tier,
     })
 }
 

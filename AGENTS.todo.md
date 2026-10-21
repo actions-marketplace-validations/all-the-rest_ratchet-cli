@@ -134,19 +134,22 @@ hand drifts from the numbers it claims to report.
 
 **Decision.**
 
-- `ratchet report --format md` (or `--output <path>`) renders the gates, the
-  findings and the metrics into **one Markdown file**; the existing drift gate
-  then checks that the file matches the committed version, so every generated
-  Markdown file is drift-checked like every other derived artifact.
+- `ratchet report --format md` (or `--output <path>`) renders the **rules**,
+  the findings and the metrics into **one Markdown file**; the existing drift
+  gate then checks that the file matches the committed version, so every
+  generated Markdown file is drift-checked like every other derived artifact.
+  The drift gates are not in the report: a report that held the result of the
+  comparison with itself would be a regress.
 - The generator is deterministic: sorted output, no timestamps, no absolute
   paths, no machine names. The same tree produces the same bytes.
 
 **Open.**
 
-- `SPEC.md` gains a section for the report format (the sections, the columns,
-  the determinism rules).
-- The binary gains the renderer; the drift gate already exists and only needs
-  the generated file to be registered in the config.
+- The spec has the section (§14) and the binary has the renderer
+  (`ratchet report --format md [--output <path>]`). What is open is the
+  **project-level** half: the report has to be registered in a project's
+  `generated[]`, and the decision where that report lives is a project
+  decision — the gate that checks the report is the drift gate of that file.
 
 ### GitHub Action: validate and update the stand in CI
 

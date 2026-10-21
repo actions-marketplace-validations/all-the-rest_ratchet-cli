@@ -245,12 +245,21 @@ impl Registry {
         Ok(Registry { findings })
     }
 
-    /// The number of the findings that count.
+    /// The findings that count.
     ///
     /// `severities` names the levels that count; without it every level
     /// counts.  `statuses` names the statuses that count; without it the
     /// counting statuses — `open` and `in-progress` — count.
-    pub fn count(&self, severities: Option<&[Severity]>, statuses: Option<&[Status]>) -> i64 {
+    ///
+    /// The list is what the count is made of: the report shows **these**
+    /// findings, not a second reading of the file (SPEC 14).  A report that
+    /// counts the findings again could tell a different story than the number
+    /// it claims to report.
+    pub fn selecting(
+        &self,
+        severities: Option<&[Severity]>,
+        statuses: Option<&[Status]>,
+    ) -> Vec<&Finding> {
         self.findings
             .iter()
             .filter(|finding| match severities {
@@ -261,7 +270,12 @@ impl Registry {
                 None => finding.status.counts(),
                 Some(list) => list.contains(&finding.status),
             })
-            .count() as i64
+            .collect()
+    }
+
+    /// The number of the findings that count.
+    pub fn count(&self, severities: Option<&[Severity]>, statuses: Option<&[Status]>) -> i64 {
+        self.selecting(severities, statuses).len() as i64
     }
 }
 

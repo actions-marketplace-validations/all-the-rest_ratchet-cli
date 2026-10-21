@@ -133,10 +133,10 @@ A check that ran and failed counts as executed: it fails anyway (exit 2), so
 the floor only says how many checks the tier has to run. A check that was
 never selected does not count — that is the empty selection, and it fails.
 
-A **check** is a rule **or a drift gate** that runs in the tier. A tier that
-declares a floor therefore needs that many rules and generators: a tier whose
-promised checks are all missing is exactly the narrowing the floor exists to
-catch.
+A **check** is a **rule**. The drift gates are not counted: they are gates over
+the *generated* files, and the report — which is a generated file — cannot be
+part of the count that decides whether the report is coherent. A tier that
+declares a floor therefore needs that many rules.
 
 The run as a whole fails when **no check ran at all** — the empty selection is
 never a pass, whether the selection consists of rules, of drift gates, or of
@@ -251,6 +251,7 @@ ratchet baseline update [--rule <id>] [--reason <text>]
 ratchet baseline path
 ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
+ratchet report [--output <path>] [--format md]
 ratchet init
 ratchet update
 ```
@@ -263,9 +264,10 @@ The default command is `check`.
 |---|---|
 | `--config <path>` | use this config file |
 | `--no-config` | do not look for a config (requires `--config`) |
-| `--format <stylish\|json>` | output format, default `stylish` |
-| `--fix` | apply the fixable: regenerate generated files |
-| `--tier <fast\|slow>` | run only the rules of that tier |
+| `--format <stylish\|json\|md>` | output format, default `stylish` (`md` only for `report`) |
+| `--output <path>` | write the report to this file (relative to the repository root) — a `report` option |
+| `--fix` | apply the fixable: regenerate generated files — a **`check`/`drift`** option, not a global one |
+| `--tier <fast\|slow>` | run only the rules of that tier — a `check` option |
 | `--rule <id>` | restrict to one rule |
 | `--ignore <pattern>` | glob of paths to exclude from the run (repeatable) |
 | `--debug` | print the resolved config and every counter invocation |
@@ -562,6 +564,11 @@ generated files, never hand-written text.
 | `1` | at least one gate failed |
 | `2` | operational error: invalid config, missing config, crashed counter, unreadable file |
 
+`ratchet report` is the exception: it exits **0** when it produced a report
+(§14) — the report is a *generator*, and a generator that failed because the
+run is red would fail the gate that invoked it. The run's verdict is in the
+report's content. `ratchet check` is the gate.
+
 ## 11. Non-goals of v0
 
 * No Node API and no npm plugin registry.
@@ -704,3 +711,44 @@ The prose document (the security review closure, the UI review log) stays the
 migrated in the same commit and must not disagree about the severity of a
 finding — a status written into the severity field destroys the severity, and
 the migration has to recover it from the row.
+
+## 14. The Markdown report
+
+`ratchet report --format md [--output <path>]` renders a run into **one
+Markdown file**.
+
+The report and the number must come from **one source** — otherwise they
+contradict each other. A gate result that is only visible on the terminal is
+not reviewable, and a status table maintained by hand drifts from the numbers
+it claims to report.
+
+**The sections:**
+
+1. a summary (the rules, the failed, the executed) **and the run's verdict**;
+2. one row per rule (id, class, direction, tier, count, baseline, status, and the
+   **detail** — the reason a status is not `ok`);
+3. for every rule that counts a **registry**: the findings that count (id,
+   severity, status, title, owner, ticket) — the report says *which* findings
+   are open, not only how many;
+4. the run's **notes** (the tier floor, the skipped comparisons).
+
+**The report renders the gates that do not depend on the report.** The drift
+gates are not in it: a report that contained the result of the comparison with
+itself would be a regress, and the report is exactly what the drift gate
+compares. The drift gates' verdicts belong to the `check` — and to the diff
+the gate prints. The report is a snapshot of the **rules**: their counts, their
+baselines and the findings behind them.
+
+**The report of a red run is not green.** The report carries the run's
+**verdict** and its **notes** (the tier floor, the skipped comparisons). A
+committed artifact that says "0 failed" while the run is red is exactly the
+drift this feature exists to prevent.
+
+**The report is drift-checked like every other derived artifact:** the project
+registers it in `generated[]`, and the drift gate compares it with the
+committed version. The tool checks its own output — and because the report
+contains no drift verdict, that comparison has no regress.
+
+**The report is deterministic:** sorted output, no timestamps, no absolute
+paths, no machine names. The same tree produces the same bytes — otherwise the
+drift gate would report a difference that does not exist.

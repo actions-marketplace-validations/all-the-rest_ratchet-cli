@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::config::Counter;
 use crate::generate::Generator;
-use crate::registry::{Registry, Severity, Status};
+use crate::registry::{Finding, Registry, Severity, Status};
 
 /// The value a counter produced.
 #[derive(Debug, Clone, Default)]
@@ -78,6 +78,12 @@ pub struct CounterRun {
     pub value: CounterValue,
     /// The raw output of the subprocess; the diagnostic channel carries it.
     pub output: String,
+    /// The findings that count, when the counter is a findings registry.
+    ///
+    /// The list is the **same** selection the count was made of: the report
+    /// shows the findings that produced the number, not a second reading of
+    /// the registry (SPEC 14).  It is `None` for every other counter.
+    pub findings: Option<Vec<Finding>>,
 }
 
 /// Runs the counter and returns its value and the raw output.
@@ -270,6 +276,7 @@ fn run_command(command: &[String], root: &Path) -> Result<CounterRun, CounterErr
     Ok(CounterRun {
         value,
         output: transcript,
+        findings: None,
     })
 }
 
@@ -325,7 +332,11 @@ fn run_file(
         )
     })?;
 
-    Ok(CounterRun { value, output })
+    Ok(CounterRun {
+        value,
+        output,
+        findings: None,
+    })
 }
 
 /// Reads a findings registry and counts the findings that count (SPEC 13).
@@ -334,6 +345,9 @@ fn run_file(
 /// when the rule runs, and a registry that cannot be read or does not hold
 /// what it must hold is a configuration error — never a gate that reports
 /// zero findings.
+///
+/// The findings that count travel with the count: the report shows **the
+/// findings the number was made of** (SPEC 14).
 fn run_registry(
     registry: &str,
     severities: Option<&[Severity]>,
@@ -371,13 +385,22 @@ fn run_registry(
         ))
     })?;
 
-    let count = registry.count(severities, statuses);
+    // The count is the number of the findings that count — and the findings
+    // themselves travel with it: the report shows the ones the number was
+    // made of.
+    let findings: Vec<Finding> = registry
+        .selecting(severities, statuses)
+        .into_iter()
+        .cloned()
+        .collect();
+    let count = findings.len() as i64;
     Ok(CounterRun {
         value: CounterValue {
             count: Some(count),
             items: None,
         },
         output: String::new(),
+        findings: Some(findings),
     })
 }
 

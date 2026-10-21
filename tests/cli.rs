@@ -3571,11 +3571,11 @@ fn the_json_report_carries_the_notes_of_a_failing_run() {
 // --- the floor counts the drift gates too ------------------------------------
 
 /// A config with one fast rule, one fast generator and one slow generator.
-fn tier_with_generators_config(fast_floor: i64, slow_floor: i64) -> String {
+fn tier_with_generators_config(fast_floor: i64) -> String {
     format!(
         r#"[
           {{
-            "tiers": {{ "fast": {{ "floor": {fast_floor} }}, "slow": {{ "floor": {slow_floor} }} }},
+            "tiers": {{ "fast": {{ "floor": {fast_floor} }} }},
             "rules": {{
               "a": {{ "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
                       "tier": "fast", "count": {{ "command": ["echo", "1"] }} }}
@@ -3600,9 +3600,9 @@ fn repo_with_generators(config: &str) -> Repo {
 }
 
 #[test]
-fn a_drift_gate_counts_as_a_check_of_its_tier() {
-    // One rule and one fast generator: two checks, and the floor is two.
-    let repo = repo_with_generators(&tier_with_generators_config(2, 1));
+fn a_drift_gate_does_not_count_towards_the_floor_of_its_tier() {
+    // One rule and one fast generator: the floor of one is met by the rule.
+    let repo = repo_with_generators(&tier_with_generators_config(1));
 
     let output = repo.run(&["check", "--format", "json"]);
 
@@ -3614,9 +3614,10 @@ fn a_drift_gate_counts_as_a_check_of_its_tier() {
 }
 
 #[test]
-fn the_floor_counts_the_drift_gates_beyond_the_rules() {
-    // One rule and one fast generator: two checks, and the floor is three.
-    let repo = repo_with_generators(&tier_with_generators_config(3, 1));
+fn the_floor_counts_the_rules_only() {
+    // One rule and two generators: the floor of two is not met — a drift gate
+    // is not a check (SPEC 3.3).
+    let repo = repo_with_generators(&tier_with_generators_config(2));
 
     let output = repo.run(&["check", "--format", "json"]);
 
@@ -3627,7 +3628,7 @@ fn the_floor_counts_the_drift_gates_beyond_the_rules() {
     assert!(
         notes.iter().any(|note| {
             let note = note.as_str().unwrap_or_default();
-            note.contains("the tier `fast`") && note.contains("the floor is 3")
+            note.contains("the tier `fast`") && note.contains("the floor is 2")
         }),
         "{notes:?}"
     );
@@ -3635,29 +3636,29 @@ fn the_floor_counts_the_drift_gates_beyond_the_rules() {
         notes.iter().any(|note| note
             .as_str()
             .unwrap_or_default()
-            .contains("executed 2 check")),
+            .contains("executed 1 check")),
         "{notes:?}"
     );
     // The same note is on stderr.
     assert!(
-        stderr(&output).contains("the floor is 3"),
+        stderr(&output).contains("the floor is 2"),
         "{}",
         stderr(&output)
     );
 }
 
 #[test]
-fn a_slow_generator_counts_towards_the_slow_tier_only() {
-    // The fast floor is three: the rule and the fast generator are two, and
-    // the slow generator is skipped in the fast tier.
-    let repo = repo_with_generators(&tier_with_generators_config(3, 1));
+fn a_slow_generator_does_not_count_towards_the_floor_of_the_slow_tier() {
+    // The fast floor is three: the rule is one check, and the generators are
+    // not checks at all (SPEC 3.3).
+    let repo = repo_with_generators(&tier_with_generators_config(3));
 
     let output = repo.run(&["check", "--tier", "fast", "--format", "json"]);
 
     assert_eq!(code(&output), 1, "{}", stderr(&output));
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
     let notes = report["notes"].as_array().expect("the notes are an array");
-    // The fast tier is short of its floor: the slow generator does not count.
+    // The fast tier is short of its floor: the rule is one check.
     assert!(
         notes.iter().any(|note| {
             let note = note.as_str().unwrap_or_default();
@@ -3666,8 +3667,8 @@ fn a_slow_generator_counts_towards_the_slow_tier_only() {
         "{notes:?}"
     );
 
-    // Without `--tier` the slow generator runs — and counts towards the slow
-    // tier, whose floor of one is met.
+    // Without `--tier` the slow generator runs — and the slow tier holds no
+    // rule: it is not a tier that runs.
     let output = repo.run(&["check", "--format", "json"]);
 
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
@@ -3679,11 +3680,11 @@ fn a_slow_generator_counts_towards_the_slow_tier_only() {
             .contains("the tier `slow`")),
         "{notes:?}"
     );
-    // The fast tier is still short of its floor: two checks, not three.
+    // The fast tier is still short of its floor: one check, not three.
     assert!(
         notes.iter().any(|note| {
             let note = note.as_str().unwrap_or_default();
-            note.contains("the tier `fast`") && note.contains("executed 2 check")
+            note.contains("the tier `fast`") && note.contains("executed 1 check")
         }),
         "{notes:?}"
     );
@@ -3847,7 +3848,9 @@ fn the_diff_is_a_patch_that_patch_accepts() {
 }
 
 #[test]
-fn a_project_whose_only_gate_is_a_drift_gate_is_green() {
+fn a_project_whose_only_gate_is_a_drift_gate_is_the_empty_selection() {
+    // A drift gate is not a check (SPEC 3.3): a project without a rule has
+    // no check at all, and the empty selection is never a pass.
     let config = r#"[
       {
         "tiers": { "fast": { "floor": 1 } },
@@ -3865,18 +3868,19 @@ fn a_project_whose_only_gate_is_a_drift_gate_is_green() {
 
     let output = repo.run(&["check", "--format", "json"]);
 
-    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
-    assert_eq!(report["ok"], true);
+    assert_eq!(report["ok"], false);
+    // The drift gate ran — and it is not a check.
     assert_eq!(report["summary"]["generated"], 1);
-    // The summary counts the drift gate as an executed check.
-    assert_eq!(report["summary"]["executed"], 1);
-    // And the floor of the tier is met by the drift gate alone.
+    assert_eq!(report["summary"]["executed"], 0);
+    // The notes say why the run is not green.
     let notes = report["notes"].as_array().expect("the notes are an array");
     assert!(
-        !notes
-            .iter()
-            .any(|note| note.as_str().unwrap_or_default().contains("the tier")),
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap_or_default()
+            .contains("empty selection")),
         "{notes:?}"
     );
 }
@@ -3947,7 +3951,7 @@ fn a_generator_that_writes_nothing_is_an_operational_error() {
 }
 
 #[test]
-fn the_summary_counts_the_drift_gates_as_executed_checks() {
+fn the_summary_counts_the_rules_as_executed_checks() {
     let config = r#"[
       {
         "rules": {
@@ -3969,10 +3973,11 @@ fn the_summary_counts_the_drift_gates_as_executed_checks() {
 
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
-    // One rule and two drift gates: three executed checks.
+    // One rule and two drift gates: the drift gates are not checks (SPEC
+    // 3.3), so one check ran.
     assert_eq!(report["summary"]["rules"], 1);
     assert_eq!(report["summary"]["generated"], 2);
-    assert_eq!(report["summary"]["executed"], 3);
+    assert_eq!(report["summary"]["executed"], 1);
 }
 
 // --- the damaged repository --------------------------------------------------

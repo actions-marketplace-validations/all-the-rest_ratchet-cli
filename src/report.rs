@@ -1,10 +1,12 @@
-//! The output formats: `stylish` (human readable) and `json` (machine readable).
+//! The output formats: `stylish` (human readable), `json` (machine readable)
+//! and `md` (the Markdown report).
 
 use serde::Serialize;
 
 use crate::check::{BaselineAction, Report, RuleResult, RuleStatus};
 use crate::config::Direction;
 use crate::drift::DriftEntry;
+use crate::registry::Finding;
 
 /// The JSON schema version of the report.
 pub const SCHEMA: u32 = 1;
@@ -275,6 +277,139 @@ pub fn render_init_json(config: &str) -> String {
         config: config.to_string(),
     };
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Renders the Markdown report (SPEC 14).
+///
+/// The report is a **rendering of a run**: every number is a number of that
+/// run, and the findings are the findings the count was made of.  A report
+/// that counted the findings again could contradict the number it claims to
+/// report.
+///
+/// The report renders the gates that do not depend on the report: the drift
+/// gates are not in it — a report that contained the result of the comparison
+/// with itself would be a regress, and the report is exactly what the drift
+/// gate compares.  The drift gates' verdicts belong to the `check`.
+///
+/// The generator is deterministic: the rows are sorted, there is no timestamp,
+/// no absolute path and no machine name.  The same tree produces the same
+/// bytes — otherwise the drift gate would report a difference that does not
+/// exist.
+pub fn render_markdown(report: &Report) -> String {
+    let mut out = String::new();
+
+    out.push_str("# Ratchet report\n\n");
+
+    // 1. the summary: the verdict of the run and its numbers.
+    out.push_str("## Summary\n\n");
+    if report.ok {
+        out.push_str("**Verdict: COHERENT**\n\n");
+    } else if report.notes.is_empty() {
+        out.push_str("**Verdict: NOT COHERENT**\n\n");
+    } else {
+        out.push_str("**Verdict: NOT COHERENT** — the notes below say why.\n\n");
+    }
+    out.push_str("| Rules | Failed | Executed |\n");
+    out.push_str("|---|---|---|\n");
+    out.push_str(&format!(
+        "| {} | {} | {} |\n",
+        report.rules.len(),
+        report.failed(),
+        report.checks()
+    ));
+    out.push('\n');
+
+    // 2. one row per rule.  The detail says why a rule is not green: the
+    //    file alone has to say why.
+    out.push_str("## Rules\n\n");
+    out.push_str("| Rule | Class | Direction | Tier | Count | Baseline | Status | Detail |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|\n");
+    for rule in &report.rules {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            cell(&rule.id),
+            value(rule.class.as_deref()),
+            value(rule.direction.map(|direction| direction.as_str())),
+            value(rule.tier.map(|tier| tier.as_str())),
+            number(rule.count),
+            number(rule.baseline),
+            rule.status.as_str(),
+            value(rule.detail.as_deref()),
+        ));
+    }
+    out.push('\n');
+
+    // 3. the findings that count, for every rule that counts a registry.
+    let registries: Vec<&RuleResult> = report
+        .rules
+        .iter()
+        .filter(|rule| rule.findings.is_some())
+        .collect();
+    if !registries.is_empty() {
+        out.push_str("## Findings\n\n");
+        for rule in registries {
+            out.push_str(&format!("### {}\n\n", cell(&rule.id)));
+            out.push_str("| Id | Severity | Status | Title | Owner | Ticket |\n");
+            out.push_str("|---|---|---|---|---|---|\n");
+            let mut findings: Vec<&Finding> = rule.findings.iter().flatten().collect();
+            // The findings are sorted by id: the report is a stable diff.
+            findings.sort_by(|left, right| left.id.cmp(&right.id));
+            for finding in findings {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} |\n",
+                    cell(&finding.id),
+                    finding.severity.as_str(),
+                    finding.status.as_str(),
+                    cell(&finding.title),
+                    value(finding.owner.as_deref()),
+                    value(finding.ticket.as_deref()),
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    // 4. the notes of the run: the tier floor, the skipped comparisons.
+    if !report.notes.is_empty() {
+        out.push_str("## Notes\n\n");
+        for note in &report.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+        out.push('\n');
+    }
+
+    // The file ends with exactly one newline.
+    let mut out = out.trim_end().to_string();
+    out.push('\n');
+    out
+}
+
+/// The content of a table cell: one line, with the pipe escaped.
+///
+/// A cell that carries a newline would end the row, and a cell that carries a
+/// pipe would open a column.  Neither belongs in a report that has to be
+/// read by a machine as well.
+fn cell(text: &str) -> String {
+    text.replace(['\r', '\n'], " ")
+        .replace('|', "\\|")
+        .trim()
+        .to_string()
+}
+
+/// A value that may be missing: an em dash says that there is none.
+fn value(text: Option<&str>) -> String {
+    match text {
+        Some(text) => cell(text),
+        None => "—".to_string(),
+    }
+}
+
+/// A number that may be missing.
+fn number(value: Option<i64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "—".to_string(),
+    }
 }
 
 /// The label of a rule in the human readable output.

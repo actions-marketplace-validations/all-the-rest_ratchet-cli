@@ -7,6 +7,7 @@ use crate::config::{Config, Direction, Rule, Tier};
 use crate::counter;
 use crate::drift::DriftEntry;
 use crate::git::Git;
+use crate::registry::Finding;
 
 /// The status of one rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,12 @@ pub struct RuleResult {
     pub detail: Option<String>,
     /// The committed baseline, for the monotonicity statuses.
     pub committed: Option<i64>,
+    /// The findings that count, when the rule counts a findings registry.
+    ///
+    /// They are the findings the count was made of — the report says *which*
+    /// findings are open, not only how many (SPEC 14).  They are `None` for
+    /// every rule that does not count a registry.
+    pub findings: Option<Vec<Finding>>,
 }
 
 impl RuleResult {
@@ -89,6 +96,7 @@ impl RuleResult {
             tier: Some(rule.tier),
             detail: Some(message),
             committed: None,
+            findings: None,
         }
     }
 }
@@ -148,13 +156,16 @@ impl Report {
         self.rules.len() + self.generated.len()
     }
 
-    /// The number of checks that ran: the rules and the drift gates.
+    /// The number of checks that ran: the rules.
     ///
-    /// A check is a rule **or a drift gate** (SPEC 3.3): the floor counts
-    /// them, the run-level empty selection counts them, and the summary
-    /// counts them.
+    /// A **check** is a **rule** (SPEC 3.3): the drift gates are not
+    /// counted.  They are gates over the *generated* files, and the report —
+    /// which is a generated file — cannot be part of the count that decides
+    /// whether the report is coherent.  The check and the report therefore
+    /// evaluate the floor over the same set and cannot disagree about whether
+    /// the run is coherent.
     pub fn checks(&self) -> usize {
-        self.executed + self.generated.len()
+        self.executed
     }
 }
 
@@ -373,6 +384,9 @@ pub fn check(
             tier: Some(rule.tier),
             detail,
             committed: committed_value,
+            // The findings the count was made of: the report shows which
+            // findings are open, not only how many (SPEC 14).
+            findings: run.findings,
         });
     }
 
@@ -419,30 +433,28 @@ pub fn tier_notes(config: &Config, selection: &Selection<'_>, report: &Report) -
     notes
 }
 
-/// The checks that executed in a tier: its rules and its drift gates.
+/// The checks that executed in a tier: its rules.
 ///
-/// A drift gate that was skipped — because of its tier — is not in the
-/// report and does not count.
+/// A drift gate is **not** a check (SPEC 3.3): the floor counts the rules,
+/// so that the check and the report — which runs no drift gate — evaluate
+/// the same set.
 fn executed_checks(report: &Report, tier: Tier) -> usize {
-    let rules = report
+    report
         .rules
         .iter()
         .filter(|rule| rule.tier == Some(tier))
-        .count();
-    let gates = report
-        .generated
-        .iter()
-        .filter(|entry| entry.tier == tier)
-        .count();
-    rules + gates
+        .count()
 }
 
 /// The tiers that a run executes.
 ///
 /// * with `--tier` — the selected tier and nothing else;
-/// * without it — every tier of the config: the declared ones and the ones
-///   its rules and its drift gates belong to.  A tier that runs and has no
-///   check is the empty selection and fails.
+/// * without it — every declared tier and the tiers of the rules.  A tier
+///   that runs and has no check is the empty selection and fails.
+///
+/// The tiers of the drift gates are not tiers that run: a drift gate is not
+/// a check (SPEC 3.3), and a tier that holds nothing but a generator has
+/// nothing to count.
 fn tiers_that_run(config: &Config, selection: &Selection<'_>) -> Vec<Tier> {
     if let Some(tier) = selection.tier {
         return vec![tier];
@@ -451,11 +463,6 @@ fn tiers_that_run(config: &Config, selection: &Selection<'_>) -> Vec<Tier> {
     for rule in config.rules.values() {
         if !tiers.contains(&rule.tier) {
             tiers.push(rule.tier);
-        }
-    }
-    for entry in &config.generated {
-        if !tiers.contains(&entry.tier) {
-            tiers.push(entry.tier);
         }
     }
     tiers.sort();
@@ -572,6 +579,7 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
             tier: Some(rule.tier),
             detail: None,
             committed: None,
+            findings: run.findings,
         });
     }
     report.ok = report.failed() == 0 && report.counter_errors == 0;
