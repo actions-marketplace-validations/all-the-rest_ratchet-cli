@@ -21,3 +21,14 @@ block is written by `ratchet release`.
 - the pre-release check: a command compared with its committed snapshot
 - the GitHub Action: validate the gates, or move the baseline deliberately
 - the self-update: the newest release, checksum verified
+
+## [0.2.0] - 2026-10-21
+
+### Added
+
+- the release step — the version and the changelog from the history (release)
+
+### Fixed
+
+- the publish needs the repository, and the release can run again (release)
+- the report says that it is generated — and how (report)

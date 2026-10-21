@@ -1325,9 +1325,12 @@ What the gates do **not** cover, named here rather than in a footnote:
 release workflow, the GitHub Action and the release step exist now, and the
 first release (`v0.1.0`) is published — but two things are still open: the
 **moving action tag** (`v1`) has to be moved by hand whenever `action.yml`
-changes, and the **release step** writes the version into one file of the
+changes, and the **release step** writes the version into **one** file of the
 project — a project that keeps its version in several places (a lock file
-beside the manifest) still has to move the second one by hand.
+beside the manifest, the default of the action's `version` input) still has to
+move the second one by hand. In this repository the second place is the action:
+the test that compares the default with the manifest catches a forgotten
+move, but the release commit has to make it.
 
 ## Specification
 
