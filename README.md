@@ -418,12 +418,13 @@ Two generator modes exist:
   is never touched.
 - **without `output_arg`** — the generator writes the file **in place**. The
   binary then owns a **verified restore**: it snapshots the original bytes,
-  the file mode *and* the time the file was written last, runs the
+  the file mode *and* the time the file was written last, **creates the
+  directory of the file** if it does not exist, runs the
   generator, reads the produced bytes, writes the snapshot to a temporary
   file in the same directory, gives it the original mode and time and
   **renames** it over the target — a rename replaces a symbolic link instead
   of writing through it — verifies the restore and removes a directory the
-  generator created and left empty. If the target **is** a symbolic link,
+  generator created and left **empty**. If the target **is** a symbolic link,
   the restore writes the file **behind** the link and recreates the link: a
   rename over the link would replace it with a regular file and change the
   tree, and the tree must not change. A generator writes **behind** a link, so
@@ -433,6 +434,15 @@ Two generator modes exist:
   an operational error that names the file and says that the working tree was
   modified: a swallowed restore error is a mutated tree that nobody was told
   about.
+
+  The directory is the engine's business, not the generator's: a project
+  cannot commit an empty directory, and a generator that writes a file into a
+  new directory would fail otherwise — the gate would be red from its first
+  run. A directory that cannot be created is an operational error that names
+  the directory and the cause: the failure is the engine's, and the user is
+  not sent to the generator. The restore removes the directory again — when it
+  is **empty**: a directory that still holds something is not the engine's to
+  remove.
 
   Before the generator runs, the file is touched with an **old** time — an
   hour into the past. The engine can then tell whether the generator wrote

@@ -571,9 +571,15 @@ The generator must be able to write to a **given path**:
 * without `output_arg` — the generator writes the file in place. The binary
   then owns a **verified restore**:
   1. snapshot the original bytes **and the file mode**;
-  2. run the generator;
-  3. read the produced bytes;
-  4. restore: write the snapshot to a **temporary file in the same directory**,
+  2. **create the directory of the file** if it does not exist: a project
+     cannot commit an empty directory, and a generator that writes a file into
+     a new directory would fail otherwise — the gate would be red from its
+     first run. A directory that cannot be created is an **operational error**
+     that names the directory and the cause: the failure is the engine's, and
+     the user is not sent to the generator;
+  3. run the generator;
+  4. read the produced bytes;
+  5. restore: write the snapshot to a **temporary file in the same directory**,
      give it the original mode, and **rename** it over the target — a rename
      replaces a symlink instead of writing through it, and it does not need
      write permission on the target itself. If the target **is** a symbolic
@@ -583,8 +589,11 @@ The generator must be able to write to a **given path**:
      **behind** a link, so the file behind the link is the one that changes —
      a file created behind a **dangling** link is not removed, which is why a
      dangling link is refused;
-  5. **verify** the restore (read the bytes back and compare);
-  6. a directory the generator created and left empty is removed.
+  6. **verify** the restore (read the bytes back and compare);
+  7. a directory the generator created and left **empty** is removed — and so
+     is the directory of step 2, which the engine created for the file. A
+     directory that still holds something is not the engine's to remove: it
+     was not left behind by the engine alone.
 
   If the restore fails, the run ends with an **operational error** that names
   the file and says that the working tree was modified. A swallowed restore

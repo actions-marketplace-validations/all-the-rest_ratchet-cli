@@ -3319,6 +3319,22 @@ fn mode_of(repo: &Repo, name: &str) -> u32 {
         & 0o7777
 }
 
+/// Makes a directory read-only: nothing can be created in it.
+#[cfg(unix)]
+fn make_read_only(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
+        .expect("the directory is read-only");
+}
+
+/// Makes a directory writable again.
+#[cfg(unix)]
+fn make_writable(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
+        .expect("the directory is writable");
+}
+
 /// Sets the mode of a file in the repository.
 #[cfg(unix)]
 fn set_mode(repo: &Repo, name: &str, mode: u32) {
@@ -6361,6 +6377,36 @@ fn the_diagnostic_channel_shows_the_argv_of_the_check() {
     assert!(text.contains("resolved config"), "{text}");
 }
 
+#[test]
+fn a_drift_gate_creates_the_directory_of_the_generated_file() {
+    // A project cannot commit an empty directory: a generator that writes a
+    // file into a new directory would fail, and the gate would be red from
+    // the first run.  The engine creates the directory for it — and removes
+    // it again.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    // The generator writes the file and nothing else: the directory is the
+    // engine's business, not the generator's.
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate runs: the file is new (it is not committed yet), and the
+    // directory it needed was created for it.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // And the tree is unchanged: the file the generator wrote is gone again.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    // The directory the engine created is gone again, too.
+    assert!(
+        !repo.path().join("docs").exists(),
+        "the directory the engine created was left behind"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_drift_gate_through_a_linked_directory_outside_the_root_is_refused() {
@@ -6780,4 +6826,37 @@ fn a_drift_gate_with_a_target_that_is_a_link_inside_the_root_is_allowed() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(repo.status(), "", "the drift run changed the working tree");
     assert_eq!(repo.read("docs/real.md"), "generated\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_of_the_generated_file_that_cannot_be_created_is_an_error() {
+    // The directory is the engine's business: a failure to create it is the
+    // engine's error, and the user is not sent to the generator.
+    let repo = Repo::new(
+        &generated_config_at(
+            "docs/sub/generated.md",
+            &["sh", "gen.sh", "docs/sub/generated.md"],
+            None,
+        ),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.write("docs/keep.md", "keep\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    // The directory cannot be written into: the run fails — with the
+    // engine's error, not with the generator's.
+    let directory = repo.path().join("docs");
+    make_read_only(&directory);
+    let output = repo.run(&["drift"]);
+    make_writable(&directory);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("cannot create the directory"), "{text}");
+    assert!(text.contains("docs/sub"), "{text}");
+    // The generator is not the one that is blamed.
+    assert!(!text.contains("exited with status"), "{text}");
 }

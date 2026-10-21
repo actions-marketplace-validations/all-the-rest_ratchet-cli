@@ -378,6 +378,21 @@ fn produce_in_place(
     let marker = fsutil::marker_time();
     let _ = fsutil::set_modified(&target, marker);
 
+    // 1c. the directory of the file is created if it does not exist: a
+    //     generator that writes a file into a new directory would otherwise
+    //     fail, and a project cannot commit an empty directory.  The
+    //     directories that were missing are removed again by the restore.
+    //     A directory that cannot be created is an error of the engine, not
+    //     of the generator: the user is not sent to the wrong place.
+    if let Some(directory) = target.parent() {
+        fs::create_dir_all(directory).map_err(|error| {
+            Error::new(format!(
+                "cannot create the directory {} of {display}: {error}",
+                path::display(Some(root), directory)
+            ))
+        })?;
+    }
+
     // 2. the generator.
     let run = run_generator(&entry.command, root, &display, debug);
 

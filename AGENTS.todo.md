@@ -59,6 +59,24 @@ and the one clippy dead-code error of item 1.
   the cross-check does not compile yet (the simulation that found the defects
   replaced every `cfg(unix)` in `tests/` with `cfg(any())`).
 
+### The drift gate creates the directory by the named path
+
+Logged 2026-10-21 (found by the verification of the path containment work).
+
+**Why.** The drift gate creates the directory of the generated file from the
+**named** path (`src/drift.rs`). When that directory is behind a link to a
+directory that does not exist yet, the creation fails with a misleading error
+(`cannot create the directory docs of docs/generated.md: File exists (os
+error 17)`) although the **resolved** directory lies inside the root and
+could be created. The run fails closed — the generator could not have written
+the file either — but the diagnosis points at the wrong place.
+
+**Open.**
+
+- Create the directory from the **resolved** path (the helper has to hand the
+  resolved path to the caller, not only the verdict), or name the named path
+  and the resolved one in the error.
+
 ### The moving action tag `v1` drifts
 
 Logged 2026-10-21 (found by the review of the release workflow, before the
