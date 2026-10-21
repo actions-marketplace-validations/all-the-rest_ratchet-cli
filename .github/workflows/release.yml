@@ -11,6 +11,21 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
+  workflow_dispatch:
+    # The release can be run again for a tag: a failed publish is retried
+    # without deleting the tag and pushing it a second time.  The tag is the
+    # reference — the run for `v0.1.0` publishes the release of `v0.1.0`.
+    inputs:
+      tag:
+        description: The tag of the release to publish.
+        required: true
+        type: string
+
+# The tag of the release.  A run that was started by the push of a tag uses
+# the tag of the push; a run that was started by hand names the tag in its
+# input.  The tag is the one thing every job agrees on.
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 # Only the job that publishes the release writes; every other job reads.
 permissions:
@@ -22,7 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
+        # The code that is released is the code of the tag.
         uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Node.js
         # The JavaScript config is evaluated by node; without it the eight
@@ -68,6 +86,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Read the version from the manifest
         id: version
@@ -90,8 +110,8 @@ jobs:
             echo "::error::the version cannot be read from Cargo.toml"
             exit 1
           fi
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::the tag $GITHUB_REF_NAME does not match the version $version of Cargo.toml"
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::the tag $RELEASE_TAG does not match the version $version of Cargo.toml"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -239,6 +259,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        # `gh release create` works in the repository: it needs the tag and
+        # the history behind it — the release notes are generated from the
+        # commits.  Without the checkout the publish fails with "not a git
+        # repository".
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
       - name: Download the assets
         uses: actions/download-artifact@v4
         with:
@@ -256,8 +286,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" dist/* \
+            --title "$RELEASE_TAG" \
             --verify-tag \
             --generate-notes
 
@@ -273,7 +303,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          published=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)
+          published=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)
           expected=$( { awk '{print $2}' dist/checksums.txt | sed 's/^\*//'; echo checksums.txt; } | sort )
           if [ "$published" != "$expected" ]; then
             echo "::error::the release does not carry the assets the checksums name"
