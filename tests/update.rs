@@ -596,11 +596,15 @@ fn step_script(workflow: &str, name: &str) -> String {
 }
 
 /// Runs a script of the workflow in a directory, with a tag.
+///
+/// The tag reaches the script as `RELEASE_TAG`: that is the variable the
+/// workflow defines, and every job reads the tag from it.
 fn run_step(script: &str, directory: &Path, tag: &str) -> Output {
     Command::new("sh")
         .arg("-c")
         .arg(script)
         .current_dir(directory)
+        .env("RELEASE_TAG", tag)
         .env("GITHUB_REF_NAME", tag)
         .env("GITHUB_OUTPUT", directory.join("github-output"))
         .output()
@@ -762,6 +766,35 @@ fn the_release_checks_the_tag_against_the_manifest() {
         text.contains("::error::the tag v0.2.0 does not match the version 0.1.0 of Cargo.toml"),
         "{text}"
     );
+}
+
+#[test]
+fn the_release_reads_the_tag_from_one_place() {
+    let workflow = workflow();
+    // The tag of the release reaches every job through one variable: a run
+    // that was started by the push of a tag and a run that was started by
+    // hand have to publish the same release.
+    assert!(
+        workflow.contains("RELEASE_TAG: ${{ inputs.tag || github.ref_name }}"),
+        "the workflow defines the tag of the release"
+    );
+    // The scripts read that variable — not the one of the event: the two
+    // differ in a run that was started by hand.
+    for step in [
+        "Read the version from the manifest",
+        "Publish the release",
+        "Check the release",
+    ] {
+        let script = step_script(&workflow, step);
+        assert!(
+            !script.contains("GITHUB_REF_NAME"),
+            "{step} reads the tag of the event, not the tag of the release"
+        );
+        assert!(
+            script.contains("RELEASE_TAG"),
+            "{step} does not read the tag of the release"
+        );
+    }
 }
 
 #[test]
