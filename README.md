@@ -25,23 +25,21 @@ command, a JSON file or a findings registry.
 
 ## Install
 
-There is no release yet — the release workflow landed with the self-update,
-but no tag was pushed. Until a release exists, build the binary from source
-and put it on your `PATH`:
-
-```sh
-cargo build --release
-install -m 0755 target/release/ratchet /usr/local/bin/
-ratchet --version
-```
-
-When a release is published, it consists of per-OS/arch tarballs with a
-`checksums.txt`; installing it looks like this:
+The releases are on GitHub: every tag `v<version>` publishes the binary of
+five platforms and a `checksums.txt`. Installing it looks like this:
 
 ```sh
 tar -xzf ratchet-<version>-<os>-<arch>.tar.gz
 sha256sum --check checksums.txt
 mv ratchet /usr/local/bin/
+```
+
+Or from source:
+
+```sh
+cargo build --release
+install -m 0755 target/release/ratchet /usr/local/bin/
+ratchet --version
 ```
 
 The intended way to update an installed binary is `ratchet update`: it
@@ -1223,9 +1221,10 @@ What the gates do **not** cover, named here rather than in a footnote:
 ## Not implemented yet
 
 `SPEC.md` describes more than this binary does today. The self-update, the
-release workflow and the GitHub Action exist now, but **no tag was pushed
-yet**: there is no GitHub Release to download and no release for the action
-to install, build the binary from source.
+release workflow and the GitHub Action exist now, and the first release
+(`v0.1.0`) is published — but the **moving action tag** (`v1`) still has to be
+moved by hand whenever `action.yml` changes, and nothing detects that it was
+forgotten.
 
 ## Specification
 
