@@ -86,9 +86,9 @@ first release).
 major tag), and nothing moves it: every change to `action.yml` or `action/`
 needs a `git tag -f v1 && git push -f origin v1`, and a forgotten move is
 invisible — a consumer on `all-the-rest/ratchet-cli@v1` silently runs an old
-action. The tag was pushed with the first release (`v0.1.0`) and moved with
-the release of `0.2.0`; the drift is the open part — nothing does it
-automatically.
+action. The tag was pushed with the first release (`v0.1.0`) and moved by hand
+with the releases of `0.2.0` and `0.3.0`; the drift is the open part — nothing
+does it automatically.
 
 **Open.**
 
@@ -96,3 +96,21 @@ automatically.
   a check that fails when the tag and the action disagree. A project that
   pins the tag by its commit SHA — as the portal does, because its
   supply-chain contract allows no moving tag — is not affected.
+
+### The artifact actions of the release run on a deprecated Node.js
+
+Logged 2026-10-21 (the annotation of the release run of `v0.3.0`).
+
+**Why.** The release workflow publishes its assets with
+`actions/upload-artifact@v4` and collects them with
+`actions/download-artifact@v4`. Both target Node.js 20, and the runners of
+GitHub force them onto Node.js 24 — the run of `v0.3.0` carried the
+annotation „Node.js 20 is deprecated". The run is green, so nothing is broken
+today; a forced fallback is a courtesy, not a promise.
+
+**Open.**
+
+- Move both actions to the version that targets Node.js 24 as soon as it
+  exists, and check the two workflows of this repository (the CI and the
+  release) for the same pair. The action is used in the release only — the CI
+  of this repository builds and tests, it publishes no artifact.
