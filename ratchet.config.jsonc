@@ -8,6 +8,16 @@
 [
   {
     "name": "ratchet-cli",
+    "release": {
+      // The changelog is written by hand up to 0.2.0; from that version on
+      // every block is machine-written (`ratchet release`).
+      "changelog": "CHANGELOG.md",
+      "changelogFrom": "0.2.0",
+      "tagPrefix": "v",
+      // The version lives in the manifest of the build tool — the one place
+      // it is written down.
+      "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" }
+    },
     "rules": {
       "dependency-count": {
         "class": "supply-chain debt",

@@ -62,6 +62,7 @@ ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseli
 ratchet drift           # run the drift gates: the generated files
 ratchet verify          # run the pre-release checks: the commands against their snapshots
 ratchet report --format md # render the run into a Markdown report
+ratchet release         # compute the next version and the changelog
 ratchet update          # update the binary to the newest release
 ratchet init            # write a starter config
 ```
@@ -129,6 +130,19 @@ root.
         // The scope of the rule; without it the rule always runs.
         "files": ["src/**"]
       }
+    },
+
+    // The release step and the changelog.  See "The release step" below.
+    "release": {
+      // The changelog file; "CHANGELOG.md" by default.
+      "changelog": "CHANGELOG.md",
+      // The first version the tool manages; below it the changelog is
+      // written by hand.
+      "changelogFrom": "0.2.0",
+      // The prefix of the tag of a release; "v" by default.
+      "tagPrefix": "v",
+      // Where the version of the project lives.
+      "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" }
     }
   }
 ]
@@ -547,6 +561,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
 | `ratchet verify` | Runs the pre-release checks — the commands of the `verify` entries against their committed snapshots — and nothing else. `--name` restricts the run to one check, `--update` writes the produced output into the snapshots. See [the pre-release check](#the-pre-release-check). |
 | `ratchet report` | Renders the run into a **Markdown report**: the summary with the verdict, one row per rule, the findings that count and the notes of the run. The drift gates are not in it — a report that held the result of the comparison with itself would be a regress. `--output <path>` writes it into the repository instead of stdout. See [the Markdown report](#the-markdown-report). |
+| `ratchet release` | Computes the next version from the commits since the last release tag and renders the changelog block of that version. It writes the version into the manifest of the project and appends the block to the changelog — and it writes **no tag**: a tag is a promise, and a promise is not made by a tool. `--from <tag>` computes the release from another tag, `--dry-run` prints the release and changes nothing. See [the release step](#the-release-step). |
 | `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
 
@@ -561,6 +576,8 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. A `check` and a `drift` option — the `report` writes a report and changes nothing else. |
 | `--name <name>` | Run only the check of this name. A `verify` option. |
 | `--update` | Write the produced output into the snapshots. A `verify` option: the snapshot is machine-written, and the check stays failed until the snapshot is committed. |
+| `--from <tag>` | Compute the release from this tag instead of the last release tag. A `release` option. |
+| `--dry-run` | Print the release, change nothing. A `release` option. |
 | `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. A `check` option: `ratchet drift` runs every tier. |
 | `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |
@@ -887,6 +904,10 @@ the run is red would fail the drift gate that invoked it. The verdict of the
 run is in the **content** of the report — and the `check` on the same tree
 exits `1`.
 
+The **release** has its own middle: it exits `1` when there is nothing to
+release — no commit since the last release changes the version. The tool did
+its job; the release that was asked for does not exist.
+
 ## The self-update
 
 `ratchet update` replaces the binary with the newest release of this
@@ -1116,6 +1137,84 @@ action and in the release workflow. A test substitutes the template of the
 action and compares the result with the function of the binary for every
 platform: a renamed asset fails the test instead of the action.
 
+## The release step
+
+`ratchet release` computes the next version from the commits since the last
+release tag and renders the changelog block of that version. The version and
+the changelog are **derived facts**: both are determined by the commit
+history, and a hand-written version drifts from the history silently — the
+tag says `0.2.0` while the history contains a breaking change.
+
+The release is configured in the config file:
+
+```jsonc
+{
+  "release": {
+    "changelog": "CHANGELOG.md",
+    "changelogFrom": "0.2.0",
+    "tagPrefix": "v",
+    "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" }
+  }
+}
+```
+
+**Where the version lives** is the project's business — the tool writes the
+version into the manifest of the build tool, whatever language that is:
+
+| Format | The project owns | An example |
+|---|---|---|
+| `toml` | the section and the key | `Cargo.toml` (`[package] version`), `pyproject.toml` (`[project] version`) |
+| `json` | the key | `package.json` (`version`) |
+| `line` | the prefix and the suffix of the line | `VERSION := 1.0.0` in a `Makefile`, `version = "1.0.0"` in a Gradle build |
+
+The write is a **targeted edit**: the line that carries the value is
+replaced, the rest of the file keeps its bytes and its formatting. A tool
+that rewrote a manifest with its own serializer would reformat a file it does
+not own — a diff of the whole file instead of a diff of the version.
+
+**The step** follows the commits since the last release tag:
+
+| Commit | Step | Changelog section |
+|---|---|---|
+| `feat:` | minor | `Added` |
+| `fix:` | patch | `Fixed` |
+| `perf:` | patch | `Changed` |
+| `refactor:` | none | `Changed` |
+| `!` in the subject, or a `BREAKING CHANGE:` footer | major | `Changed`, marked as breaking |
+| `docs:` `chore:` `test:` `build:` `ci:` | none | none |
+
+The mapping is configurable (`"steps"`), because a pre-1.0 project treats
+minor and patch differently: a project that maps `feat` to `patch` never
+leaves the `0.x` line by accident.
+
+**The changelog** is a Keep-a-Changelog block. The date is the date of the
+newest commit of the release — a fact of the history, not the clock: a block
+that carried the date of the day it was generated would make the same history
+produce different bytes on different days.
+
+```markdown
+## [0.2.0] - 2026-10-21
+
+### Added
+
+- the pre-release check (verify)
+```
+
+A commit whose **scope** is `security` goes into the section `Security`. The
+scope is the marker: a subject that mentions the word is not a finding — a
+commit that mentions "security" in a roadmap note is not a security change,
+and a marker that is sometimes right is a marker that is often wrong.
+
+The generator **appends** one block; it never rewrites the file. Below
+`changelogFrom` the changelog is written by hand — the tool refuses to write
+a block for a version below it and says so. From that version on, every block
+is machine-written.
+
+The command writes **two** files: the version file and the changelog. It
+writes **no tag**: the tag is the decision of the human, and the release
+workflow publishes what the tag names. `--dry-run` prints the release and
+changes nothing.
+
 ## This repo gates itself
 
 The repository is gated with the binary it ships. `ratchet.config.jsonc` holds
@@ -1221,10 +1320,12 @@ What the gates do **not** cover, named here rather than in a footnote:
 ## Not implemented yet
 
 `SPEC.md` describes more than this binary does today. The self-update, the
-release workflow and the GitHub Action exist now, and the first release
-(`v0.1.0`) is published — but the **moving action tag** (`v1`) still has to be
-moved by hand whenever `action.yml` changes, and nothing detects that it was
-forgotten.
+release workflow, the GitHub Action and the release step exist now, and the
+first release (`v0.1.0`) is published — but two things are still open: the
+**moving action tag** (`v1`) has to be moved by hand whenever `action.yml`
+changes, and the **release step** writes the version into one file of the
+project — a project that keeps its version in several places (a lock file
+beside the manifest) still has to move the second one by hand.
 
 ## Specification
 

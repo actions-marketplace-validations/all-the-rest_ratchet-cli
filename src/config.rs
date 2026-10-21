@@ -306,6 +306,70 @@ pub struct Verify {
     pub output_arg: Option<String>,
 }
 
+/// The release step and the changelog (SPEC §16).
+///
+/// The version and the changelog are derived facts: both are determined by
+/// the commit history.  The project owns the **paths** — where the version
+/// lives, where the changelog lives — and the engine owns the mechanic.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Release {
+    /// The path of the changelog file, relative to the repository root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+    /// The first version the tool manages.
+    ///
+    /// Below that version the changelog is written by hand: the tool refuses
+    /// to write a block for a version below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog_from: Option<String>,
+    /// The prefix of the tag of a release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_prefix: Option<String>,
+    /// Where the version of the project lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionFile>,
+    /// The mapping from the commit type to the version step.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub steps: BTreeMap<String, String>,
+}
+
+/// Where the version of a project lives.
+///
+/// The format is the shape of the file, not the language of the project: the
+/// same tool writes the version of a Rust, a Node, a Python or a Go project
+/// — the project owns the file, the engine owns the edit.
+#[derive(Debug, Clone, Serialize)]
+pub struct VersionFile {
+    /// The path of the file, relative to the repository root.
+    pub path: String,
+    /// The shape of the file.
+    pub format: VersionFormat,
+    /// The section of the key (`toml`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// The key of the version (`toml`, `json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The prefix of the line (`line`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The suffix of the line (`line`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+}
+
+/// The shape of the file that carries the version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionFormat {
+    /// A TOML file: a section and a key (`Cargo.toml`, `pyproject.toml`).
+    Toml,
+    /// A JSON file: a key of the root object (`package.json`).
+    Json,
+    /// A line of a text file: a prefix and a suffix (`Makefile`).
+    Line,
+}
+
 /// A merged config.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Config {
@@ -329,6 +393,9 @@ pub struct Config {
     /// The baseline path, relative to the config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<String>,
+    /// The release step and the changelog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
 }
 
 /// Parses a JSONC (or plain JSON) config.
@@ -471,7 +538,15 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
     let map = expect_object(value, "")?;
     check_unknown(
         map,
-        &["name", "tiers", "generated", "verify", "rules", "baseline"],
+        &[
+            "name",
+            "tiers",
+            "generated",
+            "verify",
+            "rules",
+            "baseline",
+            "release",
+        ],
         "",
     )?;
 
@@ -493,7 +568,161 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
     if let Some(rules) = map.get("rules") {
         merge_rules(config, rules)?;
     }
+    if let Some(release) = map.get("release") {
+        merge_release(config, release)?;
+    }
     Ok(())
+}
+
+/// Merges the release settings (SPEC §16).
+fn merge_release(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
+    let map = expect_object(value, "release")?;
+    check_unknown(
+        map,
+        &[
+            "changelog",
+            "changelogFrom",
+            "tagPrefix",
+            "version",
+            "steps",
+        ],
+        "release",
+    )?;
+
+    let mut release = config.release.clone().unwrap_or_default();
+
+    if let Some(changelog) = map.get("changelog") {
+        let path = expect_string(changelog, "release.changelog")?;
+        if path.trim().is_empty() {
+            return Err(ConfigError::new("release.changelog", "must not be empty"));
+        }
+        release.changelog = Some(path);
+    }
+    if let Some(from) = map.get("changelogFrom") {
+        let version = expect_string(from, "release.changelogFrom")?;
+        if version.trim().is_empty() {
+            return Err(ConfigError::new(
+                "release.changelogFrom",
+                "must not be empty",
+            ));
+        }
+        release.changelog_from = Some(version);
+    }
+    if let Some(prefix) = map.get("tagPrefix") {
+        release.tag_prefix = Some(expect_string(prefix, "release.tagPrefix")?);
+    }
+    if let Some(steps) = map.get("steps") {
+        let step_map = expect_object(steps, "release.steps")?;
+        for (kind, step) in step_map {
+            let path = format!("release.steps.{kind}");
+            let text = expect_string(step, &path)?;
+            // The step has to be a step: a typo in the configuration would
+            // otherwise be a version that moves nowhere.
+            crate::version::Step::parse(&text)
+                .map_err(|message| ConfigError::new(&path, message))?;
+            release.steps.insert(kind.clone(), text);
+        }
+    }
+    if let Some(version) = map.get("version") {
+        release.version = Some(parse_version_file(version)?);
+    }
+
+    config.release = Some(release);
+    Ok(())
+}
+
+/// Parses the place the version of the project lives.
+fn parse_version_file(value: &Value) -> Result<VersionFile, ConfigError> {
+    let path = "release.version";
+    let map = expect_object(value, path)?;
+    check_unknown(
+        map,
+        &["path", "format", "section", "key", "prefix", "suffix"],
+        path,
+    )?;
+
+    let file = require_string(map, "path", path)?;
+    if file.trim().is_empty() {
+        return Err(ConfigError::new(
+            format!("{path}.path"),
+            "must not be empty",
+        ));
+    }
+    let format = match map.get("format") {
+        None => {
+            return Err(ConfigError::new(
+                format!("{path}.format"),
+                "must not be empty — expected \"toml\", \"json\" or \"line\"",
+            ));
+        }
+        Some(value) => match expect_string(value, &format!("{path}.format"))?.as_str() {
+            "toml" => VersionFormat::Toml,
+            "json" => VersionFormat::Json,
+            "line" => VersionFormat::Line,
+            other => {
+                return Err(ConfigError::new(
+                    format!("{path}.format"),
+                    format!("expected \"toml\", \"json\" or \"line\", found \"{other}\""),
+                ));
+            }
+        },
+    };
+
+    let section = optional_string(map, "section", path)?;
+    let key = optional_string(map, "key", path)?;
+    let prefix = optional_string(map, "prefix", path)?;
+    let suffix = optional_string(map, "suffix", path)?;
+
+    // The fields of the format are required: a version file without them
+    // cannot be read, and a tool that guessed would write the version into a
+    // file that does not carry one.
+    let missing = |field: &str| {
+        Err(ConfigError::new(
+            format!("{path}.{field}"),
+            format!("the format \"{}\" needs it", format_name(format)),
+        ))
+    };
+    match format {
+        VersionFormat::Toml => {
+            if section.is_none() {
+                return missing("section");
+            }
+            if key.is_none() {
+                return missing("key");
+            }
+        }
+        VersionFormat::Json => {
+            if key.is_none() {
+                return missing("key");
+            }
+        }
+        VersionFormat::Line => {
+            if prefix.is_none() {
+                return missing("prefix");
+            }
+            if suffix.is_none() {
+                return missing("suffix");
+            }
+        }
+    }
+
+    Ok(VersionFile {
+        path: file,
+        format,
+        section,
+        key,
+        prefix,
+        suffix,
+    })
+}
+
+/// The name of a format, for the messages.
+fn format_name(format: VersionFormat) -> &'static str {
+    match format {
+        VersionFormat::Toml => "toml",
+        VersionFormat::Json => "json",
+        VersionFormat::Line => "line",
+    }
 }
 
 fn merge_tiers(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
@@ -1028,6 +1257,18 @@ fn require_string(map: &Map<String, Value>, key: &str, path: &str) -> Result<Str
         .get(key)
         .ok_or_else(|| ConfigError::new(format!("{path}.{key}"), "missing required field"))?;
     expect_string(value, &format!("{path}.{key}"))
+}
+
+/// An optional string field.
+fn optional_string(
+    map: &Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<Option<String>, ConfigError> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(value) => Ok(Some(expect_string(value, &format!("{path}.{key}"))?)),
+    }
 }
 
 fn check_unknown(

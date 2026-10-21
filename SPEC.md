@@ -94,6 +94,7 @@ shorthand for a one-element array.
 | `generated` | array | drift-gate entries (see §7) |
 | `verify` | array | pre-release checks (see §15) |
 | `rules` | object | rule id → rule object (see 3.2) |
+| `release` | object | the release step and the changelog (see §16) |
 
 ### 3.2 Rule object fields
 
@@ -254,6 +255,7 @@ ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
 ratchet verify [--name <name>] [--update]
 ratchet report [--output <path>] [--format md]
+ratchet release [--from <tag>] [--dry-run]
 ratchet init
 ratchet update
 ```
@@ -274,6 +276,8 @@ The default command is `check`.
 | `--ignore <pattern>` | glob of paths to exclude from the run (repeatable) |
 | `--name <name>` | run only this check — a `verify` option |
 | `--update` | write the snapshot instead of comparing it — a `verify` option |
+| `--from <tag>` | compute the release from this tag instead of the last release tag — a `release` option |
+| `--dry-run` | print the release, change nothing — a `release` option |
 | `--debug` | print the resolved config and every counter invocation |
 | `--quiet` | only print failures |
 | `--version`, `--help` | |
@@ -843,3 +847,193 @@ the marker and restored like any other write. If the restore fails, the run
 ends with an **operational error** that names the file and says that the
 working tree was modified — the same rule as the drift gate (§7). A swallowed
 restore error is a mutated tree that nobody was told about.
+
+## 16. The release step and the changelog
+
+`ratchet release [--from <tag>] [--dry-run]` computes the next version from
+the commits since the last release and renders the changelog block of that
+version.
+
+**The version and the changelog are derived facts.** Both are determined by
+the commit history; a hand-written version drifts from the history silently —
+the tag says `0.2.0` while the history contains a breaking change. The
+history is the reference, never a version string somebody typed.
+
+### 16.1 The configuration
+
+The release is configured in the config file:
+
+```jsonc
+{
+  "release": {
+    "changelog": "CHANGELOG.md",
+    "changelogFrom": "0.2.0",
+    "tagPrefix": "v",
+    "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" },
+    "steps": { "feat": "minor", "fix": "patch", "perf": "patch" }
+  }
+}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `changelog` | string | no (default `CHANGELOG.md`) | the path of the changelog file, relative to the repository root |
+| `changelogFrom` | string | no | the **first version the tool manages**; below it the changelog is written by hand |
+| `tagPrefix` | string | no (default `v`) | the prefix of the tag of a release |
+| `version` | object | yes | **where the version lives** (see 16.2) |
+| `steps` | object | no | the mapping from the commit type to the version step (see 16.3) |
+
+A missing `release` section means: the changelog is `CHANGELOG.md`, the tag
+prefix is `v`, the step table is the default one — and the **version file is
+not configured**, so `ratchet release` is a configuration error: the tool
+does not guess where the version of a project lives. A project without a
+version in a file (the version is only in the tag) cannot use the command.
+
+### 16.2 The version file
+
+The version lives in **the file the project names** — the manifest of the
+build tool, whatever language that is:
+
+| Format | The project owns | An example |
+|---|---|---|
+| `toml` | `section` and `key` | `Cargo.toml` (`[package] version`), `pyproject.toml` (`[project] version`) |
+| `json` | `key` | `package.json` (`version`) |
+| `line` | `prefix` and `suffix` | `VERSION := 1.0.0` in a `Makefile`, `version = "1.0.0"` in a Gradle build |
+
+The tool **reads** the version from that file and **writes** the new version
+into it. The write is a **targeted edit**: the line that carries the value is
+replaced, the rest of the file keeps its bytes and its formatting. A tool
+that rewrites a manifest with its own serializer would reformat a file it
+does not own — a diff of the whole file instead of a diff of the version.
+The write is **atomic**: the content goes to a temporary file in the same
+directory and is renamed over the target, so an interrupted write cannot
+truncate the file.
+
+* `toml` — the section is a dotted path (`tool.poetry` is the section
+  `[tool.poetry]`); the key is the name of the entry in it.
+* `json` — the key is the name of the member; it has to be a member of the
+  **root** of the document (`package.json` has one). The members of the root
+  sit at the smallest indentation of the document, and the line of the key
+  has to sit there: a key that only exists in a nested object is not the
+  version of the project, and writing into it would put the version where
+  nobody reads it. The document has to be written **one member per line** —
+  a compact document has no lines to write into.
+* `line` — the line that starts with the prefix and ends with the suffix
+  carries the version between them. The suffix may be empty.
+
+A version file that cannot be read, a version that cannot be parsed, a value
+that is not there — every one of them is an **operational error** that names
+the file. A release command that guesses where the version is would write a
+version into a file that does not carry one.
+
+### 16.3 The step
+
+| Commit | Step | Changelog section |
+|---|---|---|
+| `feat:` | minor | `Added` |
+| `fix:` | patch | `Fixed` |
+| `perf:` | patch | `Changed` |
+| `refactor:` | none | `Changed` |
+| `!` in the subject, or a `BREAKING CHANGE:` footer | major | `Changed`, marked as breaking |
+| `docs:` `chore:` `test:` `build:` `ci:` | none | none |
+
+The **base version** is the version of the last release tag, and the version
+in the version file **has to be that version**: a file that says something
+else means that the release was already prepared, or that the version was
+changed by hand. Both are refused — the run ends with an operational error
+that names both versions.
+
+The step is **configurable** (`steps`), because a pre-1.0 project treats minor
+and patch differently: a project that maps `feat` to `patch` never leaves the
+`0.x` line by accident. The default table is the one above; the mapping
+covers the types the project wants to change, the others keep their default.
+The key `breaking` is the step of a commit that breaks the contract — it is
+`major` by default.
+
+The commits are the ones **since the last release tag** — `--from <tag>`
+names another one. The tag is the reference, never a version string somebody
+typed.
+
+**A release tag is the prefix and three numbers** — `v1.2.3`. Nothing more:
+a pre-release (`v1.2.3-rc.1`) is not a release, and the moving major tag of
+the action (`v1`) is not a release either. A tag that is not a release tag
+does not count, and naming one explicitly is refused — the version it stands
+for would be a guess.
+
+With **no release tag at all**, the version in the version file is the
+version of the release: the first release is the version the project chose,
+and the step does not apply to it.
+
+### 16.4 The changelog
+
+The block is a **Keep-a-Changelog** block:
+
+```markdown
+## [0.2.0] - 2026-10-21
+
+### Added
+
+- the pre-release check (verify)
+
+### Fixed
+
+- the restore of a snapshot that the command changed
+```
+
+The sections are the ones of Keep a Changelog (`Added`, `Changed`,
+`Deprecated`, `Removed`, `Fixed`, `Security`), filled from the commit type.
+A commit whose **scope** is `security` goes into `Security`: the scope is
+the marker, and a subject that mentions the word is not a finding — a commit
+that mentions "security" in a roadmap note is not a security change, and a
+marker that is sometimes right is a marker that is often wrong. A commit that
+breaks the contract goes into `Changed`, marked as breaking.
+
+The **date** is the **committer date** of the newest commit of the release —
+the day the change landed in this history. It is a fact of the history, not
+the clock. A block that carries the date of the day it was generated would
+make the same history produce different bytes on different days, and the
+determinism rule (§2) forbids that.
+
+The entries are the subjects of the commits, without the type and the scope
+prefix, with the scope in parentheses. The order is the order of the commits,
+oldest first.
+
+The generator **appends** one block to the changelog file; it never rewrites
+the file. Below `changelogFrom` the changelog is **written by hand**: the
+tool refuses to write a block for a version below it and says so. From that
+version on, every block is machine-written — the tool owns that part of the
+file, and the human owns the rest.
+
+A changelog file that does not exist yet is created with the preamble of Keep
+a Changelog.
+
+### 16.5 The command
+
+`ratchet release [--from <tag>] [--dry-run]`:
+
+* it writes **two** files: the version file and the changelog file. Nothing
+  else in the tree is touched;
+* both paths have to lie **inside the repository root** — the check is not
+  only lexical: a symbolic link inside the root can point outside it, and the
+  write would follow the link;
+* it creates **no tag**: the tag is the decision of the human, and the
+  release workflow publishes what the tag names;
+* `--dry-run` prints the computed version and the block and changes nothing;
+* the **exit codes**: `0` when the release was prepared, `1` when there is
+  nothing to release (no commit since the last release changes the version),
+  `2` on an operational error (not a git repository, the tag cannot be read,
+  the tag is not a release tag, the version file cannot be read or written,
+  the version in the file is not the version of the last release, the
+  changelog is below `changelogFrom`).
+
+The run prints the **version**, the **tag** of the release (`v0.2.0`), the
+**changelog block** and what it wrote. The block is the artifact the command
+produces, and a person who asks for a release wants to read it — before the
+run writes it and after. The tag is the one thing the tool does not write — a
+tag is a promise, and a promise is not made by a tool.
+
+The **JSON document** of the command carries the version, the tag, the tag the
+release was computed from, the step, the entries with their type, scope and
+date, the block, the files that were written and the notes — the same
+information as the stylish output, in the machine shape. The document is
+printed like every other one: one newline at the end, no more.

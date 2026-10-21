@@ -15,189 +15,29 @@ outside that vocabulary is a hard error, never a fallback.
 
 ## Open
 
-### Release step and changelog from the conventional-commit history
+### The moving action tag `v1` drifts
 
-Logged 2026-10-20 (owner decision: "aus einer conventional commit history den
-nächsten release step ermitteln können und auch die changelog generieren können
-daraus").
+Logged 2026-10-21 (found by the review of the release workflow, before the
+first release).
 
-**Why.** The version and the changelog are derived facts: both are already
-determined by the commit history, and both are currently written by hand. A
-hand-written version drifts from the history silently — the tag says `0.2.0`
-while the history contains a breaking change.
-
-**Decision.**
-
-- **Semver + Keep-a-Changelog.** The next step is computed from the commits
-  since the last tag: `feat` → minor, `fix` → patch, `!` in the subject or a
-  `BREAKING CHANGE:` footer → major, `docs`/`refactor`/`chore`/`test`/`perf` →
-  no step. A pre-1.0 project may configure the mapping, because `0.x` treats
-  minor and patch differently.
-- The changelog is written in **Keep-a-Changelog** sections (`Added` /
-  `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`), grouped by the
-  commit type, and appended to the project's existing `CHANGELOG.md` — the
-  generator does not replace the file, it appends one release block.
-- The engine owns the parsing, the mapping and the rendering; the project owns
-  the version prefix and the changelog path. As everywhere else: the mechanic
-  is not project-specific.
+**Why.** The action is pinned by a tag of this repository (`v1` — a moving
+major tag), and nothing moves it: every change to `action.yml` or `action/`
+needs a `git tag -f v1 && git push -f origin v1`, and a forgotten move is
+invisible — a consumer on `all-the-rest/ratchet-cli@v1` silently runs an old
+action. The tag was pushed with the first release (`v0.1.0`); the drift is
+the open part.
 
 **Open.**
 
-- `SPEC.md` gains a section for the release step (the current spec covers
-  gates, baselines, drift and the self-update only — the release step is
-  **not** part of v0).
-- The binary gains `ratchet release [--from <tag>] [--dry-run]` printing the
-  computed version and the changelog block, plus the write path.
-- The tag lookup, the commit parsing and the Semver mapping need unit tests
-  (conventional-commit subjects, `!` markers, footers, `0.x` handling).
-
-### Security findings registry and gate
-
-Logged 2026-10-20 (owner decision: "Befund-Registry + Gate").
-
-**Why.** Two projects keep security findings in prose: the portal in
-`features/security/2026-10-18-review-closure.md` (`SEC-01`…) with
-`accepted-risks.md`, the website in `rules/10-ui-review-findings.md`. Neither
-can answer "how many open high-severity findings are there, and did that number
-grow?" — the number is not a number anywhere, so it cannot be gated.
-
-**Decision.**
-
-- A **JSON registry in the project** (`ratchet.findings.json`), entries with
-  `id`, `title`, `severity`, `status` (`open` / `in-progress` / `fixed` /
-  `accepted` / `wontfix` — the canonical vocabulary) and optional `status_since`,
-  `regression_test` and `path`. `owner` and `ticket` are **mandatory for every
-  entry that is not `fixed`**: a closed entry has its commit and its regression
-  test, an open one has nobody → a graveyard entry. `ticket` is the identifier
-  of the decision, the review round or the issue that tracks the finding (the
-  portal uses its owner decisions `D-1`…`D-44`). The schema is project-neutral:
-  both projects can use it, and the existing prose documents stay the human
-  record.
-- The gate counts the **open high/critical findings** against a baseline that
-  may only **fall**. The levels that count are named by the **rule**, not by the
-  engine — the portal speaks `P1`/`P2`, the website `critical`…`low`, and the
-  registry carries the canonical levels (`P1` → `critical`, `P2` → `high`).
-  `accepted` and `wontfix` do not count, but they stay visible in the report —
-  an accepted risk is a decision, not a deletion.
-- The registry is a **counter source** like the other artifacts, so the
-  existing mechanic applies unchanged: the count comes from the registry, the
-  baseline from `ratchet.baseline.json`, the direction from the rule. A rule
-  with `direction: "ceiling"` and `baseline: 0` *is* the boolean gate ("no open
-  finding") — the portal's count is 0 today, all 14 findings being closed.
-
-**Open.**
-
-- Both projects need the migration of their existing findings into the
-  registry — a project-level task, not a tool task.
-
-### Pre-release verification: run a command, fail on a change
-
-Logged 2026-10-20 (owner decision: "man übergibt ihm einen befehl den er
-ausführt und failt wenn sich da was verändert, das könnte ein pre release und
-nicht immer gate sein").
-
-**Why.** A benchmark is a measurement, not a defect class. It has no meaningful
-"baseline that may only sink" — the value moves in both directions and only
-matters at the moment of a release. Encoding it as a permanent gate would
-either freeze a number or produce permanent noise.
-
-**Decision.**
-
-- A **pre-release check**, not a permanent gate: a command is executed, its
-  output is compared with a **snapshot**, and a deviation **fails** the check.
-  It runs in the release pipeline, not in the commit gate.
-- The snapshot is a committed file (the same machine-written discipline as the
-  baseline: never hand-edited, the diff is the review artifact). The direction
-  is **not** restricted — a benchmark may legitimately move in either
-  direction, and the human decides whether the deviation is acceptable. The
-  tool reports the diff.
-- The mechanic is the same as the drift gate (§7 of the spec) with a different
-  comparison: the drift gate compares a *generated file* with its committed
-  counterpart, the pre-release check compares a *command output* with a
-  committed snapshot.
-
-**Open.**
-
-- `SPEC.md` gains a section for the pre-release check (the command, the
-  snapshot, the comparison, the exit codes, the interaction with the drift
-  gate).
-- The binary gains the command, e.g. `ratchet verify --snapshot <path>`.
-
-### Markdown report generator
-
-Logged 2026-10-20 (owner decision: "Report-Generator + Drift-Gates").
-
-**Why.** The report and the number must come from one source — otherwise they
-contradict each other. A gate result that is only visible on the terminal is
-not reviewable, and a status table in a Markdown file that is maintained by
-hand drifts from the numbers it claims to report.
-
-**Decision.**
-
-- `ratchet report --format md` (or `--output <path>`) renders the **rules**,
-  the findings and the metrics into **one Markdown file**; the existing drift
-  gate then checks that the file matches the committed version, so every
-  generated Markdown file is drift-checked like every other derived artifact.
-  The drift gates are not in the report: a report that held the result of the
-  comparison with itself would be a regress.
-- The generator is deterministic: sorted output, no timestamps, no absolute
-  paths, no machine names. The same tree produces the same bytes.
-
-**Open.**
-
-- The spec has the section (§14) and the binary has the renderer
-  (`ratchet report --format md [--output <path>]`). What is open is the
-  **project-level** half: the report has to be registered in a project's
-  `generated[]`, and the decision where that report lives is a project
-  decision — the gate that checks the report is the drift gate of that file.
-
-### GitHub Action: validate and update the stand in CI
-
-Logged 2026-10-20 (owner decision: "sie soll per cli verwendet werden aber auch
-in die github ci gut integriert werden können. können wir da nativ einen step
-bauen, den wir einbinden können? Es soll sowohl den Stand updaten können als
-auch validieren ob der stand korrekt ist").
-
-**Why.** The gates are worthless if nobody runs them, and running them by hand
-in every repository is not a process — it is a habit, and habits are what the
-ratchet mechanic exists to replace. Both projects that are to use the binary
-(website, portal) run GitHub Actions, and the website repo deliberately has no
-CI of its own today.
-
-**Decision.**
-
-- A **native GitHub Action** in this repo (`action.yml`), usable as
-  `uses: all-the-rest/ratchet-cli@v1` in any project. Two modes:
-  - **validate** — installs the binary and runs `ratchet check`; a failing
-    gate fails the job. This is the commit/PR gate.
-  - **update** — runs `ratchet baseline update` and commits the changed
-    baseline. Only for a deliberate, scheduled or manually triggered run: the
-    baseline is a reviewed artifact, and a bot that moves it silently on
-    every push defeats the monotonicity check.
-- The action does **not** decide the baseline direction, the tier or the
-  rules — that stays in the project's `ratchet.config.jsonc`.
-
-**Open.**
-
-- **No release exists yet.** The action installs the release of its `version`
-  input (`v0.1.0` by default) — but no tag was pushed, so there is nothing to
-  download: the action is untested against a real release. Every release has
-  to name its version in the default of the input (a test compares it with
-  `Cargo.toml`).
-- **The tag of the action** (`v1`) has to be pushed next to the binary tag:
-  two version lines, and a project pins the action, not the binary.
-- **The moving `v1` tag drifts.** Nothing moves it: every change to
-  `action.yml` or `action/` needs a `git tag -f v1 && git push -f origin v1`,
-  and a forgotten move is invisible — a consumer on
-  `all-the-rest/ratchet-cli@v1` silently runs an old action. The fix is a
-  workflow that moves the tag to the commit that last touched the action, or
-  a check that fails when the tag and the action disagree.
-- The two consuming projects (website, portal) need a workflow that calls the
-  action — a project-level task, not a tool task.
+- A workflow that moves the tag to the commit that last touched the action, or
+  a check that fails when the tag and the action disagree. A project that
+  pins the tag by its commit SHA — as the portal does, because its
+  supply-chain contract allows no moving tag — is not affected.
 
 ## Not open here
 
-- The **skills repo** (`~/dev/agents-skills`) owns the `ratchet-gates` skill:
-  the concrete CLI reference (`references/cli.md`) belongs there, and its
-  checklist should point at the binary instead of describing the mechanic
-  only. That is logged in the skills repo's own `AGENTS.todo.md`.
+- The **migration of the findings** of the two projects that use the binary:
+  the website's UI findings and the portal's security findings into
+  `ratchet.findings.json`, and the registration of the Markdown report in a
+  project's `generated[]`. The tool owns the mechanic (§13, §14); the projects
+  own the migration — it is a project-level task, not a tool task.

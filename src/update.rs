@@ -82,60 +82,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A version: `MAJOR.MINOR.PATCH`.
+/// The version of a release.
 ///
-/// The comparison is hand-written: three numbers do not need a crate, and a
-/// pre-release suffix (`1.2.3-rc.1`) does not change the order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version {
-    major: u64,
-    minor: u64,
-    patch: u64,
-}
-
-impl Version {
-    /// Parses `MAJOR.MINOR.PATCH`.
-    ///
-    /// A leading `v` — the tag of a release — and a pre-release or build
-    /// suffix are ignored: `v1.2.3-rc.1` is `1.2.3`.  A missing part is a
-    /// zero: `1.2` is `1.2.0`.
-    pub fn parse(text: &str) -> Result<Version, String> {
-        let trimmed = text.trim();
-        let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
-        // The suffix of a pre-release ("1.2.3-rc.1") and of a build
-        // ("1.2.3+7") does not take part in the order.
-        let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
-
-        let mut numbers = [0u64; 3];
-        for (index, part) in core.split('.').enumerate() {
-            if index == numbers.len() {
-                return Err(format!(
-                    "{text} is not a version — expected MAJOR.MINOR.PATCH"
-                ));
-            }
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(format!(
-                    "{text} is not a version — expected MAJOR.MINOR.PATCH"
-                ));
-            }
-            let number = part
-                .parse::<u64>()
-                .map_err(|_| format!("{text} is not a version — {part} is not a number"))?;
-            numbers[index] = number;
-        }
-        Ok(Version {
-            major: numbers[0],
-            minor: numbers[1],
-            patch: numbers[2],
-        })
-    }
-}
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
+/// The version is defined once, in [`crate::version`]: the self-update
+/// compares versions and the release step computes the next one.  Two
+/// definitions would drift, and a version that drifts from the history is
+/// the failure this tool exists to prevent.
+pub use crate::version::Version;
 
 /// The platform a release asset is named for.
 #[derive(Debug, Clone, PartialEq, Eq)]

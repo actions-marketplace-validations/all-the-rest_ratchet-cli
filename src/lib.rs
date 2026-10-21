@@ -16,10 +16,12 @@ pub mod generate;
 pub mod git;
 pub mod path;
 pub mod registry;
+pub mod release;
 pub mod report;
 pub mod update;
 pub mod update_check;
 pub mod verify;
+pub mod version;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -194,6 +196,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
         Command::Verify(args) => cmd_verify(&cli, args, &cwd),
         Command::Report(args) => cmd_report(&cli, args, &cwd),
+        Command::Release(args) => cmd_release(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
         Command::Update(args) => cmd_update(&cli, args),
     }
@@ -427,6 +430,41 @@ fn cmd_report(cli: &Cli, args: &ReportArgs, cwd: &Path) -> Result<i32, Error> {
     // The report was produced: the command succeeded.  The verdict of the
     // run is in the report, not in the exit code.
     Ok(0)
+}
+
+/// Computes the next version and the changelog of the release (SPEC §16).
+fn cmd_release(cli: &Cli, args: &ReleaseArgs, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+    // The release command runs no rule: the option has no effect here.  It is
+    // still compiled: an invalid pattern is an error everywhere.
+    let _ignore = compile_ignore(&cli.ignore)?;
+
+    let outcome = release::run(
+        &context.config,
+        &context.git,
+        &release::Options {
+            root: &context.root,
+            from: args.from.as_deref(),
+            dry_run: args.dry_run,
+        },
+    )?;
+
+    let mut debug = Vec::new();
+    if cli.debug {
+        debug.push(resolved_config(&context.config));
+    }
+
+    match format_of(cli)? {
+        Output::Json => {
+            println!("{}", report::render_release_json(&outcome, args.dry_run));
+        }
+        Output::Stylish => print!("{}", report::render_release(&outcome, args.dry_run)),
+    }
+    print_notes(&outcome.notes, &debug, cli);
+
+    // Nothing to release is not a failure of the tool — but it is a failure
+    // of the request: the release that was asked for does not exist.
+    Ok(if outcome.nothing { 1 } else { 0 })
 }
 
 /// The path of the report: the absolute path and the repository-relative one.
@@ -1334,8 +1372,8 @@ fn parent_dir(path: &Path) -> PathBuf {
 }
 
 /// The subcommands of the CLI.
-const SUBCOMMANDS: [&str; 8] = [
-    "check", "count", "baseline", "drift", "verify", "report", "init", "update",
+const SUBCOMMANDS: [&str; 9] = [
+    "check", "count", "baseline", "drift", "verify", "report", "release", "init", "update",
 ];
 
 /// The options that take a value; the value is not a positional argument.
@@ -1468,6 +1506,8 @@ enum Command {
     Verify(VerifyArgs),
     /// Render the run into a Markdown report.
     Report(ReportArgs),
+    /// Compute the next version and the changelog of the release.
+    Release(ReleaseArgs),
     /// Write a starter config.
     Init(InitArgs),
     /// Update the binary to the newest release.
@@ -1483,6 +1523,18 @@ struct ReportArgs {
     /// configuration error.
     #[arg(long, value_name = "PATH")]
     output: Option<String>,
+}
+
+/// The arguments of `release`.
+#[derive(Args, Debug)]
+struct ReleaseArgs {
+    /// Compute the release from this tag instead of the last release tag.
+    #[arg(long, value_name = "TAG")]
+    from: Option<String>,
+
+    /// Print the release, change nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// The arguments of `check`.

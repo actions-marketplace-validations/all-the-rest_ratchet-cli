@@ -108,6 +108,93 @@ impl Git {
         let root = self.root.as_ref()?;
         run_bytes(root, &["cat-file", "blob", object])
     }
+
+    /// The last release tag: the most recent tag that names a release.
+    ///
+    /// The tag of the release is the reference of the release step (SPEC
+    /// §16) — never a version string somebody typed.  A tag that is not a
+    /// release tag (the moving major tag of the action, a pre-release) is
+    /// **not** a release and does not count: it is skipped, and the search
+    /// continues with the tag below it.
+    ///
+    /// The search walks the history of `HEAD`, so a tag that is not an
+    /// ancestor of `HEAD` is not a release of this branch.
+    pub fn last_release_tag(&self, prefix: &str) -> Option<String> {
+        let root = self.root.as_ref()?;
+        // The commits that carry a tag, newest first.  Every tag of a commit
+        // is on its line.
+        let output = run(
+            root,
+            &[
+                "log",
+                "--tags",
+                "--simplify-by-decoration",
+                "--pretty=format:%D",
+            ],
+        )?;
+        for line in output.lines() {
+            for part in line.split(',') {
+                let part = part.trim();
+                let Some(name) = part.strip_prefix("tag: ") else {
+                    continue;
+                };
+                if crate::version::parse_tag(name, prefix).is_ok() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// The commits since a tag, oldest first.
+    ///
+    /// Without a tag the whole history is returned.  The subject, the body
+    /// and the date of every commit are read: the release step needs the
+    /// type of the commit, its breaking marker and the date of the release.
+    pub fn commits_since(&self, since: Option<&str>) -> Option<Vec<Commit>> {
+        let root = self.root.as_ref()?;
+        // The fields are separated by a unit separator, the records by a
+        // record separator: a commit message may hold anything else.
+        let format = "--format=%s%x1f%cs%x1f%b%x1e";
+        let range = match since {
+            Some(tag) => format!("{tag}..HEAD"),
+            None => "HEAD".to_string(),
+        };
+        let output = run(root, &["log", "--reverse", format, &range])?;
+        Some(parse_commits(&output))
+    }
+}
+
+/// A commit of the history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// The subject of the commit.
+    pub subject: String,
+    /// The date of the commit (`YYYY-MM-DD`, the date of the commit itself).
+    pub date: String,
+    /// The body of the commit.
+    pub body: String,
+}
+
+/// Parses the commits of the output of `git log`.
+fn parse_commits(output: &str) -> Vec<Commit> {
+    let mut commits = Vec::new();
+    for record in output.split('\u{1e}') {
+        let record = record.trim_start_matches('\n');
+        if record.trim().is_empty() {
+            continue;
+        }
+        let mut fields = record.split('\u{1f}');
+        let subject = fields.next().unwrap_or_default().to_string();
+        let date = fields.next().unwrap_or_default().to_string();
+        let body = fields.next().unwrap_or_default().to_string();
+        commits.push(Commit {
+            subject,
+            date,
+            body,
+        });
+    }
+    commits
 }
 
 /// The state of the committed tree of a repository.

@@ -7,6 +7,7 @@ use crate::check::{BaselineAction, Report, RuleResult, RuleStatus};
 use crate::config::Direction;
 use crate::drift::DriftEntry;
 use crate::registry::Finding;
+use crate::release::Outcome as ReleaseOutcome;
 use crate::verify::VerifyEntry;
 
 /// The JSON schema version of the report.
@@ -278,6 +279,110 @@ pub fn render_verify_json(entries: &[VerifyEntry], ok: bool, notes: &[String]) -
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Renders the human readable output of the release command.
+///
+/// The **block** is part of the output: it is the artifact the command
+/// produces, and a person who asks for a release wants to read it — before
+/// the run writes it (a dry run) and after.
+pub fn render_release(outcome: &ReleaseOutcome, dry_run: bool) -> String {
+    let mut out = String::new();
+    let version = outcome
+        .version
+        .map(|version| version.to_string())
+        .unwrap_or_default();
+    out.push_str(&format!("ratchet — the release {version}\n\n"));
+    if let Some(tag) = &outcome.tag {
+        out.push_str(&format!("  {:<14}{tag}\n", "the tag"));
+    }
+    if let Some(base) = &outcome.base {
+        out.push_str(&format!("  {:<14}{base}\n", "since"));
+    }
+    out.push_str(&format!("  {:<14}{}\n", "the step", outcome.step.as_str()));
+    out.push_str(&format!("  {:<14}{}\n", "the entries", outcome.announced()));
+    if !outcome.written.is_empty() {
+        out.push('\n');
+        for file in &outcome.written {
+            out.push_str(&format!("  wrote {file}\n"));
+        }
+    }
+    if !outcome.block.is_empty() {
+        out.push('\n');
+        out.push_str(&outcome.block);
+    }
+    if dry_run {
+        out.push_str("\n  the run was a dry one: nothing was written\n");
+    }
+    out
+}
+
+/// The JSON document of the release command.
+#[derive(Serialize)]
+struct JsonRelease<'a> {
+    schema: u32,
+    /// The version of the release.
+    version: Option<String>,
+    /// The tag of the release.
+    tag: Option<&'a str>,
+    /// The tag the release was computed from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<&'a str>,
+    /// The step the version moves by.
+    step: &'a str,
+    /// True when there is nothing to release.
+    nothing: bool,
+    /// True when the run was a dry one: nothing was written.
+    dry_run: bool,
+    /// The entries of the changelog block.
+    entries: Vec<JsonEntry<'a>>,
+    /// The changelog block.
+    block: &'a str,
+    /// The files that were written.
+    written: &'a [String],
+    /// The notes of the run.
+    notes: &'a [String],
+}
+
+/// One commit of the release.
+#[derive(Serialize)]
+struct JsonEntry<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    subject: &'a str,
+    breaking: bool,
+    date: &'a str,
+}
+
+/// Renders the JSON document of the release command.
+pub fn render_release_json(outcome: &ReleaseOutcome, dry_run: bool) -> String {
+    let json = JsonRelease {
+        schema: SCHEMA,
+        version: outcome.version.map(|version| version.to_string()),
+        tag: outcome.tag.as_deref(),
+        base: outcome.base.as_deref(),
+        step: outcome.step.as_str(),
+        nothing: outcome.nothing,
+        dry_run,
+        entries: outcome
+            .entries
+            .iter()
+            .map(|entry| JsonEntry {
+                kind: entry.kind.as_deref(),
+                scope: entry.scope.as_deref(),
+                subject: &entry.subject,
+                breaking: entry.breaking,
+                date: &entry.date,
+            })
+            .collect(),
+        block: &outcome.block,
+        written: &outcome.written,
+        notes: &outcome.notes,
+    };
+    // The document ends like every other JSON document of the tool: the
+    // newline comes from the printing, not from the renderer.
+    serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+}
 /// Renders the human readable `count` output.
 pub fn render_counts(report: &Report) -> String {
     let mut out = String::new();
