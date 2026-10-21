@@ -213,6 +213,8 @@ fn fixture() -> Repo {
 /// generated file in the summary.
 const EXPECTED: &str = r#"# Ratchet report
 
+**Generated — do not edit by hand.** Regenerate with `ratchet report --format md --output <path>`.
+
 ## Summary
 
 **Verdict: COHERENT**

@@ -732,6 +732,10 @@ it claims to report.
 
 **The sections:**
 
+0. a header that says the file is **generated** — "do not edit by hand" — and
+   names the command that regenerates it. A derived file that does not say so
+   is a file somebody edits by hand, and the edit is lost at the next
+   regeneration;
 1. a summary (the rules, the failed, the executed) **and the run's verdict**;
 2. one row per rule (id, class, direction, tier, count, baseline, status, and the
    **detail** — the reason a status is not `ok`);

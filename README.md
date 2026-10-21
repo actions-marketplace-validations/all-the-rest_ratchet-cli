@@ -825,6 +825,8 @@ the run is red would fail the drift gate that invoked it.
 ```markdown
 # Ratchet report
 
+**Generated — do not edit by hand.** Regenerate with `ratchet report --format md --output <path>`.
+
 ## Summary
 
 **Verdict: COHERENT**

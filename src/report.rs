@@ -505,6 +505,11 @@ pub fn render_markdown(report: &Report) -> String {
     let mut out = String::new();
 
     out.push_str("# Ratchet report\n\n");
+    // 0. the header: the file says that it is generated, and how.
+    out.push_str(
+        "**Generated — do not edit by hand.** Regenerate with `ratchet report --format md \
+         --output <path>`.\n\n",
+    );
 
     // 1. the summary: the verdict of the run and its numbers.
     out.push_str("## Summary\n\n");
