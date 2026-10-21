@@ -62,6 +62,7 @@ ratchet baseline update # pay a ceiling down / a floor up — in that direction 
 ratchet baseline path   # print the path of the baseline file
 ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
 ratchet drift           # run the drift gates: the generated files
+ratchet verify          # run the pre-release checks: the commands against their snapshots
 ratchet report --format md # render the run into a Markdown report
 ratchet update          # update the binary to the newest release
 ratchet init            # write a starter config
@@ -374,6 +375,121 @@ the gate measures the **committed** artifact. It turns green once the fix is
 committed. A run with `--fix` in a pipeline is therefore never green against a
 stale HEAD; that is deliberate, not a bug.
 
+### The pre-release check
+
+A **benchmark is a measurement, not a defect class**. It has no meaningful
+"baseline that may only sink" — the value moves in both directions and only
+matters at the moment of a release. So the pre-release check is **not a
+ratchet: it has no direction**. It runs in the **release pipeline**, not in the
+commit gate: it needs the infrastructure the release needs, and a permanent
+gate over a measurement would be noise.
+
+The `verify` entries of the config name the checks:
+
+```jsonc
+"verify": [
+  {
+    "name": "benchmark",
+    "command": ["cargo", "bench", "--", "--output", "<out>"],
+    "snapshot": "snapshots/benchmark.txt"
+  }
+]
+```
+
+* The **snapshot** is a committed file, machine-written, the same discipline as
+  the baseline: never hand-edited, the diff is the review artifact.
+* The command runs with the working directory set to the **repository root**
+  and writes to a **temporary path** — the check does not modify the tree.
+* The comparison is against the **committed** snapshot
+  (`git show HEAD:<snapshot>`), and the difference is shown as a unified diff:
+
+  ```
+  --- snapshots/benchmark.txt
+  +++ snapshots/benchmark.txt
+  @@ -1,1 +1,1 @@
+  -benchmark: 100 ops/s
+  +benchmark: 103 ops/s
+  ```
+
+* The status of a check is `ok` (the snapshot is the output), `drift` (the
+  snapshot differs — a failed check) or `new` (the snapshot is not committed
+  yet — informational, not a failure).
+
+**Where the output goes.** Three ways to say it:
+
+| the entry | the output is |
+|---|---|
+| `"output_arg": "--output"` | the file the command writes to `--output <temporary path>` — the flag and the path are appended to the argv |
+| the placeholder `<out>` in the command | the file the command writes to the temporary path the placeholder stands for |
+| neither | the **stdout** of the command |
+
+The placeholder is replaced **wherever it appears in an argument** — not only
+as a whole argument: `--output=<out>` and `<out>.txt` name the output as
+well. The literal `<out>` never reaches the command: a command that writes
+`--output=<out>` has to write to the temporary file, or the engine would
+compare the command's stdout with the snapshot and report a green that means
+nothing. The temporary directory is the contract, not the file name: the
+output is the file the command wrote there. A command that writes nothing is
+an operational error; a command that writes more than one file is one too —
+the output would be a guess.
+
+The placeholder and the `output_arg` are two ways to name the same output
+path; an entry that uses both is a configuration error.
+
+**The snapshot has to be a regular file.** A symbolic link is refused with a
+named error: the committed content of a link is its target, and comparing the
+*output* with the target's content would say nothing about the output. (The
+drift gate resolves a link instead — there the *file* is the subject, here the
+*output* is. The two gates have different subjects and say so.)
+
+`ratchet verify` runs the checks; `--name <name>` runs one of them. The exit
+code is `0` when every check is `ok` or `new`, `1` when a snapshot differs
+**or** when there is no check at all (an empty selection is never a pass), and
+`2` on an operational error:
+
+* the command could not be started, failed, or wrote nothing;
+* the command wrote more than one file into the temporary directory — the
+  output would be a guess;
+* the committed snapshot could not be read;
+* the snapshot path is outside the repository root — also when it leaves the
+  root through a symbolic link;
+* the snapshot is not a regular file — a link or a directory;
+* the restore of the snapshot failed — the working tree was modified;
+* the `--name` names a check that does not exist.
+
+The message names the check — and, where a file is involved, the path as
+well: a broken command is not a failed measurement, and whoever reads the
+error has to know which check failed and which file it is about.
+
+`--update` writes the produced output into the snapshot — the snapshot is
+machine-written, never hand-edited. The check stays **failed**: the committed
+snapshot is still stale until the file is committed, the same rule the drift
+gate follows. A snapshot outside the repository root is refused — and the
+refusal holds for a path that leaves the root through a symbolic link, so
+`--update` cannot write outside the tree.
+
+The engine does not modify the tree: the command writes into a temporary
+directory, and the snapshot — the one file the engine owns — is restored
+afterwards, byte-, mode- **and** time-identical. The engine touches the file
+with an old time before the command runs, so it can tell a command that
+rewrites the snapshot with the same bytes from a command that leaves it
+alone; either way the file gets its time back. A command with other side
+effects is the command's doing: the engine cannot undo them.
+
+The command sees a snapshot that is **an hour older** than it is. A command
+that compares the time of its input with the time of its output therefore
+rewrites the snapshot instead of skipping it — and a command that embeds the
+time of its input in its output would produce a permanent drift, which the
+determinism rule forbids anyway. The snapshot is restored exactly afterwards:
+the bytes, the mode **and** the time.
+
+The JSON document reuses the **check document's envelope** with the
+`generated` array replaced by a `verify` array: the same `schema`, `ok`,
+`summary` and `notes`, an empty `rules` array — the verify command runs no
+rule — and one entry per check with its `name`, `status`, `diff` and
+`detail`. In the summary, `generated` counts the checks and `drifted` the
+checks whose snapshot differs.
+
 ### The JavaScript config
 
 `ratchet.config.mjs` / `ratchet.config.cjs` exports the same JSON shape as its
@@ -431,6 +547,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `ratchet baseline path` | Prints the **repository-relative path** of the baseline file — the path the binary itself uses, and nothing else. It is the answer to "which file is my baseline?" for a script outside the binary: the resolution lives in one place, and a second implementation answers a different question than the binary. |
 | `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
+| `ratchet verify` | Runs the pre-release checks — the commands of the `verify` entries against their committed snapshots — and nothing else. `--name` restricts the run to one check, `--update` writes the produced output into the snapshots. See [the pre-release check](#the-pre-release-check). |
 | `ratchet report` | Renders the run into a **Markdown report**: the summary with the verdict, one row per rule, the findings that count and the notes of the run. The drift gates are not in it — a report that held the result of the comparison with itself would be a regress. `--output <path>` writes it into the repository instead of stdout. See [the Markdown report](#the-markdown-report). |
 | `ratchet update` | Updates the binary to the newest release of this repository: the asset for the platform is downloaded, its SHA-256 is verified against the `checksums.txt` of the release, and the binary is replaced. See [the self-update](#the-self-update). |
 | `ratchet init` | Writes a starter `ratchet.config.jsonc` if no config exists. An existing config — also one in a parent directory of the repository — is never overwritten. |
@@ -444,6 +561,8 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `--format <stylish\|json\|md>` | The output format, `stylish` by default. `md` belongs to the `report` command: the other commands print the stylish output or the JSON document. |
 | `--rule <id>` | Restrict the run to one rule. |
 | `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. A `check` and a `drift` option — the `report` writes a report and changes nothing else. |
+| `--name <name>` | Run only the check of this name. A `verify` option. |
+| `--update` | Write the produced output into the snapshots. A `verify` option: the snapshot is machine-written, and the check stays failed until the snapshot is committed. |
 | `--tier <fast\|slow>` | Run only the rules of that tier — and only the generators of that tier. A `check` option: `ratchet drift` runs every tier. |
 | `--ignore <pattern>` | Exclude the paths that match the pattern from the **rules' path scope** (repeatable). It does not exclude a drift gate. |
 | `--debug` | Print the resolved config and every counter invocation (on stderr). |

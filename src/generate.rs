@@ -7,9 +7,10 @@
 //! (SPEC §7), which owns a verified restore.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::fsutil::Temporary;
 
 /// A generator: the argv and the output argument.
 #[derive(Debug, Clone)]
@@ -40,23 +41,6 @@ pub struct GeneratedArtifact {
     _temporary: Temporary,
 }
 
-/// A temporary directory that is removed again when it goes out of scope.
-///
-/// The guard exists so that **every** path removes it: a successful run, a
-/// failing generator, and every early return in between.  A resource that
-/// grows without bound is a defect even outside the repository.
-#[derive(Debug)]
-struct Temporary {
-    /// The path of the directory.
-    path: PathBuf,
-}
-
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
 impl Generator {
     /// Runs the generator and returns the produced bytes of `artifact`.
     ///
@@ -64,12 +48,10 @@ impl Generator {
     /// root.  The generator writes to a temporary path; the tree stays as it
     /// is.
     pub fn run(&self, artifact: &Path, root: &Path) -> Result<GeneratedArtifact, GeneratorError> {
-        // The guard is created before the directory exists: every path out of
-        // this function removes it again.
-        let temporary = Temporary {
-            path: temporary_directory(),
-        };
-        fs::create_dir_all(&temporary.path).map_err(|e| GeneratorError {
+        // The guard removes the directory on every path out of this function:
+        // a successful run, a failing generator, and every early return in
+        // between.
+        let temporary = Temporary::new("generate").map_err(|e| GeneratorError {
             message: "the generator could not be started".to_string(),
             output: format!("cannot create the temporary directory: {e}"),
         })?;
@@ -77,7 +59,7 @@ impl Generator {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "artifact".to_string());
-        let output = temporary.path.join(name);
+        let output = temporary.path().join(name);
 
         // Every path in the report is relative to the repository root.
         let display = crate::path::display(Some(root), &root.join(artifact));
@@ -155,15 +137,6 @@ fn run_generator(command: &[String], root: &Path) -> Result<String, Failure> {
 /// The argv of a subprocess, as a human readable line.
 fn command_line(command: &[String]) -> String {
     command.join(" ")
-}
-
-/// A unique temporary directory for the generated output.
-fn temporary_directory() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!("ratchet-generate-{}-{nanos}", std::process::id()))
 }
 
 #[cfg(test)]

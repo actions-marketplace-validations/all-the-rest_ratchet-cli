@@ -283,6 +283,29 @@ pub struct Generated {
     pub tier: Tier,
 }
 
+/// A pre-release check: a command whose output is compared with a committed
+/// snapshot (SPEC §15).
+///
+/// A benchmark is a measurement, not a defect class: it has no meaningful
+/// "baseline that may only sink".  The value moves in both directions and
+/// only matters at the moment of a release, so the check has **no direction**.
+#[derive(Debug, Clone, Serialize)]
+pub struct Verify {
+    /// The name of the check; it identifies the entry in the report.
+    pub name: String,
+    /// The command that produces the output.
+    pub command: Vec<String>,
+    /// The committed snapshot, relative to the repository root.
+    pub snapshot: String,
+    /// The argument the command writes its output to.
+    ///
+    /// The argv gets the temporary output path appended — the flag, then the
+    /// path — so the command writes where the tool tells it and the tree
+    /// stays untouched (SPEC §15).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_arg: Option<String>,
+}
+
 /// A merged config.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Config {
@@ -295,6 +318,12 @@ pub struct Config {
     /// Drift gate entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub generated: Vec<Generated>,
+    /// The pre-release checks.
+    ///
+    /// They run in the release pipeline, not in the commit gate: a measurement
+    /// is not a defect class (SPEC §15).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub verify: Vec<Verify>,
     /// The rules, sorted by id.
     pub rules: BTreeMap<String, Rule>,
     /// The baseline path, relative to the config.
@@ -442,7 +471,7 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
     let map = expect_object(value, "")?;
     check_unknown(
         map,
-        &["name", "tiers", "generated", "rules", "baseline"],
+        &["name", "tiers", "generated", "verify", "rules", "baseline"],
         "",
     )?;
 
@@ -457,6 +486,9 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
     }
     if let Some(generated) = map.get("generated") {
         merge_generated(config, generated)?;
+    }
+    if let Some(verify) = map.get("verify") {
+        merge_verify(config, verify)?;
     }
     if let Some(rules) = map.get("rules") {
         merge_rules(config, rules)?;
@@ -530,6 +562,83 @@ fn merge_generated(config: &mut Config, value: &Value) -> Result<(), ConfigError
         match config.generated.iter_mut().find(|g| g.path == entry.path) {
             Some(existing) => *existing = entry,
             None => config.generated.push(entry),
+        }
+    }
+    Ok(())
+}
+
+/// Merges the pre-release checks (SPEC §15).
+fn merge_verify(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
+    let items = expect_array(value, "verify")?;
+    // The names of this array: a name twice in one array is a mistake, and a
+    // mistake that silently drops a check is a false green.
+    let mut names: Vec<String> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let path = format!("verify[{index}]");
+        let map = expect_object(item, &path)?;
+        check_unknown(map, &["name", "command", "snapshot", "output_arg"], &path)?;
+
+        let name = require_string(map, "name", &path)?;
+        if name.trim().is_empty() {
+            return Err(ConfigError::new(
+                format!("{path}.name"),
+                "must not be empty",
+            ));
+        }
+        if names.contains(&name) {
+            return Err(ConfigError::new(
+                format!("{path}.name"),
+                format!("the name \"{name}\" is used twice — every check has its own name"),
+            ));
+        }
+        names.push(name.clone());
+        let command = require_string_array(map, "command", &path)?;
+        if command.is_empty() {
+            return Err(ConfigError::new(
+                format!("{path}.command"),
+                "must not be empty",
+            ));
+        }
+        let snapshot = require_string(map, "snapshot", &path)?;
+        if snapshot.trim().is_empty() {
+            return Err(ConfigError::new(
+                format!("{path}.snapshot"),
+                "must not be empty",
+            ));
+        }
+        let output_arg = match map.get("output_arg") {
+            None => None,
+            Some(value) => Some(expect_string(value, &format!("{path}.output_arg"))?),
+        };
+
+        // The placeholder in the argv and the `output_arg` are two ways to
+        // name the output path.  A command that uses both does not say where
+        // its output goes, and the tool would tell it twice.
+        if output_arg.is_some()
+            && command
+                .iter()
+                .any(|part| part.contains(crate::verify::PLACEHOLDER))
+        {
+            return Err(ConfigError::new(
+                format!("{path}.output_arg"),
+                format!(
+                    "the command carries the {} placeholder and the entry declares an \
+                     `output_arg` — one of them names the output path",
+                    crate::verify::PLACEHOLDER
+                ),
+            ));
+        }
+
+        let entry = Verify {
+            name,
+            command,
+            snapshot,
+            output_arg,
+        };
+        // A later config object overrides an earlier entry with the same name.
+        match config.verify.iter_mut().find(|v| v.name == entry.name) {
+            Some(existing) => *existing = entry,
+            None => config.verify.push(entry),
         }
     }
     Ok(())

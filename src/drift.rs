@@ -21,12 +21,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use crate::Error;
 use crate::config::{Config, Generated, Tier};
 use crate::diff;
+use crate::fsutil;
 use crate::generate::Generator;
 use crate::git::{Git, HeadEntry};
 use crate::path;
@@ -350,8 +350,8 @@ fn produce_in_place(
     // 1b. the marker: the file is touched with an old time, so that the
     //     engine can tell whether the generator wrote it — whatever the
     //     timestamp granularity of the filesystem is.
-    let marker = marker_time();
-    let _ = set_modified(&target, marker);
+    let marker = fsutil::marker_time();
+    let _ = fsutil::set_modified(&target, marker);
 
     // 2. the generator.
     let run = run_generator(&entry.command, root, &display, debug);
@@ -512,7 +512,7 @@ struct Link {
 impl Snapshot {
     /// Takes the snapshot of `target`.
     fn take(target: &Path) -> io::Result<Self> {
-        let created = created_directories(target);
+        let created = fsutil::created_directories(target);
         match fs::symlink_metadata(target) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Snapshot {
                 target: target.to_path_buf(),
@@ -531,8 +531,8 @@ impl Snapshot {
                     Ok(metadata) => (
                         Some(fs::read(&resolved)?),
                         metadata.modified().ok(),
-                        inode_of(&metadata),
-                        mode_of(&metadata),
+                        fsutil::inode_of(&metadata),
+                        fsutil::mode_of(&metadata),
                     ),
                     Err(_) => (None, None, None, None),
                 };
@@ -557,8 +557,8 @@ impl Snapshot {
                 target: target.to_path_buf(),
                 content: Some(fs::read(target)?),
                 modified: metadata.modified().ok(),
-                inode: inode_of(&metadata),
-                mode: mode_of(&metadata),
+                inode: fsutil::inode_of(&metadata),
+                mode: fsutil::mode_of(&metadata),
                 link: None,
                 created,
             }),
@@ -591,7 +591,7 @@ impl Snapshot {
         // The time is the same — but a generator that **replaces** the file
         // (`cp -p` and `mv`, the reproducible-build pattern) leaves a new
         // inode behind, and the inode survives a preserved time.
-        if inode_of(&metadata) != self.inode() {
+        if fsutil::inode_of(&metadata) != self.inode() {
             return true;
         }
         produced != self.bytes()
@@ -633,15 +633,17 @@ impl Snapshot {
                 // replace it with a regular file and change the tree — and the
                 // tree must not change (SPEC 7).
                 if let Some(content) = &link.content {
-                    write_atomic(&link.resolved, content, link.mode, link.modified)
+                    fsutil::write_atomic(&link.resolved, content, link.mode, link.modified)
                         .map_err(|error| error.to_string())?;
                 }
                 remove_path(&self.target).map_err(|error| error.to_string())?;
                 create_symlink(&link.raw, &self.target).map_err(|error| error.to_string())?;
             }
             None => match &self.content {
-                Some(content) => write_atomic(&self.target, content, self.mode, self.modified)
-                    .map_err(|error| error.to_string())?,
+                Some(content) => {
+                    fsutil::write_atomic(&self.target, content, self.mode, self.modified)
+                        .map_err(|error| error.to_string())?
+                }
                 None => {
                     // The file did not exist before: the generator created it.
                     if fs::symlink_metadata(&self.target).is_ok() {
@@ -661,8 +663,8 @@ impl Snapshot {
     fn keep(&self) -> Result<(), String> {
         if let (Some(mode), None) = (self.mode, &self.link) {
             let metadata = fs::metadata(&self.target).map_err(|error| error.to_string())?;
-            if mode_of(&metadata) != Some(mode) {
-                set_mode(&self.target, mode).map_err(|error| error.to_string())?;
+            if fsutil::mode_of(&metadata) != Some(mode) {
+                fsutil::set_mode(&self.target, mode).map_err(|error| error.to_string())?;
             }
         }
         Ok(())
@@ -670,18 +672,7 @@ impl Snapshot {
 
     /// Removes the directories the generator created and left empty.
     fn remove_created_directories(&self) -> Result<(), String> {
-        for directory in &self.created {
-            // The deepest directory comes first: an empty parent can only be
-            // removed after its child is gone.
-            match fs::read_dir(directory) {
-                Ok(mut entries) => {
-                    if entries.next().is_none() {
-                        let _ = fs::remove_dir(directory);
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
+        fsutil::remove_empty_directories(&self.created);
         Ok(())
     }
 
@@ -715,7 +706,7 @@ impl Snapshot {
                     if let Some(mode) = self.mode {
                         let metadata =
                             fs::metadata(&self.target).map_err(|error| error.to_string())?;
-                        if mode_of(&metadata) != Some(mode) {
+                        if fsutil::mode_of(&metadata) != Some(mode) {
                             return Err("the mode differs from the snapshot".to_string());
                         }
                     }
@@ -731,90 +722,6 @@ impl Snapshot {
             },
         }
     }
-}
-
-/// Writes `content` to `path` through a temporary file in the same directory.
-///
-/// The temporary file carries the original mode and time and is then
-/// **renamed** over the target: a rename replaces a symbolic link instead of
-/// writing through it, and it does not need write permission on the target
-/// itself.
-fn write_atomic(
-    path: &Path,
-    content: &[u8],
-    mode: Option<u32>,
-    modified: Option<SystemTime>,
-) -> io::Result<()> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = directory.join(temporary_name(path));
-
-    let result = (|| -> io::Result<()> {
-        fs::write(&temporary, content)?;
-        if let Some(mode) = mode {
-            set_mode(&temporary, mode)?;
-        }
-        if let Some(modified) = modified {
-            // The time is restored on a best-effort basis: the bytes and the
-            // mode are what the tree owes, and a filesystem that refuses the
-            // time must not fail the restore.
-            let _ = set_modified(&temporary, modified);
-        }
-        fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        // The temporary file must not stay behind: it would be a change of
-        // the tree that nobody asked for.
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-/// A time far enough in the past that every write lands after it.
-///
-/// The engine touches the generated file with this time before the generator
-/// runs: a generator that writes the file sets a current time, and the
-/// difference between the two tells the engine that the file was written —
-/// on every filesystem, whatever its timestamp granularity is.
-fn marker_time() -> SystemTime {
-    SystemTime::now() - Duration::from_secs(3600)
-}
-
-/// Sets the time the file was written last.
-fn set_modified(path: &Path, time: SystemTime) -> io::Result<()> {
-    let file = fs::File::open(path)?;
-    let times = fs::FileTimes::new().set_modified(time);
-    file.set_times(times)
-}
-
-/// The name of the temporary file of a restore.
-///
-/// The name carries the process id and a counter: two restores in the same
-/// run never collide, and the file is gone before the run ends.
-fn temporary_name(path: &Path) -> String {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let number = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    format!(".ratchet-restore-{}-{number}-{name}", std::process::id())
-}
-
-/// The directories that do not exist yet below the target.
-fn created_directories(target: &Path) -> Vec<PathBuf> {
-    let mut missing = Vec::new();
-    let mut current = target.parent();
-    while let Some(directory) = current {
-        if directory.as_os_str().is_empty() {
-            break;
-        }
-        if !directory.exists() {
-            missing.push(directory.to_path_buf());
-        } else {
-            break;
-        }
-        current = directory.parent();
-    }
-    missing
 }
 
 /// The path a symbolic link points to.
@@ -853,47 +760,4 @@ fn create_symlink(_raw: &Path, _target: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "symbolic links are not supported here",
     ))
-}
-
-/// The mode of a file, on the platforms that have one.
-#[cfg(unix)]
-fn mode_of(metadata: &fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    Some(metadata.permissions().mode() & 0o7777)
-}
-
-/// The mode of a file, on the platforms that have none.
-#[cfg(not(unix))]
-fn mode_of(_metadata: &fs::Metadata) -> Option<u32> {
-    None
-}
-
-/// The inode of a file, on the platforms that have one.
-///
-/// The inode survives a preserved time: a generator that replaces the file
-/// (`cp -p` and `mv`, the reproducible-build pattern) leaves a new one behind,
-/// and that is the only signal that such a write happened.
-#[cfg(unix)]
-fn inode_of(metadata: &fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.ino())
-}
-
-/// The inode of a file, on the platforms that have none.
-#[cfg(not(unix))]
-fn inode_of(_metadata: &fs::Metadata) -> Option<u64> {
-    None
-}
-
-/// Sets the mode of a file, on the platforms that have one.
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-}
-
-/// Sets the mode of a file, on the platforms that have none.
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
 }

@@ -5,6 +5,7 @@
 //! different bytes.  These helpers are the only place that decides how a path
 //! is shown.
 
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// The path of `path` relative to `root`, with `/` as the separator.
@@ -49,6 +50,57 @@ pub fn file_name(path: &Path) -> String {
         Some(name) => name.to_string_lossy().into_owned(),
         None => slash(path),
     }
+}
+
+/// The path with its symbolic links resolved: the existing part of it is
+/// resolved, the rest is kept.
+///
+/// A file that does not exist yet has no link to resolve: the walk stops at
+/// the first component that is not there, and the rest is appended to the
+/// resolved parent.  A link that points at nothing is resolved by hand:
+/// `canonicalize` cannot follow it, and the caller would create its target.
+pub fn resolve(path: &Path) -> PathBuf {
+    // The deepest part of the path that is there — a link counts as there.
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if fs::symlink_metadata(&existing).is_ok() {
+            break;
+        }
+        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        rest.push(name);
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+    }
+
+    let mut resolved = match fs::canonicalize(&existing) {
+        Ok(resolved) => resolved,
+        // A link that points at nothing: its target is read by hand.
+        Err(_) => match fs::read_link(&existing) {
+            Ok(target) => {
+                let parent = existing.parent().map(Path::to_path_buf).unwrap_or_default();
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    parent.join(target)
+                };
+                let directory = target.parent().map(Path::to_path_buf).unwrap_or_default();
+                let directory = fs::canonicalize(&directory).unwrap_or(directory);
+                match target.file_name() {
+                    Some(name) => directory.join(name),
+                    None => directory,
+                }
+            }
+            Err(_) => path.to_path_buf(),
+        },
+    };
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
 }
 
 /// The path with `/` as the separator.

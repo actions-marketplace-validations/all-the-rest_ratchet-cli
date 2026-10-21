@@ -11,6 +11,7 @@ pub mod config;
 pub mod counter;
 pub mod diff;
 pub mod drift;
+pub mod fsutil;
 pub mod generate;
 pub mod git;
 pub mod path;
@@ -18,6 +19,7 @@ pub mod registry;
 pub mod report;
 pub mod update;
 pub mod update_check;
+pub mod verify;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -190,6 +192,7 @@ fn run_inner(cli: Cli) -> Result<i32, Error> {
             BaselineCommand::Raise(args) => cmd_baseline_raise(&cli, args, &cwd),
         },
         Command::Drift(args) => cmd_drift(&cli, args, &cwd),
+        Command::Verify(args) => cmd_verify(&cli, args, &cwd),
         Command::Report(args) => cmd_report(&cli, args, &cwd),
         Command::Init(_) => cmd_init(&cli, &cwd),
         Command::Update(args) => cmd_update(&cli, args),
@@ -446,7 +449,7 @@ fn report_path(root: &Path, raw: &str) -> Result<(PathBuf, String), Error> {
     // The link is resolved: a path that leaves the root through a symbolic
     // link is a path outside the root.
     let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if !resolve(&full).starts_with(&resolved_root) {
+    if !path::resolve(&full).starts_with(&resolved_root) {
         return Err(Error::new(
             "config error at --output: the report must be written inside the repository root — \
              the path leaves it through a symbolic link",
@@ -459,57 +462,6 @@ fn report_path(root: &Path, raw: &str) -> Result<(PathBuf, String), Error> {
         ));
     }
     Ok((full, relative))
-}
-
-/// The path with its symbolic links resolved: the existing part of it is
-/// resolved, the rest is kept.
-///
-/// A file that does not exist yet has no link to resolve: the walk stops at
-/// the first component that is not there, and the rest is appended to the
-/// resolved parent.  A link that points at nothing is resolved by hand:
-/// `canonicalize` cannot follow it, and the report would create its target.
-fn resolve(path: &Path) -> PathBuf {
-    // The deepest part of the path that is there — a link counts as there.
-    let mut existing = path.to_path_buf();
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if fs::symlink_metadata(&existing).is_ok() {
-            break;
-        }
-        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
-            return path.to_path_buf();
-        };
-        rest.push(name);
-        if !existing.pop() {
-            return path.to_path_buf();
-        }
-    }
-
-    let mut resolved = match fs::canonicalize(&existing) {
-        Ok(resolved) => resolved,
-        // A link that points at nothing: its target is read by hand.
-        Err(_) => match fs::read_link(&existing) {
-            Ok(target) => {
-                let parent = existing.parent().map(Path::to_path_buf).unwrap_or_default();
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    parent.join(target)
-                };
-                let directory = target.parent().map(Path::to_path_buf).unwrap_or_default();
-                let directory = fs::canonicalize(&directory).unwrap_or(directory);
-                match target.file_name() {
-                    Some(name) => directory.join(name),
-                    None => directory,
-                }
-            }
-            Err(_) => path.to_path_buf(),
-        },
-    };
-    for name in rest.into_iter().rev() {
-        resolved.push(name);
-    }
-    resolved
 }
 
 /// The format of a command that prints a report.
@@ -624,6 +576,58 @@ fn cmd_drift(cli: &Cli, args: &DriftArgs, cwd: &Path) -> Result<i32, Error> {
             println!("{}", report::render_json(&report));
         }
         Output::Stylish => print!("{}", report::render_drift(&outcome.entries, ok, cli.quiet)),
+    }
+    print_notes(&notes, &debug, cli);
+
+    Ok(if ok { 0 } else { 1 })
+}
+
+/// Runs the pre-release checks: the commands whose output is compared with a
+/// committed snapshot (SPEC §15).
+///
+/// The checks are **not** part of the commit gate: they run in the release
+/// pipeline.  A measurement is not a defect class, and a permanent gate over
+/// it would be noise.
+fn cmd_verify(cli: &Cli, args: &VerifyArgs, cwd: &Path) -> Result<i32, Error> {
+    let context = load_context(cli, cwd)?;
+    // `--ignore` applies to the rules' path scope; the verify command has no
+    // rules, so the option has no effect here.  It is still compiled: an
+    // invalid pattern is an error everywhere.
+    let _ignore = compile_ignore(&cli.ignore)?;
+
+    let outcome = verify::run(
+        &context.config,
+        &context.git,
+        &verify::Options {
+            root: &context.root,
+            update: args.update,
+            name: args.name.as_deref(),
+        },
+    )?;
+
+    let drifted = outcome.drifted();
+    // An empty selection is never a pass: a verify command without a check
+    // runs no check at all.
+    let ran = !outcome.entries.is_empty();
+    let ok = drifted == 0 && ran;
+
+    let mut debug = outcome.debug;
+    if cli.debug {
+        debug.insert(0, resolved_config(&context.config));
+    }
+    let mut notes = outcome.notes;
+    if !ran {
+        notes.push("no check was executed — an empty selection is never a pass".to_string());
+    }
+
+    match format_of(cli)? {
+        Output::Json => {
+            println!(
+                "{}",
+                report::render_verify_json(&outcome.entries, ok, &notes)
+            );
+        }
+        Output::Stylish => print!("{}", report::render_verify(&outcome.entries, ok, cli.quiet)),
     }
     print_notes(&notes, &debug, cli);
 
@@ -1330,13 +1334,13 @@ fn parent_dir(path: &Path) -> PathBuf {
 }
 
 /// The subcommands of the CLI.
-const SUBCOMMANDS: [&str; 7] = [
-    "check", "count", "baseline", "drift", "report", "init", "update",
+const SUBCOMMANDS: [&str; 8] = [
+    "check", "count", "baseline", "drift", "verify", "report", "init", "update",
 ];
 
 /// The options that take a value; the value is not a positional argument.
-const OPTIONS_WITH_VALUE: [&str; 9] = [
-    "config", "format", "rule", "tier", "ignore", "path", "reason", "value", "output",
+const OPTIONS_WITH_VALUE: [&str; 10] = [
+    "config", "format", "rule", "tier", "ignore", "path", "reason", "value", "output", "name",
 ];
 
 /// Inserts the default command when the first argument is not a subcommand:
@@ -1460,6 +1464,8 @@ enum Command {
     Baseline(BaselineArgs),
     /// Run the drift gates: the generated files.
     Drift(DriftArgs),
+    /// Run the pre-release checks: the commands against their snapshots.
+    Verify(VerifyArgs),
     /// Render the run into a Markdown report.
     Report(ReportArgs),
     /// Write a starter config.
@@ -1505,6 +1511,22 @@ struct DriftArgs {
     /// Apply the fixable: write the produced content into the generated files.
     #[arg(long)]
     fix: bool,
+}
+
+/// The arguments of `verify`.
+#[derive(Args, Debug)]
+struct VerifyArgs {
+    /// Run only the check of this name.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Write the produced output into the snapshots.
+    ///
+    /// The snapshot is machine-written, never hand-edited (SPEC §15).  The
+    /// check stays failed: the committed snapshot is still stale until the
+    /// file is committed.
+    #[arg(long)]
+    update: bool,
 }
 
 /// The arguments of `count`.

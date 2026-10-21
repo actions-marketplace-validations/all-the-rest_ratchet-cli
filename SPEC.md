@@ -92,6 +92,7 @@ shorthand for a one-element array.
 | `name` | string | optional label for this config object |
 | `tiers` | object | per-tier settings (see 3.3) |
 | `generated` | array | drift-gate entries (see §7) |
+| `verify` | array | pre-release checks (see §15) |
 | `rules` | object | rule id → rule object (see 3.2) |
 
 ### 3.2 Rule object fields
@@ -251,6 +252,7 @@ ratchet baseline update [--rule <id>] [--reason <text>]
 ratchet baseline path
 ratchet baseline raise --rule <id> --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
+ratchet verify [--name <name>] [--update]
 ratchet report [--output <path>] [--format md]
 ratchet init
 ratchet update
@@ -270,6 +272,8 @@ The default command is `check`.
 | `--tier <fast\|slow>` | run only the rules of that tier — a `check` option |
 | `--rule <id>` | restrict to one rule |
 | `--ignore <pattern>` | glob of paths to exclude from the run (repeatable) |
+| `--name <name>` | run only this check — a `verify` option |
+| `--update` | write the snapshot instead of comparing it — a `verify` option |
 | `--debug` | print the resolved config and every counter invocation |
 | `--quiet` | only print failures |
 | `--version`, `--help` | |
@@ -752,3 +756,90 @@ contains no drift verdict, that comparison has no regress.
 **The report is deterministic:** sorted output, no timestamps, no absolute
 paths, no machine names. The same tree produces the same bytes — otherwise the
 drift gate would report a difference that does not exist.
+
+## 15. The pre-release check
+
+A command is executed, its output is compared with a committed snapshot, and a
+deviation fails the check.
+
+A **benchmark is a measurement, not a defect class**. It has no meaningful
+"baseline that may only sink" — the value moves in both directions and only
+matters at the moment of a release. Encoding it as a permanent gate would either
+freeze a number or produce permanent noise. So the pre-release check is **not a
+ratchet**: it has no direction.
+
+```jsonc
+{
+  "verify": [
+    {
+      "name": "benchmark",
+      "command": ["cargo", "bench", "--", "--output", "<out>"],
+      "snapshot": "snapshots/benchmark.txt"
+    }
+  ]
+}
+```
+
+* The **snapshot** is a committed file, machine-written, the same discipline as
+  the baseline: never hand-edited, the diff is the review artifact.
+* The command writes to a **temporary path** (like the drift gate's
+  `output_arg`), so the tree is not modified by the check.
+* The comparison is a diff, and the report shows it — a benchmark that moved by
+  3 % is not a failure of the code, it is a number a human looks at.
+* It runs in the **release pipeline**, not in the commit gate: it needs the
+  infrastructure the release needs, and a permanent gate over a measurement
+  would be noise.
+
+The mechanic is the drift gate (§7) with a different comparison: the drift gate
+compares a *generated file* with its committed counterpart, the pre-release
+check compares a *command output* with a committed snapshot.
+
+**The command.** `ratchet verify [--name <name>] [--update]`:
+
+* the **statuses** are `ok`, `drift` and `new` — the same vocabulary as the
+  drift gates, for the same reasons (a snapshot that is not committed yet is
+  `new`: informational, not a failure);
+* the **exit codes**: `0` when every entry is `ok` or `new`, `1` when a
+  snapshot differs, `2` on an operational error (the command could not be
+  started, it failed, it wrote nothing, it wrote more than one file — the
+  output would be a guess, the committed snapshot could not be read, the
+  snapshot path is outside the repository root, the snapshot is not a regular
+  file, the restore of the snapshot failed). **An empty selection is not a
+  pass**: a `verify` without an entry exits `1` — the same rule as the drift
+  command;
+* `--name` runs a single entry; an unknown name is an operational error;
+* `--update` **writes** the snapshot (the tool writes it, a human never edits
+  it) and the check stays **failed** while the committed snapshot is stale —
+  the same rule as the drift gate's `--fix`: the file is written, the detail
+  says "commit it", and it turns green after the commit;
+* the JSON document reuses the **check document's envelope** (§6.3) with the
+  `generated` array replaced by a `verify` array.
+
+**The snapshot is a regular file.** A symbolic link is refused with a named
+error: the committed content of a link is its target, and comparing the
+*output* with the target's content would say nothing about the output. (The
+drift gate resolves links, because there the *file* is the subject; the two
+gates have different subjects and say so.)
+
+**The placeholder `<out>`** in the command is replaced by the temporary path
+**wherever it appears in an argument** — not only as a whole argument. A
+command that writes `--output=<out>` must write to the temporary file, or the
+engine would compare the command's stdout with the snapshot and report a
+green that means nothing.
+
+**The snapshot is restored after the command.** The engine owns exactly one
+file — the snapshot — and it gives it back unchanged:
+
+1. take the state of the file: its **bytes**, its **mode** and its **time**;
+2. touch the file with a time far enough in the past, so that a write of the
+   **same bytes** is still visible (the marker);
+3. run the command;
+4. restore: the bytes, the mode **and the time** — and **verify** the
+   restore;
+5. a directory the command created and left empty is removed.
+
+A command that rewrites the snapshot with the same bytes is detected through
+the marker and restored like any other write. If the restore fails, the run
+ends with an **operational error** that names the file and says that the
+working tree was modified — the same rule as the drift gate (§7). A swallowed
+restore error is a mutated tree that nobody was told about.

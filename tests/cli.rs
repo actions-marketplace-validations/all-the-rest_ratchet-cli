@@ -2624,6 +2624,21 @@ fn set_mode(repo: &Repo, name: &str, mode: u32) {
     .expect("the mode is set");
 }
 
+/// Sets the time a file in the repository was written last.
+fn set_modified(repo: &Repo, name: &str, time: std::time::SystemTime) {
+    let file = std::fs::File::open(repo.path().join(name)).expect("the file is readable");
+    let times = std::fs::FileTimes::new().set_modified(time);
+    file.set_times(times).expect("the time is set");
+}
+
+/// The time a file in the repository was written last.
+fn modified_of(repo: &Repo, name: &str) -> std::time::SystemTime {
+    std::fs::metadata(repo.path().join(name))
+        .expect("the file is readable")
+        .modified()
+        .expect("the file has a time")
+}
+
 #[test]
 fn a_stale_generated_file_fails_with_a_unified_diff() {
     let repo = Repo::new(
@@ -4573,4 +4588,1001 @@ fn a_deliberate_lowering_does_not_excuse_an_unreasoned_raise_of_another_rule() {
         notes[0].contains("tests: the baseline was lowered deliberately"),
         "{notes:?}"
     );
+}
+
+// --- the pre-release check ----------------------------------------------------
+
+/// A config with one pre-release check and no rule.
+fn verify_config(name: &str, command: &[&str], snapshot: &str) -> String {
+    let argv: Vec<String> = command.iter().map(|part| format!("\"{part}\"")).collect();
+    format!(
+        "[{{ \"rules\": {{}}, \"verify\": [{{ \"name\": \"{name}\", \"command\": [{}], \
+         \"snapshot\": \"{snapshot}\" }}] }}]",
+        argv.join(", ")
+    )
+}
+
+/// A config with one pre-release check that writes to a given path.
+fn verify_config_with_output_arg(
+    name: &str,
+    command: &[&str],
+    output_arg: &str,
+    snapshot: &str,
+) -> String {
+    let argv: Vec<String> = command.iter().map(|part| format!("\"{part}\"")).collect();
+    format!(
+        "[{{ \"rules\": {{}}, \"verify\": [{{ \"name\": \"{name}\", \"command\": [{}], \
+         \"output_arg\": \"{output_arg}\", \"snapshot\": \"{snapshot}\" }}] }}]",
+        argv.join(", ")
+    )
+}
+
+#[test]
+fn a_snapshot_that_holds_the_output_is_green() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("PASS"), "{text}");
+    assert!(text.contains("benchmark"), "{text}");
+    assert!(text.contains("COHERENT"), "{text}");
+}
+
+#[test]
+fn a_snapshot_that_differs_fails_with_a_unified_diff() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    // The diff shows the difference between the committed snapshot and the
+    // output, with the repository-relative path.
+    assert!(text.contains("--- snapshots/benchmark.txt"), "{text}");
+    assert!(text.contains("+++ snapshots/benchmark.txt"), "{text}");
+    assert!(text.contains("-100 ops/s"), "{text}");
+    assert!(text.contains("+103 ops/s"), "{text}");
+    assert!(text.contains("@@"), "{text}");
+    // The verdict line agrees with the exit code.
+    assert!(text.contains("NOT COHERENT"), "{text}");
+}
+
+#[test]
+fn a_snapshot_that_is_not_committed_is_new_and_not_a_failure() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    // The envelope is the check document's envelope (§6.3): the `generated`
+    // array is replaced by a `verify` array.
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["summary"]["drifted"], 0);
+    assert_eq!(report["summary"]["rules"], 0);
+    assert_eq!(report["rules"].as_array().expect("an array").len(), 0);
+    assert_eq!(report["verify"][0]["status"], "new");
+    assert_eq!(report["verify"][0]["name"], "benchmark");
+    assert_eq!(report["verify"][0]["diff"], Value::Null);
+    assert_eq!(report["ok"], true);
+}
+
+#[test]
+fn the_json_report_carries_the_diff_of_a_deviation() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["summary"]["drifted"], 1);
+    assert_eq!(report["summary"]["generated"], 1);
+    assert_eq!(report["verify"][0]["status"], "drift");
+    let diff = report["verify"][0]["diff"]
+        .as_str()
+        .expect("the entry has a diff");
+    assert!(diff.contains("-100 ops/s"), "{diff}");
+    assert!(diff.contains("+103 ops/s"), "{diff}");
+}
+
+#[test]
+fn a_check_that_cannot_be_started_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["ratchet-check-that-does-not-exist"],
+            "snapshots/out.txt",
+        ),
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    // The message names the entry.
+    assert!(
+        text.contains("the check benchmark could not be started"),
+        "{text}"
+    );
+    assert_deterministic(&text);
+}
+
+#[test]
+fn a_check_that_fails_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\necho 'the reason' >&2\nexit 3\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the check benchmark exited with status 3"),
+        "{text}"
+    );
+    // The report carries ratchet's own words, never the output of the
+    // command (SPEC 6.2).
+    assert!(!text.contains("the reason"), "{text}");
+    assert_deterministic(&text);
+}
+
+#[test]
+fn a_check_that_writes_nothing_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config_with_output_arg(
+            "benchmark",
+            &["sh", "bench.sh"],
+            "--output",
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command succeeds but writes nothing.
+    repo.write("bench.sh", "#!/bin/sh\nexit 0\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the check benchmark wrote no output"),
+        "{text}"
+    );
+    assert_deterministic(&text);
+}
+
+#[test]
+fn a_verify_run_leaves_the_tree_byte_and_mode_identical() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    #[cfg(unix)]
+    set_mode(&repo, "snapshots/benchmark.txt", 0o644);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The tree is unchanged: the command wrote to a temporary path.
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
+    #[cfg(unix)]
+    assert_eq!(mode_of(&repo, "snapshots/benchmark.txt"), 0o644);
+}
+
+#[test]
+fn a_command_that_writes_into_the_tree_leaves_the_snapshot_alone() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command writes into the tree — the engine cannot undo that — and
+    // into the snapshot: the snapshot is the file the engine owns.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\nprintf 'side effect\\n' > side-effect.txt\n",
+    );
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    // The snapshot is byte-identical: the engine restored it.
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
+    // The side effect of the command is the command's doing.
+    assert!(
+        repo.status().contains("side-effect.txt"),
+        "{}",
+        repo.status()
+    );
+}
+
+#[test]
+fn the_update_writes_the_snapshot_and_the_written_snapshot_compares_equal() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    // The snapshot is written — the tool writes it, a human never edits it.
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "103 ops/s\n");
+    // The check stays failed: the committed snapshot is still stale.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("the snapshot was written to the working tree"),
+        "{text}"
+    );
+    // The fix touches the snapshot and nothing else.
+    assert_eq!(repo.status(), " M snapshots/benchmark.txt\n");
+
+    // Once the snapshot is committed, the check is green.
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "updated"]);
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
+#[test]
+fn the_update_writes_a_snapshot_that_is_not_committed_yet() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    // The snapshot exists now; it is not committed yet.
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.status(), "?? snapshots/\n");
+}
+
+#[test]
+fn a_snapshot_outside_the_repository_root_is_refused() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "../escape.txt"),
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must lie inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn an_absolute_snapshot_path_is_refused() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "/tmp/escape.txt"),
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must lie inside the repository root"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn two_verify_runs_produce_the_same_bytes() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let first = repo.run(&["verify"]);
+    let second = repo.run(&["verify"]);
+
+    assert_eq!(code(&first), 1, "{}", stderr(&first));
+    assert_eq!(stdout(&first), stdout(&second));
+    assert_eq!(stderr(&first), stderr(&second));
+    let text = format!("{}{}", stdout(&first), stderr(&first));
+    assert_deterministic(&text);
+}
+
+#[test]
+fn the_stdout_of_the_command_is_the_output_without_an_output_path() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
+#[test]
+fn the_output_arg_names_the_path_the_command_writes_to() {
+    let repo = Repo::new(
+        &verify_config_with_output_arg(
+            "benchmark",
+            &["sh", "bench.sh"],
+            "--output",
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$2\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
+#[test]
+fn the_verify_checks_are_not_part_of_the_check() {
+    let config = r#"[
+      {
+        "rules": {
+          "a": {
+            "class": "c",
+            "incident": "i",
+            "unit": "u",
+            "direction": "ceiling",
+            "count": { "command": ["echo", "1"] }
+          }
+        },
+        "verify": [
+          { "name": "benchmark", "command": ["sh", "bench.sh", "<out>"], "snapshot": "snapshots/benchmark.txt" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, Some(&baseline("a", 3)));
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["check", "--format", "json"]);
+
+    // The check runs the rules and the drift gates — not the pre-release
+    // checks: they belong to the release pipeline.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["status"], "ok");
+    assert_eq!(report["summary"]["generated"], 0);
+}
+
+#[test]
+fn a_verify_command_without_a_check_is_not_a_pass() {
+    let repo = Repo::new(r#"[{ "rules": {} }]"#, None);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("an empty selection is never a pass"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_verify_command_selects_one_check() {
+    let config = r#"[
+      {
+        "rules": {},
+        "verify": [
+          { "name": "alpha", "command": ["sh", "bench.sh", "<out>"], "snapshot": "snapshots/a.txt" },
+          { "name": "beta", "command": ["sh", "bench.sh", "<out>"], "snapshot": "snapshots/b.txt" }
+        ]
+      }
+    ]"#;
+    let repo = Repo::new(config, None);
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/a.txt", "100 ops/s\n");
+    repo.write("snapshots/b.txt", "103 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify", "--name", "beta"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("beta"), "{text}");
+    assert!(!text.contains("alpha"), "{text}");
+}
+
+#[test]
+fn a_check_name_without_a_check_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+
+    let output = repo.run(&["verify", "--name", "typo"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no check for typo"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_config_refuses_a_command_with_the_placeholder_and_an_output_arg() {
+    let repo = Repo::plain(
+        &verify_config_with_output_arg(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "--output",
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("config error at verify[0].output_arg"),
+        "{text}"
+    );
+    assert!(text.contains("one of them names the output path"), "{text}");
+}
+
+#[test]
+fn the_config_refuses_a_check_without_a_name_or_a_command() {
+    let repo = Repo::plain(
+        r#"[{ "rules": {}, "verify": [{ "command": ["echo", "1"], "snapshot": "s.txt" }] }]"#,
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("config error at verify[0].name"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_config_refuses_two_checks_with_the_same_name() {
+    let repo = Repo::plain(
+        r#"[{ "rules": {}, "verify": [
+             { "name": "a", "command": ["echo", "1"], "snapshot": "a.txt" },
+             { "name": "a", "command": ["echo", "2"], "snapshot": "b.txt" }
+           ] }]"#,
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("config error at verify[1].name"), "{text}");
+    assert!(text.contains("is used twice"), "{text}");
+}
+
+#[test]
+fn without_git_the_verify_comparison_is_skipped_with_a_note() {
+    let repo = Repo::plain(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+
+    let output = repo.run_without_git(&["verify"]);
+
+    // The check still runs; there is no committed snapshot to compare with.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("the verify comparison is skipped: not a git repository"),
+        "{text}"
+    );
+    assert!(stdout(&output).contains("PASS"), "{}", stdout(&output));
+}
+
+#[test]
+fn a_snapshot_that_is_a_directory_is_refused() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    repo.write("snapshots/benchmark.txt/inner.txt", "not a snapshot\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is a directory, not a file"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_committed_snapshot_that_cannot_be_read_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "snapshots/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    // The committed path is a directory, not a file.
+    repo.write("snapshots/benchmark.txt/inner.txt", "not a snapshot\n");
+    repo.write("snapshots/benchmark.txt/other.txt", "not a snapshot\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+    // The working tree does not have it any more; the committed tree does.
+    std::fs::remove_dir_all(repo.path().join("snapshots/benchmark.txt"))
+        .expect("the directory is removed");
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is a directory, not a file"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_placeholder_is_replaced_inside_an_argument() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "--output=<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command takes the path out of the argument: `--output=<path>`.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nprintf '100 ops/s\\n' > \"${1#--output=}\"\n",
+    );
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    // The command wrote to the temporary path: the check compares that file
+    // with the snapshot, and the two are the same.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+    // The literal placeholder did not reach the command: no file named
+    // `<out>` was created in the repository root.
+    assert!(
+        !repo.path().join("<out>").exists(),
+        "the command wrote a file named <out>"
+    );
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn the_placeholder_is_replaced_inside_an_argument_with_a_suffix() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>.txt"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
+#[test]
+fn the_config_refuses_a_command_with_the_placeholder_inside_an_argument_and_an_output_arg() {
+    let repo = Repo::plain(
+        &verify_config_with_output_arg(
+            "benchmark",
+            &["sh", "bench.sh", "--output=<out>"],
+            "--output",
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("config error at verify[0].output_arg"),
+        "{text}"
+    );
+    assert!(text.contains("one of them names the output path"), "{text}");
+}
+
+#[test]
+fn a_command_that_rewrites_the_snapshot_leaves_its_time_alone() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command writes its output to the temporary path **and** rewrites
+    // the snapshot with the very same bytes: a command that leaves the file
+    // alone would not exercise the restore.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\nprintf '100 ops/s\\n' > snapshots/benchmark.txt\n",
+    );
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    // The snapshot has a time of its own: the engine has to give it back.
+    let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    set_modified(&repo, "snapshots/benchmark.txt", time);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The bytes are the same ...
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
+    // ... and so is the time: the engine gave the file its time back.  A
+    // restore that keeps the bytes but loses the time is a restore that
+    // changed the tree.
+    assert_eq!(modified_of(&repo, "snapshots/benchmark.txt"), time);
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn a_command_that_overwrites_the_snapshot_gives_it_its_bytes_and_its_time_back() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command overwrites the snapshot with other bytes.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\nprintf '999 ops/s\\n' > snapshots/benchmark.txt\n",
+    );
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    set_modified(&repo, "snapshots/benchmark.txt", time);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The bytes of the snapshot are back ...
+    assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
+    // ... and so is its time.
+    assert_eq!(modified_of(&repo, "snapshots/benchmark.txt"), time);
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn a_restore_that_fails_is_an_operational_error() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command takes the snapshot away: the restore cannot write the file
+    // back.  A swallowed restore error would be a mutated tree that nobody
+    // was told about — the run has to end with an operational error.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\nrm -rf snapshots\n",
+    );
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(message.contains("the restore of"), "{message}");
+    assert!(
+        message.contains("the working tree was modified"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_command_that_leaves_the_snapshot_alone_leaves_its_time_alone() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/benchmark.txt", "100 ops/s\n");
+    let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    set_modified(&repo, "snapshots/benchmark.txt", time);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The engine touched the file with its marker and gave the time back.
+    assert_eq!(modified_of(&repo, "snapshots/benchmark.txt"), time);
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn a_symlinked_snapshot_is_refused() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.write("snapshots/real.txt", "100 ops/s\n");
+    std::os::unix::fs::symlink("real.txt", repo.path().join("snapshots/benchmark.txt"))
+        .expect("the link is created");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "link"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    // The message names the check and the path.
+    assert!(text.contains("the check benchmark"), "{text}");
+    assert!(text.contains("snapshots/benchmark.txt"), "{text}");
+    assert!(text.contains("is a symbolic link"), "{text}");
+}
+
+#[test]
+fn a_snapshot_that_leaves_the_root_through_a_link_is_refused() {
+    let outside = tempfile::tempdir().expect("a temporary directory");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    // The directory of the snapshot is a link out of the repository.
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("snapshots"))
+        .expect("the link is created");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "link"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the check benchmark"), "{text}");
+    assert!(
+        text.contains("must lie inside the repository root"),
+        "{text}"
+    );
+    // Nothing was written outside the tree.
+    assert!(!outside.path().join("benchmark.txt").exists());
+}
+
+#[test]
+fn an_empty_directory_the_command_created_is_removed() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command creates the directory of the snapshot and leaves it empty.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nmkdir -p snapshots\nprintf '100 ops/s\\n' > \"$1\"\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        !repo.path().join("snapshots").exists(),
+        "the empty directory was left behind"
+    );
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn an_empty_directory_the_command_created_is_removed_even_when_it_wrote_the_snapshot() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    // The command creates the snapshot — and the directory it lies in — and
+    // writes its output to the temporary path.
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nmkdir -p snapshots\nprintf '100 ops/s\\n' > snapshots/benchmark.txt\n\
+         printf '100 ops/s\\n' > \"$1\"\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The snapshot is gone again: it was not there before.
+    assert!(
+        !repo.path().join("snapshots/benchmark.txt").exists(),
+        "the snapshot was left behind"
+    );
+    // And so is the empty directory.
+    assert!(
+        !repo.path().join("snapshots").exists(),
+        "the empty directory was left behind"
+    );
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn the_diagnostic_channel_shows_the_argv_of_the_check() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "snapshots/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--debug"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stderr(&output);
+    // The argv that was really executed — the output path included.
+    assert!(text.contains("sh bench.sh"), "{text}");
+    // And the resolved config.
+    assert!(text.contains("resolved config"), "{text}");
 }

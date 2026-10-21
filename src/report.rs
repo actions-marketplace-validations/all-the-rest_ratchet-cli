@@ -7,6 +7,7 @@ use crate::check::{BaselineAction, Report, RuleResult, RuleStatus};
 use crate::config::Direction;
 use crate::drift::DriftEntry;
 use crate::registry::Finding;
+use crate::verify::VerifyEntry;
 
 /// The JSON schema version of the report.
 pub const SCHEMA: u32 = 1;
@@ -175,6 +176,106 @@ pub fn render_drift(entries: &[DriftEntry], ok: bool, quiet: bool) -> String {
     }
 
     out
+}
+
+/// Renders the human readable output of the pre-release check.
+///
+/// The verify command runs the pre-release checks alone: there are no rules
+/// in its report, and the headline names the checks alone.
+///
+/// The verdict is the one the run decided on — the same one the exit code and
+/// the JSON report carry.  The line must never say COHERENT while the run
+/// fails.
+pub fn render_verify(entries: &[VerifyEntry], ok: bool, quiet: bool) -> String {
+    let mut out = String::new();
+    let drifted = entries
+        .iter()
+        .filter(|entry| entry.status.is_failure())
+        .count();
+
+    if !quiet {
+        out.push_str(&format!(
+            "ratchet — {}, {drifted} failed\n\n",
+            plural(entries.len(), "check")
+        ));
+    }
+
+    let width = entries
+        .iter()
+        .map(|entry| entry.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 6;
+    let shown: Vec<&VerifyEntry> = entries
+        .iter()
+        .filter(|entry| !quiet || entry.status.is_failure())
+        .collect();
+    for entry in shown {
+        let status = if entry.status.is_failure() {
+            "FAIL"
+        } else {
+            "PASS"
+        };
+        out.push_str(&line(&format!(
+            "  {status}  {:<width$}  {}",
+            entry.name,
+            entry.detail.clone().unwrap_or_default(),
+            width = width
+        )));
+        if let Some(diff) = &entry.diff {
+            // The diff is a unified diff of its own: its lines start with
+            // a sign, and indenting them would change their meaning.
+            out.push('\n');
+            out.push_str(diff);
+        }
+    }
+
+    if !quiet {
+        out.push('\n');
+        if ok {
+            out.push_str(&format!(
+                "COHERENT — {} of {} checks passed\n",
+                entries.len(),
+                entries.len()
+            ));
+        } else {
+            out.push_str(&format!(
+                "NOT COHERENT — {drifted} of {} checks failed\n",
+                entries.len()
+            ));
+        }
+    }
+
+    out
+}
+
+/// Renders the machine readable output of the pre-release check.
+///
+/// The document **reuses the check document's envelope** (§6.3): the same
+/// `schema`, `ok`, `summary` and `notes`, the same empty `rules` array — the
+/// verify command runs no rule — and the `generated` array replaced by a
+/// `verify` array.  The summary counts the checks where the check document
+/// counts the generated files: `generated` is the number of checks, `drifted`
+/// the number of checks whose snapshot differs.
+pub fn render_verify_json(entries: &[VerifyEntry], ok: bool, notes: &[String]) -> String {
+    let json = JsonVerifyReport {
+        schema: SCHEMA,
+        ok,
+        summary: JsonSummary {
+            rules: 0,
+            failed: 0,
+            executed: 0,
+            generated: entries.len(),
+            drifted: entries
+                .iter()
+                .filter(|entry| entry.status.is_failure())
+                .count(),
+        },
+        rules: Vec::new(),
+        verify: entries.iter().map(JsonVerify::from).collect(),
+        notes,
+    };
+    serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Renders the human readable `count` output.
@@ -521,6 +622,44 @@ impl<'a> From<&'a DriftEntry> for JsonGenerated<'a> {
     fn from(entry: &'a DriftEntry) -> Self {
         Self {
             path: &entry.path,
+            status: entry.status.as_str(),
+            diff: entry.diff.as_deref(),
+            detail: entry.detail.as_deref(),
+        }
+    }
+}
+
+/// The JSON document of the pre-release check.
+///
+/// It is the check document's envelope (§6.3) with the `generated` array
+/// replaced by a `verify` array.
+#[derive(Serialize)]
+struct JsonVerifyReport<'a> {
+    schema: u32,
+    ok: bool,
+    summary: JsonSummary,
+    /// The verify command runs no rule: the array is empty.
+    rules: Vec<JsonRule<'a>>,
+    verify: Vec<JsonVerify<'a>>,
+    notes: &'a [String],
+}
+
+/// One check of the pre-release check.
+#[derive(Serialize)]
+struct JsonVerify<'a> {
+    name: &'a str,
+    status: &'a str,
+    /// The unified diff (committed → produced); absent when there is none.
+    diff: Option<&'a str>,
+    /// The reason for a status that is not `ok` (SPEC 6.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+impl<'a> From<&'a VerifyEntry> for JsonVerify<'a> {
+    fn from(entry: &'a VerifyEntry) -> Self {
+        Self {
+            name: &entry.name,
             status: entry.status.as_str(),
             diff: entry.diff.as_deref(),
             detail: entry.detail.as_deref(),
