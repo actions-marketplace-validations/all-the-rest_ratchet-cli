@@ -32,3 +32,13 @@ block is written by `ratchet release`.
 
 - the publish needs the repository, and the release can run again (release)
 - the report says that it is generated — and how (report)
+
+## [0.3.0] - 2026-10-21
+
+### Added
+
+- the drift gate creates the directory of the generated file (drift)
+
+### Fixed
+
+- the paths of a project may not leave the repository root (path)
