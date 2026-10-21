@@ -1485,3 +1485,186 @@ fn the_tier_belongs_to_the_validate_mode() {
         "the action says which mode the tier belongs to"
     );
 }
+
+/// The tag patterns of the release workflow.
+///
+/// The trigger is a **filter pattern** of GitHub, not a glob of the shell:
+/// the workflow is read, not interpreted, and a pattern that does not match
+/// the tag of the release disables the release **silently** — no red run,
+/// nothing to notice.  The test therefore reads the patterns out of the
+/// workflow and checks what they match.
+fn tag_patterns(workflow: &str) -> Vec<String> {
+    let line = workflow
+        .lines()
+        .find(|line| line.trim_start().starts_with("tags:"))
+        .expect("the release workflow triggers on tags");
+    let rest = line
+        .trim_start()
+        .strip_prefix("tags:")
+        .expect("the line holds the tags");
+    // The tags are a flow sequence: the brackets belong to the YAML, not to
+    // the patterns.
+    let rest = rest.trim().strip_prefix('[').unwrap_or(rest.trim());
+    let rest = rest.strip_suffix(']').unwrap_or(rest);
+    let patterns: Vec<String> = rest
+        .split(',')
+        .map(|value| value.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect();
+    assert!(!patterns.is_empty(), "the workflow triggers on tags");
+    patterns
+}
+
+/// One element of a filter pattern.
+struct Element {
+    /// The characters the element matches — `None` means "any character".
+    characters: Option<Vec<char>>,
+    /// The least number of times the element appears.
+    minimum: usize,
+    /// The most times the element appears — `None` means "any number".
+    maximum: Option<usize>,
+}
+
+impl Element {
+    /// True when the element matches the character.
+    fn matches(&self, character: char) -> bool {
+        match &self.characters {
+            None => true,
+            Some(characters) => characters.contains(&character),
+        }
+    }
+}
+
+/// Parses a filter pattern into its elements.
+///
+/// The subset of the GitHub syntax that the trigger uses: a literal
+/// character, a character class (`[0-9]`, `[a-z]`), `*` (any run of
+/// characters), `?` (one character) and `+` (one or more of the preceding
+/// element).
+fn parse_pattern(pattern: &str) -> Vec<Element> {
+    let characters: Vec<char> = pattern.chars().collect();
+    let mut elements: Vec<Element> = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            '[' => {
+                let mut class: Vec<char> = Vec::new();
+                index += 1;
+                while index < characters.len() && characters[index] != ']' {
+                    // A range: `a-z`.
+                    if index + 2 < characters.len() && characters[index + 1] == '-' {
+                        for value in characters[index]..=characters[index + 2] {
+                            class.push(value);
+                        }
+                        index += 3;
+                        continue;
+                    }
+                    class.push(characters[index]);
+                    index += 1;
+                }
+                index += 1;
+                elements.push(Element {
+                    characters: Some(class),
+                    minimum: 1,
+                    maximum: Some(1),
+                });
+            }
+            '*' => {
+                elements.push(Element {
+                    characters: None,
+                    minimum: 0,
+                    maximum: None,
+                });
+                index += 1;
+            }
+            '?' => {
+                elements.push(Element {
+                    characters: None,
+                    minimum: 1,
+                    maximum: None,
+                });
+                index += 1;
+            }
+            '+' => {
+                // One or more of the preceding element.
+                let previous = elements.last_mut().expect("a `+` follows an element");
+                previous.maximum = None;
+                previous.minimum = previous.minimum.max(1);
+                index += 1;
+            }
+            literal => {
+                elements.push(Element {
+                    characters: Some(vec![literal]),
+                    minimum: 1,
+                    maximum: Some(1),
+                });
+                index += 1;
+            }
+        }
+    }
+    elements
+}
+
+/// Matches a name against the elements of a pattern.
+fn match_elements(elements: &[Element], name: &[char], index: usize, position: usize) -> bool {
+    if index == elements.len() {
+        return position == name.len();
+    }
+    let element = &elements[index];
+    let maximum = element.maximum.unwrap_or(name.len() - position);
+    let mut count = 0;
+    loop {
+        if count >= element.minimum {
+            let next = position + count;
+            if next <= name.len() && match_elements(elements, name, index + 1, next) {
+                return true;
+            }
+        }
+        if count >= maximum {
+            break;
+        }
+        if position + count < name.len() && element.matches(name[position + count]) {
+            count += 1;
+            continue;
+        }
+        break;
+    }
+    false
+}
+
+/// True when the name matches the filter pattern.
+fn matches_filter(pattern: &str, name: &str) -> bool {
+    let elements = parse_pattern(pattern);
+    let characters: Vec<char> = name.chars().collect();
+    match_elements(&elements, &characters, 0, 0)
+}
+
+#[test]
+fn the_release_runs_for_a_version_tag_and_not_for_the_action_tag() {
+    let patterns = tag_patterns(&read(WORKFLOW));
+    // The version tags of the releases.
+    for tag in ["v0.1.0", "v1.2.3", "v10.20.30"] {
+        assert!(
+            patterns.iter().any(|pattern| matches_filter(pattern, tag)),
+            "the release does not run for {tag}"
+        );
+    }
+    // A pre-release carries a suffix — the version of the manifest may carry
+    // one as well.
+    assert!(
+        patterns
+            .iter()
+            .any(|pattern| matches_filter(pattern, "v0.2.0-rc.1")),
+        "the release does not run for a pre-release"
+    );
+    // The **action** carries a moving major tag beside the version tags: it
+    // is not a release, and a release run for it would fail the version check
+    // against the manifest.
+    for tag in ["v1", "v1.2", "release-1.2.3", "main"] {
+        assert!(
+            !patterns.iter().any(|pattern| matches_filter(pattern, tag)),
+            "the release runs for {tag} — that is not a version tag"
+        );
+    }
+}

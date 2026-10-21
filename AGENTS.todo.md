@@ -186,6 +186,12 @@ CI of its own today.
   `Cargo.toml`).
 - **The tag of the action** (`v1`) has to be pushed next to the binary tag:
   two version lines, and a project pins the action, not the binary.
+- **The moving `v1` tag drifts.** Nothing moves it: every change to
+  `action.yml` or `action/` needs a `git tag -f v1 && git push -f origin v1`,
+  and a forgotten move is invisible — a consumer on
+  `all-the-rest/ratchet-cli@v1` silently runs an old action. The fix is a
+  workflow that moves the tag to the commit that last touched the action, or
+  a check that fails when the tag and the action disagree.
 - The two consuming projects (website, portal) need a workflow that calls the
   action — a project-level task, not a tool task.
 

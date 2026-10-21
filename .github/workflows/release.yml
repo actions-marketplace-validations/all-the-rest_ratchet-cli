@@ -3,9 +3,14 @@ name: Release
 # The release is a tag: the version lives in one place — Cargo.toml — and the
 # tag is checked against it.  A tag that does not match the manifest fails
 # the release instead of publishing a binary that calls itself something else.
+#
+# The trigger is a **version tag**, not every tag that starts with a `v`: the
+# action carries a moving major tag (`v1`) beside the version tags, and that
+# tag is not a release — it has no version of its own and would fail the
+# check below.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
 
 # Only the job that publishes the release writes; every other job reads.
 permissions:
@@ -18,6 +23,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Install Node.js
+        # The JavaScript config is evaluated by node; without it the eight
+        # node-gated tests would skip silently.  The CI installs it as well —
+        # a release that skips a test the CI runs is not the same release.
+        uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -89,33 +102,39 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # The runners are **pinned**: a release is an artefact that has to be
+      # rebuildable from the same source.  A moving label (`-latest`) changes
+      # under you — `macos-latest` is an arm64 image today and was an Intel
+      # one before — and the same tag would then produce a different binary.
+      # Every leg builds its target natively: the x86_64 macOS binary is built
+      # on an Intel runner, the arm64 one on an arm64 runner.
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset_os: linux
             asset_arch: x86_64
             asset_exe: ""
             asset_compression: tar.gz
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             asset_os: linux
             asset_arch: aarch64
             asset_exe: ""
             asset_compression: tar.gz
-          - runner: macos-latest
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset_os: macos
             asset_arch: x86_64
             asset_exe: ""
             asset_compression: tar.gz
-          - runner: macos-latest
+          - runner: macos-15
             target: aarch64-apple-darwin
             asset_os: macos
             asset_arch: aarch64
             asset_exe: ""
             asset_compression: tar.gz
-          - runner: windows-latest
+          - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset_os: windows
             asset_arch: x86_64
@@ -239,4 +258,29 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
+            --verify-tag \
             --generate-notes
+
+      - name: Check the release
+        # The release is published — and then it is checked.  A release without
+        # the assets is a broken release that nobody would notice: the action
+        # would fail to install the binary with a 404 that names no cause.
+        #
+        # The expected names come from the **checksums of the release** — the
+        # file that already names every asset — and not from a second list
+        # written here: a list of names in two places drifts, and the release
+        # is exactly the place where a drift hurts.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          published=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)
+          expected=$( { awk '{print $2}' dist/checksums.txt | sed 's/^\*//'; echo checksums.txt; } | sort )
+          if [ "$published" != "$expected" ]; then
+            echo "::error::the release does not carry the assets the checksums name"
+            echo "--- expected"
+            echo "$expected"
+            echo "--- published"
+            echo "$published"
+            exit 1
+          fi
+          echo "the release carries $(echo "$published" | wc -l | tr -d ' ') assets"
