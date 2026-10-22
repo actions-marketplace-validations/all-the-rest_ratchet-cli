@@ -6391,6 +6391,7 @@ fn a_command_that_leaves_the_snapshot_alone_leaves_its_time_alone() {
     assert_eq!(repo.status(), "", "the verify run changed the working tree");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_snapshot_is_refused() {
     let repo = Repo::new(
@@ -6418,6 +6419,7 @@ fn a_symlinked_snapshot_is_refused() {
     assert!(text.contains("is a symbolic link"), "{text}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_snapshot_that_leaves_the_root_through_a_link_is_refused() {
     let outside = tempfile::tempdir().expect("a temporary directory");

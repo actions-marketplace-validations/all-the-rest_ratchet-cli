@@ -287,6 +287,7 @@ fn a_newer_release_replaces_the_binary() {
 }
 
 /// The release that replaces the binary, with the asset for this platform.
+#[cfg(unix)]
 fn newer_release() -> (FakeRelease, String) {
     let newer = Version::parse("99.0.0").expect("the version parses");
     let tag = format!("v{newer}");

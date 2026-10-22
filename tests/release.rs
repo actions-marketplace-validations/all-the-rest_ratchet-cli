@@ -471,6 +471,7 @@ fn the_commits_are_in_the_order_of_the_history() {
     assert!(first < second && second < third, "{text}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_version_file_that_cannot_be_written_leaves_the_tree_alone() {
     let repo = Repo::new(
@@ -488,29 +489,21 @@ fn a_version_file_that_cannot_be_written_leaves_the_tree_alone() {
 
     // The directory of the changelog cannot be written: the temporary file
     // of the write cannot be created.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            repo.path().join("docs"),
-            std::fs::Permissions::from_mode(0o555),
-        )
-        .expect("the directory is made read-only");
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        repo.path().join("docs"),
+        std::fs::Permissions::from_mode(0o555),
+    )
+    .expect("the directory is made read-only");
 
     let output = repo.run(&["release"]);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The permissions go back: the temporary directory has to be
-        // removable.
-        std::fs::set_permissions(
-            repo.path().join("docs"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("the permissions go back");
-    }
+    // The permissions go back: the temporary directory has to be removable.
+    std::fs::set_permissions(
+        repo.path().join("docs"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("the permissions go back");
 
     assert_eq!(code(&output), 2, "{}", stderr(&output));
     // The version file goes back: a half-written release is a state nobody
@@ -921,6 +914,7 @@ fn the_committer_date_is_the_date_of_the_release() {
     assert!(!text.contains("2026-01-02"), "{text}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_changelog_outside_the_root_is_refused() {
     let repo = Repo::new(
@@ -936,17 +930,14 @@ fn a_symlinked_changelog_outside_the_root_is_refused() {
     repo.commit("feat: a feature");
 
     // The changelog is a link to a file outside the repository.
-    #[cfg(unix)]
-    {
-        let outside = repo
-            .path()
-            .parent()
-            .expect("a parent directory")
-            .join("outside-changelog.md");
-        std::fs::write(&outside, "# Changelog\n").expect("the file is written");
-        std::os::unix::fs::symlink(&outside, repo.path().join("CHANGELOG.md"))
-            .expect("the link is made");
-    }
+    let outside = repo
+        .path()
+        .parent()
+        .expect("a parent directory")
+        .join("outside-changelog.md");
+    std::fs::write(&outside, "# Changelog\n").expect("the file is written");
+    std::os::unix::fs::symlink(&outside, repo.path().join("CHANGELOG.md"))
+        .expect("the link is made");
 
     let output = repo.run(&["release"]);
 
