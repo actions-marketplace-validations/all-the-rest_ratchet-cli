@@ -38,7 +38,11 @@ jobs:
     steps:
       - name: Checkout
         # The code that is released is the code of the tag.
-        uses: actions/checkout@v5
+        # The checkout is **pinned**: a release is an artefact that has to be
+        # rebuildable from the same source, and a moving label can change the
+        # code that checks the source out under the release. The same SHA is
+        # used by the CI and by the workflow that moves the action tag.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -85,7 +89,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -162,7 +166,7 @@ jobs:
             asset_compression: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -264,7 +268,7 @@ jobs:
         # the history behind it — the release notes are generated from the
         # commits.  Without the checkout the publish fails with "not a git
         # repository".
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0

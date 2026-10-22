@@ -26,7 +26,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        # The checkout is **pinned**: a moving label can change the code that
+        # checks the repository out under the run. The same SHA is used by the
+        # release and by the workflow that moves the action tag.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Install Node.js
         # The JavaScript config is evaluated by node; without it the eight
