@@ -6029,6 +6029,118 @@ fn verify_restore_removes_a_directory_created_before_a_parent_traversal_behind_a
     assert_eq!(repo.status(), "", "the verify run changed the working tree");
 }
 
+#[cfg(unix)]
+#[test]
+fn verify_restore_refuses_a_snapshot_parent_replaced_with_an_outside_link() {
+    let outside = Outside::new("verify-restore-parent-swap");
+    std::fs::write(outside.file("snapshot.txt"), "outside sentinel\n")
+        .expect("the outside sentinel is written");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "sub/snapshot.txt",
+        ),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'produced\\n' > \"$1\"\nprintf 'command-modified\\n' > sub/snapshot.txt\n\
+             mv sub sub-original\nln -s '{}' sub\n",
+            outside.path().display()
+        ),
+    );
+    repo.write("sub/snapshot.txt", "committed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains("the restore of sub/snapshot.txt failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the working tree may be modified"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.file("snapshot.txt")).expect("the sentinel remains"),
+        "outside sentinel\n"
+    );
+    assert_eq!(
+        repo.read("sub-original/snapshot.txt"),
+        "command-modified\n",
+        "the moved in-repository object was not modified by restore"
+    );
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("sub"))
+            .expect("the replacement link remains")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_traversal_cleanup_refuses_a_parent_replaced_with_an_outside_link() {
+    let outside = Outside::new("verify-traversal-parent-swap");
+    std::fs::create_dir(outside.file("x")).expect("the outside x directory is created");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "sub/x/../snapshot.txt",
+        ),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'produced\\n' > \"$1\"\nmkdir -p sub/x\n\
+             printf 'command-modified\\n' > sub/x/../snapshot.txt\nmv sub sub-original\n\
+             ln -s '{}' sub\n",
+            outside.path().display()
+        ),
+    );
+    repo.write("sub/snapshot.txt", "committed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains("the restore of sub/x/../snapshot.txt failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("could not safely remove the created directories"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the working tree may be modified"),
+        "{message}"
+    );
+    assert!(outside.file("x").is_dir(), "outside/x was removed");
+    assert_eq!(
+        std::fs::read_dir(outside.file("x"))
+            .expect("outside/x remains readable")
+            .count(),
+        0,
+        "outside/x is no longer empty"
+    );
+    assert!(
+        repo.path().join("sub-original/x").is_dir(),
+        "the moved in-repository traversal directory was removed"
+    );
+    assert_eq!(repo.read("sub-original/snapshot.txt"), "command-modified\n");
+}
+
 #[test]
 fn verify_update_creates_the_resolved_snapshot_without_a_traversal_directory() {
     let repo = Repo::new(
@@ -6592,7 +6704,7 @@ fn a_restore_that_fails_is_an_operational_error() {
     let message = stderr(&output);
     assert!(message.contains("the restore of"), "{message}");
     assert!(
-        message.contains("the working tree was modified"),
+        message.contains("the working tree may be modified"),
         "{message}"
     );
 }
