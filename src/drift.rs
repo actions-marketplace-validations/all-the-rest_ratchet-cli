@@ -137,6 +137,11 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
                 ));
             }
         };
+        if resolved == path::canonical_root(options.root) {
+            return Err(Error::new(format!(
+                "{subject} resolves to the repository root, not a file"
+            )));
+        }
         // A **dangling** link at the file position is refused.  The reason
         // depends on the mode: the in-place generator would write through the
         // link and create the file behind it — and the restore cannot take
@@ -399,9 +404,10 @@ fn produce_in_place(
     //     user has to look.
     let created = create_directories(root, &entry.path, resolved).map_err(|error| {
         Error::new(format!(
-            "cannot create the directory {} of {display}: {}",
+            "cannot create the directory {} of {display}: {}{}",
             directory_name(root, &error.directory),
-            error.cause
+            error.cause,
+            error.rollback_message(root)
         ))
     })?;
     snapshot.created = created;
@@ -421,7 +427,7 @@ fn produce_in_place(
     let restored = if options.fix {
         snapshot.keep()
     } else {
-        snapshot.restore()
+        snapshot.restore(root)
     };
 
     // A failed restore is the more important error: the working tree was
@@ -457,6 +463,24 @@ struct DirectoryError {
     directory: PathBuf,
     /// The cause: what the operating system said.
     cause: io::Error,
+    /// Directories created by this attempt that rollback could not remove.
+    rollback: Vec<(PathBuf, io::Error)>,
+}
+
+impl DirectoryError {
+    /// Describes every directory left behind by a failed rollback.
+    fn rollback_message(&self, root: &Path) -> String {
+        if self.rollback.is_empty() {
+            return String::new();
+        }
+        let failures = self
+            .rollback
+            .iter()
+            .map(|(directory, error)| format!("{}: {error}", directory_name(root, directory)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("; rollback could not remove {failures} — the working tree was modified")
+    }
 }
 
 /// Creates the directories the generated file needs.
@@ -484,25 +508,37 @@ fn create_directories(
     relative: &str,
     resolved: &Path,
 ) -> Result<Vec<PathBuf>, DirectoryError> {
-    let mut chains: Vec<Vec<PathBuf>> = Vec::new();
+    create_directories_with(root, relative, resolved, |directory| {
+        fs::create_dir(directory)
+    })
+}
+
+fn create_directories_with<F>(
+    root: &Path,
+    relative: &str,
+    resolved: &Path,
+    mut create: F,
+) -> Result<Vec<PathBuf>, DirectoryError>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    let mut created = Vec::new();
+    let mut directories = Vec::new();
 
     // 1. the directory the path resolves to.  It has to lie inside the
     //    repository root: the engine never writes outside the tree it owns.
     //    The root itself exists — there is nothing to create.
     if let Some(directory) = resolved.parent() {
         if path::inside_root_directory(root, directory) {
-            chains.push(fsutil::missing_directories(directory));
-            fs::create_dir_all(directory).map_err(|cause| DirectoryError {
-                directory: directory.to_path_buf(),
-                cause,
-            })?;
+            directories.push(directory.to_path_buf());
         }
     }
 
     // 2. the missing directories of the named traversal.  They come after
     //    the resolved directory: a link in the path is only a directory when
     //    its target exists.
-    for directory in traversal_directories(root, relative) {
+    directories.extend(traversal_directories(root, relative));
+    for directory in directories {
         if directory.is_dir() {
             // The system walks into it: there is nothing to create.
             continue;
@@ -512,21 +548,53 @@ fn create_directories(
             // its target, and the resolved directory above has created it.
             continue;
         }
-        chains.push(fsutil::missing_directories(&directory));
-        fs::create_dir_all(&directory).map_err(|cause| DirectoryError {
-            directory: directory.clone(),
-            cause,
-        })?;
+        let missing = fsutil::missing_directories(&directory);
+        // `missing_directories` is deepest-first. Create each parent before
+        // its child so the successful creations can be rolled back exactly.
+        // An empty result means an existing non-directory (normally a file):
+        // attempting to create it preserves the operating system's error.
+        let candidates = if missing.is_empty() {
+            vec![directory.clone()]
+        } else {
+            missing.into_iter().rev().collect()
+        };
+        for candidate in candidates {
+            match create(&candidate) {
+                Ok(()) => created.push(candidate),
+                Err(cause)
+                    if cause.kind() == io::ErrorKind::AlreadyExists && candidate.is_dir() =>
+                {
+                    // Another process made the directory after the missing
+                    // path was inspected. It is usable, but not ours to remove.
+                }
+                Err(cause) => {
+                    let rollback = rollback_directories(&created);
+                    return Err(DirectoryError {
+                        directory: candidate,
+                        cause,
+                        rollback,
+                    });
+                }
+            }
+        }
     }
 
-    // The removal is the other way round: the directories of the named
-    // traversal lie inside the directory the path resolves to, and a
-    // directory is removed after the one below it.
-    let mut created = Vec::new();
-    for chain in chains.into_iter().rev() {
-        created.extend(chain);
-    }
+    // The creation order has parents before children; removal is its reverse.
+    created.reverse();
     Ok(created)
+}
+
+/// Removes every directory created by a failed creation attempt, deepest first.
+fn rollback_directories(created: &[PathBuf]) -> Vec<(PathBuf, io::Error)> {
+    let mut failures = Vec::new();
+    for directory in created.iter().rev() {
+        if let Err(error) = fs::remove_dir(directory) {
+            if error.kind() != io::ErrorKind::NotFound {
+                failures.push((directory.clone(), error));
+            }
+        }
+    }
+    failures
 }
 
 /// The directories the operating system walks to reach the file.
@@ -593,8 +661,14 @@ fn write_fixed(
     // The directories the file needs are created: the engine's business, not
     // the generator's.  The write follows the link, and the file lands
     // behind it.
-    create_directories(root, relative, resolved)
-        .map_err(|error| Error::new(format!("cannot write {display}: {}", error.cause)))?;
+    create_directories(root, relative, resolved).map_err(|error| {
+        Error::new(format!(
+            "cannot write {display}: cannot create the directory {}: {}{}",
+            directory_name(root, &error.directory),
+            error.cause,
+            error.rollback_message(root)
+        ))
+    })?;
     fs::write(target, produced)
         .map_err(|error| Error::new(format!("cannot write {display}: {error}")))
 }
@@ -806,7 +880,33 @@ impl Snapshot {
     }
 
     /// Restores the snapshot and verifies the restore.
-    fn restore(&self) -> Result<(), String> {
+    fn restore(&self, root: &Path) -> Result<(), String> {
+        self.restore_with(root, || self.restore_file())?;
+        self.verify()
+    }
+
+    /// Runs file restoration and always attempts directory cleanup.
+    ///
+    /// Kept separate so a file-restore failure can be tested deterministically
+    /// without relying on filesystem permissions.
+    fn restore_with<F>(&self, root: &Path, restore_file: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let restored = restore_file();
+        let cleaned = self.remove_created_directories(root);
+        match (restored, cleaned) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(restore), Ok(())) => Err(format!("file restoration failed: {restore}")),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(restore), Err(cleanup)) => {
+                Err(format!("file restoration failed: {restore}; {cleanup}"))
+            }
+        }
+    }
+
+    /// Restores the file or symbolic link without cleaning up its directories.
+    fn restore_file(&self) -> Result<(), String> {
         match &self.link {
             Some(link) => {
                 // The file the link pointed to: the generator may have written
@@ -836,8 +936,7 @@ impl Snapshot {
                 }
             },
         }
-        self.remove_created_directories()?;
-        self.verify()
+        Ok(())
     }
 
     /// Keeps the produced content but restores the mode of the file.
@@ -855,9 +954,17 @@ impl Snapshot {
     }
 
     /// Removes the directories the engine created and left empty.
-    fn remove_created_directories(&self) -> Result<(), String> {
-        let _ = fsutil::remove_empty_directories(&self.created);
-        Ok(())
+    fn remove_created_directories(&self, root: &Path) -> Result<(), String> {
+        let failures = fsutil::remove_empty_directories(&self.created);
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let failures = failures
+            .iter()
+            .map(|(directory, error)| format!("{}: {error}", directory_name(root, directory)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("could not remove created directories: {failures}"))
     }
 
     /// Verifies the restore: the bytes are read back and compared.
@@ -944,4 +1051,91 @@ fn create_symlink(_raw: &Path, _target: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "symbolic links are not supported here",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_failure_still_removes_created_empty_directories() {
+        let root = tempfile::tempdir().expect("a temporary root");
+        let parent = root.path().join("new");
+        let nested = parent.join("nested");
+        fs::create_dir_all(&nested).expect("the directories are created");
+        let snapshot = Snapshot {
+            target: nested.join("generated.md"),
+            content: None,
+            modified: None,
+            inode: None,
+            mode: None,
+            link: None,
+            created: vec![nested, parent.clone()],
+        };
+
+        let error = snapshot
+            .restore_with(root.path(), || {
+                Err("injected file restore failure".to_string())
+            })
+            .expect_err("the injected restoration fails");
+
+        assert!(error.contains("injected file restore failure"), "{error}");
+        assert!(!parent.exists(), "directory cleanup was not attempted");
+    }
+
+    #[test]
+    fn directory_cleanup_failures_name_repository_relative_paths() {
+        let root = tempfile::tempdir().expect("a temporary root");
+        let not_a_directory = root.path().join("not-a-directory");
+        fs::write(&not_a_directory, "content").expect("the file is created");
+        let snapshot = Snapshot {
+            target: not_a_directory.clone(),
+            content: None,
+            modified: None,
+            inode: None,
+            mode: None,
+            link: None,
+            created: vec![not_a_directory],
+        };
+
+        let error = snapshot
+            .remove_created_directories(root.path())
+            .expect_err("reading the file as a directory fails");
+
+        assert!(error.contains("not-a-directory"), "{error}");
+        assert!(
+            !error.contains(root.path().to_str().expect("the root is UTF-8")),
+            "the error contains an absolute path: {error}"
+        );
+    }
+
+    #[test]
+    fn failed_directory_rollback_reports_every_directory_left_behind() {
+        let root = tempfile::tempdir().expect("a temporary root");
+        let resolved = root.path().join("a/b/c/generated.md");
+        let mut calls = 0;
+
+        let error =
+            create_directories_with(root.path(), "a/b/c/generated.md", &resolved, |directory| {
+                calls += 1;
+                if calls == 3 {
+                    return Err(io::Error::other("injected creation failure"));
+                }
+                fs::create_dir(directory)?;
+                if calls == 2 {
+                    fs::write(directory.join("external.txt"), "keep")?;
+                }
+                Ok(())
+            })
+            .expect_err("the third directory creation fails");
+
+        assert_eq!(error.rollback.len(), 2);
+        assert_eq!(error.rollback[0].0, root.path().join("a/b"));
+        assert_eq!(error.rollback[1].0, root.path().join("a"));
+        let message = error.rollback_message(root.path());
+        assert!(message.contains("a/b"), "{message}");
+        assert!(message.contains("a:"), "{message}");
+        assert!(message.contains("working tree was modified"), "{message}");
+        assert!(root.path().join("a/b/external.txt").exists());
+    }
 }

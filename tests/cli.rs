@@ -6787,6 +6787,56 @@ fn a_drift_gate_removes_every_directory_it_created() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_rolls_back_directories_when_a_later_component_cannot_be_created() {
+    let too_long = "x".repeat(300);
+    let generated = format!("ok/{too_long}/generated.md");
+    let repo = Repo::new(
+        &generated_config_at(&generated, &["sh", "gen.sh", &generated], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(stderr(&output).contains("cannot create the directory"));
+    assert!(
+        !repo.path().join("ok").exists(),
+        "the earlier directory in the failed chain was left behind"
+    );
+    assert_eq!(repo.status(), "", "the failed drift run changed the tree");
+}
+
+#[test]
+fn a_generated_target_that_resolves_to_the_repository_root_is_refused() {
+    let repo = Repo::new(
+        &generated_config_at("a/..", &["sh", "gen.sh", "a/.."], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("resolves to the repository root, not a file"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(repo.path().is_dir(), "the repository root was removed");
+    assert!(
+        !repo.path().join("a").exists(),
+        "an unnecessary directory remains"
+    );
+    assert_eq!(repo.status(), "", "the refused drift run changed the tree");
+}
+
 #[test]
 fn a_drift_gate_removes_the_deeper_directory_before_the_shallower_one() {
     // The path walks through two directories that do not exist:

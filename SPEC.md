@@ -565,6 +565,8 @@ points out of it would take the write with it. The file itself may be a link,
 as long as its **target** lies inside the root: there the file is the subject,
 and the comparison follows the link (the pre-release check refuses a linked
 snapshot instead, because there the *output* is the subject — §15).
+A generated target that resolves to the repository root is refused: the root
+is a directory, never a generated file to restore or remove.
 
 A **dangling** link at the file position is refused with a named error. In the
 in-place mode the generator would write through it and create the file behind
@@ -592,7 +594,11 @@ The generator must be able to write to a **given path**:
      resolves to is created **where the path resolves to**. A directory that
      cannot be created is an **operational error** that names the directory
      and the cause: the failure is the engine's, and the user is not sent to
-     the generator;
+     the generator. Directories are created one at a time and tracked as they
+     succeed. If a later creation fails, the engine rolls back every
+     directory from that attempt; if rollback cannot remove one or more, the
+     error names every directory left behind and says that the working tree
+     was modified;
   3. run the generator;
   4. read the produced bytes;
   5. restore: write the snapshot to a **temporary file in the same directory**,
@@ -605,11 +611,14 @@ The generator must be able to write to a **given path**:
      **behind** a link, so the file behind the link is the one that changes —
      a file created behind a **dangling** link is not removed, which is why a
      dangling link is refused;
-  6. **verify** the restore (read the bytes back and compare);
-  7. the directories of step 2, which the engine created for the file, are
-     removed — when they are **empty**. A directory that still holds
-     something is not the engine's to remove: it was not left behind by the
-     engine alone.
+  6. the directories of step 2, which the engine created for the file, are
+     removed — when they are **empty**. Cleanup is attempted even if file or
+     link restoration failed. A directory that still holds something is not
+     the engine's to remove: it was not left behind by the engine alone. A
+     cleanup failure is an operational error that names every directory it
+     could not remove relative to the repository root;
+  7. **verify** the restore (read the bytes back and compare), when file
+     restoration and cleanup succeeded.
 
   If the restore fails, the run ends with an **operational error** that names
   the file and says that the working tree was modified. A swallowed restore
