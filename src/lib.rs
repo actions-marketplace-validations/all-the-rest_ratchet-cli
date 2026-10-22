@@ -480,10 +480,11 @@ fn cmd_release(cli: &Cli, args: &ReleaseArgs, cwd: &Path) -> Result<i32, Error> 
 /// — and the check resolves it: a symbolic link inside the root can point
 /// outside it, and the report would follow the link.
 fn report_path(root: &Path, raw: &str) -> Result<(PathBuf, String), Error> {
-    if let Some(refusal) = path::inside_repository(root, raw)
-        .refusal("the report", "must be written inside the repository root")
-    {
-        return Err(Error::new(format!("config error at --output: {refusal}")));
+    if let Err(refusal) = path::inside_repository(root, raw) {
+        return Err(Error::new(format!(
+            "config error at --output: {}",
+            refusal.message("the report", "must be written inside the repository root")
+        )));
     }
     let full = path::normalize(&root.join(Path::new(raw)));
     let relative = path::relative_to(root, &full).unwrap_or_default();
@@ -1102,11 +1103,11 @@ fn cmd_init(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     // The config is a path the project names: the rule applies to it as well.
     // A link at that position that leads out of the tree is refused — the
     // starter config would be written outside it.
-    if let Some(refusal) = path::inside_repository(&directory, CONFIG_FILE_STARTER).refusal(
-        &format!("the config file {CONFIG_FILE_STARTER}"),
-        "must lie inside the repository root",
-    ) {
-        return Err(Error::new(refusal));
+    if let Err(refusal) = path::inside_repository(&directory, CONFIG_FILE_STARTER) {
+        return Err(Error::new(refusal.message(
+            &format!("the config file {CONFIG_FILE_STARTER}"),
+            "must lie inside the repository root",
+        )));
     }
     let path = directory.join(CONFIG_FILE_STARTER);
     fs::write(&path, STARTER_CONFIG).map_err(|e| {
@@ -1222,10 +1223,11 @@ fn load_context(cli: &Cli, cwd: &Path) -> Result<Context, Error> {
     // The baseline has to be comparable with its committed version, and that
     // only works inside the repository root (SPEC 2).  The check resolves the
     // path — a link cannot carry it out of the root.
-    if let Some(refusal) = path::inside_root(&root, &config_dir, &baseline_rel)
-        .refusal("the baseline", "must be inside the repository root")
-    {
-        return Err(Error::new(format!("config error at baseline: {refusal}")));
+    if let Err(refusal) = path::inside_root(&root, &config_dir, &baseline_rel) {
+        return Err(Error::new(format!(
+            "config error at baseline: {}",
+            refusal.message("the baseline", "must be inside the repository root")
+        )));
     }
     let baseline_path = path::normalize(&config_dir.join(&baseline_rel));
 

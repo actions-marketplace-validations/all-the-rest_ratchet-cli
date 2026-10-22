@@ -571,12 +571,20 @@ The generator must be able to write to a **given path**:
 * without `output_arg` — the generator writes the file in place. The binary
   then owns a **verified restore**:
   1. snapshot the original bytes **and the file mode**;
-  2. **create the directory of the file** if it does not exist: a project
+  2. **create the directories the file needs** if they do not exist: a project
      cannot commit an empty directory, and a generator that writes a file into
      a new directory would fail otherwise — the gate would be red from its
-     first run. A directory that cannot be created is an **operational error**
-     that names the directory and the cause: the failure is the engine's, and
-     the user is not sent to the generator;
+     first run. The engine creates the directories the **operating system**
+     needs to walk the named path: the **missing directories of the
+     traversal** — `sub/../x.md` needs `sub`, because a `..` can only pop a
+     directory that exists — and the **directory the path resolves to**
+     (§2.1), the place the file lands in when a link leads there. The missing
+     directories of the traversal are created **as they are named**: the path
+     the project named is the path the engine walks. The directory the path
+     resolves to is created **where the path resolves to**. A directory that
+     cannot be created is an **operational error** that names the directory
+     and the cause: the failure is the engine's, and the user is not sent to
+     the generator;
   3. run the generator;
   4. read the produced bytes;
   5. restore: write the snapshot to a **temporary file in the same directory**,
@@ -591,7 +599,7 @@ The generator must be able to write to a **given path**:
      dangling link is refused;
   6. **verify** the restore (read the bytes back and compare);
   7. a directory the generator created and left **empty** is removed — and so
-     is the directory of step 2, which the engine created for the file. A
+     are the directories of step 2, which the engine created for the file. A
      directory that still holds something is not the engine's to remove: it
      was not left behind by the engine alone.
 
@@ -600,8 +608,14 @@ The generator must be able to write to a **given path**:
   error is a mutated tree that nobody was told about.
 
 The comparison is against the **committed** file (`git show HEAD:<path>`), not
-against the working-tree copy. The diff is a unified diff (committed →
-produced) with repository-relative paths.
+against the working-tree copy. The **lookup** uses the file the system
+resolves the named path to: git keeps a symbolic link as a blob whose content
+is the path of its target, and the files of the target are committed beside
+it: the committed tree has no entry at the **named** path, and the comparison
+has to follow the link to find the file. The report and the messages keep the
+**named** path: that is the path the project named and the path the user
+knows. The diff is a unified diff (committed → produced) with repository-relative
+paths.
 
 A file that is not in `HEAD` yet has the status `new` — informational, not a
 failure.

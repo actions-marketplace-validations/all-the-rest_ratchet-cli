@@ -375,6 +375,14 @@ fails with the unified diff of the difference:
 +fresh content
 ```
 
+The **lookup** of the committed file uses the file the system resolves the
+named path to: git keeps a symbolic link as a blob whose content is the path
+of its target, and the files of the target are committed beside it: the
+committed tree has no entry at the **named** path, and the comparison has to
+follow the link to find the file. The report and the messages keep the
+**named** path: that is the path the project named and the path the user
+knows.
+
 The diff is a **patch**: `patch -p0` applies it to the committed file. The
 newline at the end of a file is part of the file, so a file that ends with a
 newline and one that does not differ — and the difference shows up in the
@@ -419,7 +427,7 @@ Two generator modes exist:
 - **without `output_arg`** — the generator writes the file **in place**. The
   binary then owns a **verified restore**: it snapshots the original bytes,
   the file mode *and* the time the file was written last, **creates the
-  directory of the file** if it does not exist, runs the
+  directories the file needs** if they do not exist, runs the
   generator, reads the produced bytes, writes the snapshot to a temporary
   file in the same directory, gives it the original mode and time and
   **renames** it over the target — a rename replaces a symbolic link instead
@@ -438,11 +446,18 @@ Two generator modes exist:
   The directory is the engine's business, not the generator's: a project
   cannot commit an empty directory, and a generator that writes a file into a
   new directory would fail otherwise — the gate would be red from its first
-  run. A directory that cannot be created is an operational error that names
-  the directory and the cause: the failure is the engine's, and the user is
-  not sent to the generator. The restore removes the directory again — when it
-  is **empty**: a directory that still holds something is not the engine's to
-  remove.
+  run. The engine creates the directories the **operating system** needs to
+  walk the named path: the **missing directories of the traversal** —
+  `sub/../x.md` needs `sub`, because a `..` can only pop a directory that
+  exists — and the **directory the path resolves to**, the place the file
+  lands in when a link leads there. The missing directories of the traversal
+  are created **as they are named**: the path the project named is the path
+  the engine walks. The directory the path resolves to is created **where the
+  path resolves to**. A directory that cannot be created is an operational
+  error that names the directory and the cause: the failure is the engine's,
+  and the user is not sent to the generator. The restore removes the
+  directories the engine created again — when they are **empty**: a directory
+  that still holds something is not the engine's to remove.
 
   Before the generator runs, the file is touched with an **old** time — an
   hour into the past. The engine can then tell whether the generator wrote

@@ -296,11 +296,10 @@ fn run_file(
     // `generate` the count comes from a temporary path, and the configured
     // path is still the project's.  The message names the **configured**
     // path — the user has to see which path of the config was refused.
-    if let Some(refusal) =
-        crate::path::inside_repository(root, file).refusal(file, "is outside the repository root")
-    {
+    if let Err(refusal) = crate::path::inside_repository(root, file) {
         return Err(CounterError::config(format!(
-            "config error at {path}.file: {refusal}"
+            "config error at {path}.file: {}",
+            refusal.message(file, "is outside the repository root")
         )));
     }
 
@@ -373,11 +372,10 @@ fn run_registry(
     // The registry lives inside the repository root: a path that escapes it
     // is a configuration error, not a file to read.  The check resolves the
     // whole path — a link cannot carry it out.
-    if let Some(refusal) = crate::path::inside_repository(root, registry)
-        .refusal(registry, "is outside the repository root")
-    {
+    if let Err(refusal) = crate::path::inside_repository(root, registry) {
         return Err(CounterError::config(format!(
-            "config error at {path}.registry: {refusal}"
+            "config error at {path}.registry: {}",
+            refusal.message(registry, "is outside the repository root")
         )));
     }
     let full = root.join(registry);

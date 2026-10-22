@@ -144,18 +144,31 @@ pub fn inode_of(_metadata: &fs::Metadata) -> Option<u64> {
 /// The list is ordered from the deepest directory to the shallowest one: an
 /// empty parent can only be removed after its child is gone.
 pub fn created_directories(target: &Path) -> Vec<PathBuf> {
+    match target.parent() {
+        Some(parent) => missing_directories(parent),
+        None => Vec::new(),
+    }
+}
+
+/// The directories that do not exist yet, from `directory` up to the first one
+/// that exists.
+///
+/// The list is ordered from the deepest directory to the shallowest one: it is
+/// the order in which the directories have to be **removed** — an empty parent
+/// can only be removed after its child is gone.
+pub fn missing_directories(directory: &Path) -> Vec<PathBuf> {
     let mut missing = Vec::new();
-    let mut current = target.parent();
-    while let Some(directory) = current {
-        if directory.as_os_str().is_empty() {
+    let mut current = Some(directory);
+    while let Some(candidate) = current {
+        if candidate.as_os_str().is_empty() {
             break;
         }
-        if !directory.exists() {
-            missing.push(directory.to_path_buf());
+        if !candidate.exists() {
+            missing.push(candidate.to_path_buf());
         } else {
             break;
         }
-        current = directory.parent();
+        current = candidate.parent();
     }
     missing
 }

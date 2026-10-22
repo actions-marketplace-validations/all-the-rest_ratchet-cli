@@ -130,17 +130,38 @@ fn walk(start: &Path, path: &Path, depth: usize) -> Result<PathBuf, Failure> {
 }
 
 /// True when the path is a symbolic link.
-fn is_link(path: &Path) -> bool {
+pub fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
 }
 
-/// The answer of [`inside_root`].
+/// The root, resolved: the directory the paths of a project are compared with.
+///
+/// The paths are resolved against the **canonical** root: a link in the path
+/// of the root itself would carry the comparison out of the tree otherwise.
+pub fn canonical_root(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// True when the path lies inside the repository root.
+///
+/// The root itself counts: a file at the root of the tree is inside it.
+pub fn inside_root_path(root: &Path, path: &Path) -> bool {
+    path.starts_with(canonical_root(root))
+}
+
+/// True when the directory lies **strictly** inside the repository root.
+///
+/// The root itself does not: it exists, and there is nothing to create there.
+/// A directory outside the root is not the engine's to touch.
+pub fn inside_root_directory(root: &Path, directory: &Path) -> bool {
+    inside_root_path(root, directory) && directory != canonical_root(root)
+}
+
+/// Why a path was refused: it does not lie inside the repository root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Inside {
-    /// The path lies inside the repository root.
-    Yes,
+pub enum Refusal {
     /// The path is absolute: the paths of a project are relative.
     Absolute,
     /// The path leaves the repository root.
@@ -152,39 +173,39 @@ pub enum Inside {
     Ambiguous,
 }
 
-impl Inside {
-    /// The refusal of the path, or `None` when it lies inside the root.
+impl Refusal {
+    /// The sentence of the refusal.
     ///
     /// `subject` names the path in the caller's words — "the generated file
     /// docs/x.md", "docs/x.json" — and `outside` is the sentence for a path
     /// that leaves the root: it differs per subject ("must lie inside the
     /// repository root", "is outside the repository root").
-    pub fn refusal(self, subject: &str, outside: &str) -> Option<String> {
+    pub fn message(self, subject: &str, outside: &str) -> String {
         match self {
-            Inside::Yes => None,
             // The paths of a project are relative: an absolute path names a
             // place on one machine, and a committed config has to work on
             // every machine.
-            Inside::Absolute => Some(format!(
-                "{subject} has to be a relative path — the paths of a project are relative"
-            )),
-            Inside::Outside => Some(format!("{subject} {outside}")),
+            Refusal::Absolute => {
+                format!("{subject} has to be a relative path — the paths of a project are relative")
+            }
+            Refusal::Outside => format!("{subject} {outside}"),
             // A path that cannot be resolved is not inside the root: the
             // engine cannot tell where it points, so it refuses it.
-            Inside::Unresolvable => Some(format!(
+            Refusal::Unresolvable => format!(
                 "{subject} could not be resolved — the links of the path could not be followed \
                  to the end"
-            )),
+            ),
             // The two readings differ: the tool does not pick one.
-            Inside::Ambiguous => Some(format!(
+            Refusal::Ambiguous => format!(
                 "{subject} is ambiguous — a \"..\" after a symbolic link has two readings, and \
                  the tool does not choose one"
-            )),
+            ),
         }
     }
 }
 
-/// Whether the path that a project names lies inside the repository root.
+/// The path a project names, resolved — when it lies inside the repository
+/// root.
 ///
 /// The path is **relative** — a committed config has to work on every
 /// machine — and it is resolved against `base`: the repository root for most
@@ -196,28 +217,34 @@ impl Inside {
 /// and a link at the file position may not either.  The file may be a link as
 /// long as its **target** lies inside the root: there the comparison follows
 /// the link, as the drift gate intends (SPEC §7).
-pub fn inside_root(root: &Path, base: &Path, relative: &str) -> Inside {
+///
+/// The `Ok` carries the path the named path **resolves to**: the place the
+/// operating system puts the file, after the links of the path have been
+/// followed.  It is the path the engine may touch — and the place a
+/// directory of the file has to be created: a caller that creates a
+/// directory needs the resolved path, not the named one (the drift gate,
+/// SPEC §7).  The `Err` carries the reason the path was refused.
+pub fn inside_root(root: &Path, base: &Path, relative: &str) -> Result<PathBuf, Refusal> {
     let path = Path::new(relative);
     if path.is_absolute() {
-        return Inside::Absolute;
+        return Err(Refusal::Absolute);
     }
-    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let start = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     // The walk is the resolution: the result is compared with the resolved
     // root, not the lexically normalized path.
     match walk(&start, path, LINK_DEPTH) {
-        Ok(resolved) if resolved.starts_with(&resolved_root) => Inside::Yes,
-        Ok(_) => Inside::Outside,
+        Ok(resolved) if inside_root_path(root, &resolved) => Ok(resolved),
+        Ok(_) => Err(Refusal::Outside),
         // The path could not be resolved: the engine cannot tell where it
         // points, and a path it cannot resolve is not one it may touch.  Fail
         // closed.
-        Err(Failure::Unresolvable) => Inside::Unresolvable,
-        Err(Failure::Ambiguous) => Inside::Ambiguous,
+        Err(Failure::Unresolvable) => Err(Refusal::Unresolvable),
+        Err(Failure::Ambiguous) => Err(Refusal::Ambiguous),
     }
 }
 
 /// The same check for a path that is resolved against the repository root.
-pub fn inside_repository(root: &Path, relative: &str) -> Inside {
+pub fn inside_repository(root: &Path, relative: &str) -> Result<PathBuf, Refusal> {
     inside_root(root, root, relative)
 }
 
@@ -255,5 +282,21 @@ mod tests {
             display(Some(root), Path::new("/repository/audit.json")),
             "audit.json"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_behind_a_link_resolves_to_its_target() {
+        // The helper hands the resolved path to the caller: the place the
+        // operating system puts the file — the place a directory of the file
+        // has to be created.
+        let root = tempfile::TempDir::new().expect("a temporary directory");
+        std::os::unix::fs::symlink("sub", root.path().join("docs")).expect("the link is made");
+
+        let resolved = inside_repository(root.path(), "docs/generated.md")
+            .expect("the path lies inside the root");
+
+        let root = fs::canonicalize(root.path()).expect("the root is readable");
+        assert_eq!(resolved, root.join("sub").join("generated.md"));
     }
 }

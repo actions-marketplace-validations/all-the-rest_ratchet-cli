@@ -129,10 +129,10 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
         // The snapshot lies inside the repository root: a path that points
         // outside it would let the engine write outside the tree it owns.
         let subject = format!("the check {}: the snapshot {}", entry.name, entry.snapshot);
-        if let Some(refusal) = path::inside_repository(options.root, &entry.snapshot)
-            .refusal(&subject, "must lie inside the repository root")
-        {
-            return Err(Error::new(refusal));
+        if let Err(refusal) = path::inside_repository(options.root, &entry.snapshot) {
+            return Err(Error::new(
+                refusal.message(&subject, "must lie inside the repository root"),
+            ));
         }
         if let Some(filter) = options.name {
             if filter != entry.name {

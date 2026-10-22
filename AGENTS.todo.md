@@ -59,24 +59,6 @@ and the one clippy dead-code error of item 1.
   the cross-check does not compile yet (the simulation that found the defects
   replaced every `cfg(unix)` in `tests/` with `cfg(any())`).
 
-### The drift gate creates the directory by the named path
-
-Logged 2026-10-21 (found by the verification of the path containment work).
-
-**Why.** The drift gate creates the directory of the generated file from the
-**named** path (`src/drift.rs`). When that directory is behind a link to a
-directory that does not exist yet, the creation fails with a misleading error
-(`cannot create the directory docs of docs/generated.md: File exists (os
-error 17)`) although the **resolved** directory lies inside the root and
-could be created. The run fails closed — the generator could not have written
-the file either — but the diagnosis points at the wrong place.
-
-**Open.**
-
-- Create the directory from the **resolved** path (the helper has to hand the
-  resolved path to the caller, not only the verdict), or name the named path
-  and the resolved one in the error.
-
 ### The artifact actions of the release run on a deprecated Node.js
 
 Logged 2026-10-21 (the annotation of the release run of `v0.3.0`).
@@ -94,3 +76,91 @@ today; a forced fallback is a courtesy, not a promise.
   exists, and check the two workflows of this repository (the CI and the
   release) for the same pair. The action is used in the release only — the CI
   of this repository builds and tests, it publishes no artifact.
+
+### The pre-release check and the baseline writer create the directory by the named path
+
+Logged 2026-10-22 (found by the work on the drift gate of the same day).
+
+**Why.** Two places create a directory of the tree from the **named** path,
+and both fail when the directory is behind a link to a directory that does not
+exist yet inside the root:
+
+* the pre-release check writes the snapshot into the tree in the `--update`
+  mode (`src/verify.rs`): `the check snap: cannot write docs/snap.json: File
+  exists (os error 17)`;
+* the baseline writer creates the directory of the baseline
+  (`src/baseline.rs`): `cannot create the baseline directory: File exists (os
+  error 17)` — a message that does not even name the directory.
+
+The **resolved** directory lies inside the root in both cases and could be
+created. The runs fail closed, but the diagnosis points at the wrong place —
+the same defect the drift gate had, and the same fix: the helper hands the
+resolved path to the caller now.
+
+The report writer is not affected: it refuses with "the directory docs does
+not exist" instead of creating one.
+
+**Open.**
+
+- Create the directories from the **resolved** path (the helper already hands
+  it to the caller), and name the directory in the error of the baseline
+  writer. The check has to be looked at as well: the restore of the check
+  removes the directories it created, and they are the ones of the resolved
+  path.
+
+### A failing or degenerate creation of a directory leaves the tree changed
+
+Logged 2026-10-22 (found by the verification of the drift gate work of the
+same day; both shapes are the same in `v0.3.0`).
+
+**Why.** Two shapes of the creation of a directory leave the tree changed, and
+neither message names the directory that stays behind:
+
+1. **A creation that fails in the middle of a chain.** The shallower
+   directories the engine has already created stay behind, and the message
+   does not say that the working tree was modified. Reproduced with a
+   component name that is longer than `NAME_MAX`:
+   `cannot create the directory ok/bbb… of ok/bbb…/x.md: File name too long
+   (os error 63)` leaves `ok` behind.
+2. **A named path that resolves to the root itself** (`a/..`): the directory
+   `a` stays behind, and the restore fails with `Operation not permitted
+   (os error 1)` — it tries to take the root back (`remove_file("…/a/..")`).
+   The message is right about the tree: it says that the working tree was
+   modified, and it is.
+
+Both runs fail closed, and neither shape was introduced by the change of the
+drift gate — it neither fixed them nor made them worse.
+
+**Open.**
+
+- Create the directories one by one and remove the ones that were created
+  when a later one fails, and say that the working tree was modified; and
+  leave the root alone in the restore: a path that resolves to the root must
+  not be restored, and the message has to name the directory that stays
+  behind.
+
+### The drift gate does not remove the directories the generator created
+
+Logged 2026-10-22 (found by the verification of the drift gate work of the
+same day).
+
+**Why.** `SPEC.md` §7, step 7 says: "a directory **the generator** created and
+left **empty** is removed — and so are the directories of step 2, which the
+engine created for the file". The code does the second half and not the
+first: `Snapshot::created` holds the directories the **engine** created (the
+list that `create_directories` returns), and the restore removes only that
+list. A directory the generator created and left empty stays behind. The
+README says the same as the SPEC.
+
+The difference exists since `v0.1.0` — it is not a regression of the change of
+the drift gate.
+
+What "the tree is as it was" means is a **decision** of the owner: either the
+engine removes the empty directories the generator left behind, or the
+sentences are corrected to say that it removes only what it created.
+
+**Open.**
+
+- Decide whether the restore removes the directories the **generator** created
+  and left empty, and make the code, `SPEC.md` §7 and the README say the same
+  thing.

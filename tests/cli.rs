@@ -6409,6 +6409,190 @@ fn a_drift_gate_creates_the_directory_of_the_generated_file() {
 
 #[cfg(unix)]
 #[test]
+fn a_drift_gate_creates_the_directory_a_link_points_at() {
+    // The directory of the generated file is a link to a directory that does
+    // not exist yet — inside the root.  The engine creates the directory
+    // **where the system resolves the path to**: there the generator writes
+    // the file, and there the restore removes it again.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    // The link points at a directory of the root that is not there yet.
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate runs: the directory was created, and the generator wrote the
+    // file behind the link.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // And the tree is unchanged: the file the generator wrote is gone again.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    // The directory the engine created is gone again, too.
+    assert!(
+        !repo.path().join("sub").exists(),
+        "the directory the engine created was left behind"
+    );
+    // And the link is still the link it was.
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("docs")).is_ok(),
+        "the link was removed"
+    );
+}
+
+#[test]
+fn a_drift_gate_creates_the_directory_a_parent_needs() {
+    // The path walks through a directory that does not exist: `sub/../x.md`.
+    // A `..` can only pop a directory that exists, so the engine creates
+    // `sub` — the file itself lands in the root.
+    let repo = Repo::new(
+        &generated_config_at("sub/../x.md", &["sh", "gen.sh", "sub/../x.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate runs: the generator wrote the file.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // And the tree is unchanged: the file the generator wrote is gone again,
+    // and so is the directory the engine created for the `..`.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    assert!(
+        !repo.path().join("sub").exists(),
+        "the directory the engine created was left behind"
+    );
+}
+
+#[test]
+fn a_drift_gate_removes_every_directory_it_created() {
+    // The path walks through two directories that do not exist:
+    // `a/b/../x.md`.  The engine creates `a` and `a/b` — and the restore has
+    // to remove them in the other way round: the deepest first, so that the
+    // shallower one is empty when it is removed.
+    let repo = Repo::new(
+        &generated_config_at("a/b/../x.md", &["sh", "gen.sh", "a/b/../x.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate runs: the generator wrote the file.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // And the tree is unchanged: the file the generator wrote is gone again.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    // Both directories the engine created are gone again — the deeper one
+    // first, so that the shallower one is empty when it is removed.
+    assert!(
+        !repo.path().join("a").exists(),
+        "the directory the engine created was left behind"
+    );
+    assert!(
+        !repo.path().join("a").join("b").exists(),
+        "the directory the engine created was left behind"
+    );
+}
+
+#[test]
+fn a_drift_gate_removes_the_deeper_directory_before_the_shallower_one() {
+    // The path walks through two directories that do not exist:
+    // `a/b/c/../x.md`.  The engine creates `a`, `a/b` and `a/b/c` — and the
+    // restore has to remove them in the right order: the directories below a
+    // directory come before it, so that it is empty when it is removed.
+    let repo = Repo::new(
+        &generated_config_at("a/b/c/../x.md", &["sh", "gen.sh", "a/b/c/../x.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate runs: the generator wrote the file.
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // And the tree is unchanged: the file the generator wrote is gone again.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+    // Every directory the engine created is gone again — the deeper one
+    // first, so that the shallower one is empty when it is removed.
+    assert!(
+        !repo.path().join("a").exists(),
+        "the directory the engine created was left behind"
+    );
+    assert!(
+        !repo.path().join("a").join("b").exists(),
+        "the directory the engine created was left behind"
+    );
+    assert!(
+        !repo.path().join("a").join("b").join("c").exists(),
+        "the directory the engine created was left behind"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_through_a_linked_directory_compares_the_committed_file() {
+    // Git keeps a symbolic link as a blob whose content is the path of its
+    // target, and the files of the target are committed beside it: the
+    // committed tree has no entry at the **named** path, and the comparison
+    // has to follow the link to find the file — otherwise the gate measures
+    // nothing and reports a green that says nothing.
+    let repo = Repo::new(
+        &generated_config(&["sh", "gen.sh", "docs/generated.md"], None),
+        None,
+    );
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$1\"\n");
+    repo.write("sub/generated.md", "committed\n");
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift"]);
+
+    // The gate compares the committed file: it differs from what the
+    // generator produces.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("docs/generated.md"), "{text}");
+    assert!(text.contains("differs from the committed file"), "{text}");
+    // The diff names the **named** path too: that is the path the project
+    // named, and the path the user knows.
+    assert!(text.contains("--- docs/generated.md"), "{text}");
+    assert!(!text.contains("--- sub/generated.md"), "{text}");
+    // And the tree is unchanged.
+    assert_eq!(repo.status(), "", "the drift run changed the working tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drift_gate_with_fix_writes_the_file_behind_a_linked_directory() {
+    // The `--fix` mode writes the produced content into the generated file:
+    // the directory is created where the system resolves the path to, and
+    // the file lands behind the link.  The `--fix` mode does not restore —
+    // the tree keeps the produced file.
+    let repo = Repo::new(&generated_config(&["sh", "gen.sh"], Some("--output")), None);
+    repo.write("gen.sh", "#!/bin/sh\nprintf 'generated\\n' > \"$2\"\n");
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "the generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    // The produced file landed behind the link.
+    assert_eq!(repo.read("sub/generated.md"), "generated\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_drift_gate_through_a_linked_directory_outside_the_root_is_refused() {
     // The directory inside the root is a link that points out of it: the
     // write would leave the tree the engine owns.

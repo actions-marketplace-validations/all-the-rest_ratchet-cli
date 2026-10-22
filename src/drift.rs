@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -126,11 +126,17 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
         // points outside it would let the engine write outside the tree it
         // owns.
         let subject = format!("the generated file {}", entry.path);
-        if let Some(refusal) = path::inside_repository(options.root, &entry.path)
-            .refusal(&subject, "must lie inside the repository root")
-        {
-            return Err(Error::new(refusal));
-        }
+        // The resolved path is the place the operating system puts the file:
+        // the links of the named path have been followed.  It is the path the
+        // engine touches — and the place the directory of the file is created.
+        let resolved = match path::inside_repository(options.root, &entry.path) {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                return Err(Error::new(
+                    refusal.message(&subject, "must lie inside the repository root"),
+                ));
+            }
+        };
         // A **dangling** link at the file position is refused.  The reason
         // depends on the mode: the in-place generator would write through the
         // link and create the file behind it — and the restore cannot take
@@ -166,7 +172,7 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
             }
         }
         selected += 1;
-        let result = run_one(entry, git, options, &mut outcome.debug)?;
+        let result = run_one(entry, git, options, &mut outcome.debug, &resolved)?;
         outcome.entries.push(result);
     }
 
@@ -185,6 +191,7 @@ fn run_one(
     git: &Git,
     options: &Options,
     debug: &mut Vec<String>,
+    resolved: &Path,
 ) -> Result<DriftEntry, Error> {
     let root = options.root;
     let target = root.join(&entry.path);
@@ -202,12 +209,14 @@ fn run_one(
             debug.push(format!("generator {}: {}", entry.path, artifact.output));
             artifact.bytes
         }
-        None => produce_in_place(entry, root, options, debug)?,
+        None => produce_in_place(entry, root, options, debug, resolved)?,
     };
 
-    // The comparison is against the committed file (SPEC §7).
-    let comparison = comparison_path(root, &entry.path);
-    let (status, committed) = compare(git, &comparison, &produced)?;
+    // The comparison is against the committed file (SPEC §7).  The lookup
+    // uses the file the system resolves the named path to — the same file the
+    // generator wrote; the report and the messages keep the named path.
+    let lookup = committed_path(root, &entry.path, resolved);
+    let (status, committed) = compare(git, &lookup, &entry.path, &produced)?;
 
     let mut detail = None;
     let mut diff = None;
@@ -236,7 +245,7 @@ fn run_one(
         match status {
             DriftStatus::Drift => {
                 if entry.output_arg.is_some() {
-                    write_fixed(root, &target, &produced)?;
+                    write_fixed(root, &target, &entry.path, resolved, &produced)?;
                 }
                 detail = Some(
                     "the produced content was written to the working tree; commit it — the committed file is still stale"
@@ -247,7 +256,7 @@ fn run_one(
                 let written = if entry.output_arg.is_some() {
                     let current = fs::read(&target).ok();
                     if current.as_deref() != Some(produced.as_slice()) {
-                        write_fixed(root, &target, &produced)?;
+                        write_fixed(root, &target, &entry.path, resolved, &produced)?;
                         true
                     } else {
                         false
@@ -294,28 +303,19 @@ fn is_dangling_link(root: &Path, relative: &str) -> bool {
 
 /// The path the comparison is made against.
 ///
-/// A symbolic link is compared **through**: the committed content of a link
-/// is its target, and the produced content is the content behind the link.
-/// Comparing the link text with the content would report a drift that says
-/// nothing about the file.
-fn comparison_path(root: &Path, relative: &str) -> String {
-    let target = root.join(relative);
-    let Ok(metadata) = fs::symlink_metadata(&target) else {
-        return relative.to_string();
-    };
-    if !metadata.file_type().is_symlink() {
-        return relative.to_string();
-    }
-    let Ok(raw) = fs::read_link(&target) else {
-        return relative.to_string();
-    };
-    match path::relative_to(root, &resolve(&target, &raw)) {
-        Some(resolved) => resolved,
-        None => relative.to_string(),
-    }
+/// The comparison looks at the file the operating system **resolves** the
+/// named path to: git stores a linked directory as a blob, so the committed
+/// tree holds the target of the link and not the link.  The path is relative
+/// to the repository root; the report and the messages keep the **named**
+/// path — the path the project named and the path the user knows.
+fn committed_path(root: &Path, relative: &str, resolved: &Path) -> String {
+    path::relative_to(&path::canonical_root(root), resolved).unwrap_or_else(|| relative.to_string())
 }
 
 /// Compares the produced content with the committed file.
+///
+/// `lookup` is the path of the committed file, `named` the path the project
+/// named: the messages name the named path.
 ///
 /// * no repository → the comparison is skipped, the file counts as `new`;
 /// * the file is not in the committed tree → `new`, informational and not a
@@ -325,24 +325,25 @@ fn comparison_path(root: &Path, relative: &str) -> String {
 ///   reference must not disable a gate (SPEC 8).
 fn compare(
     git: &Git,
-    relative: &str,
+    lookup: &str,
+    named: &str,
     produced: &[u8],
 ) -> Result<(DriftStatus, Option<Vec<u8>>), Error> {
     if !git.is_repo() {
         return Ok((DriftStatus::New, None));
     }
-    match git.head_entry(relative) {
+    match git.head_entry(lookup) {
         HeadEntry::Missing => Ok((DriftStatus::New, None)),
         HeadEntry::Directory => Err(Error::new(format!(
-            "the committed path {relative} is a directory, not a file"
+            "the committed path {named} is a directory, not a file"
         ))),
         HeadEntry::Unreadable => Err(Error::new(format!(
-            "the committed file {relative} cannot be read"
+            "the committed file {named} cannot be read"
         ))),
         HeadEntry::Blob(object) => {
-            let committed = git.show_object(&object).ok_or_else(|| {
-                Error::new(format!("the committed file {relative} cannot be read"))
-            })?;
+            let committed = git
+                .show_object(&object)
+                .ok_or_else(|| Error::new(format!("the committed file {named} cannot be read")))?;
             if committed == produced {
                 Ok((DriftStatus::Ok, Some(committed)))
             } else {
@@ -363,13 +364,14 @@ fn produce_in_place(
     root: &Path,
     options: &Options,
     debug: &mut Vec<String>,
+    resolved: &Path,
 ) -> Result<Vec<u8>, Error> {
     let target = root.join(&entry.path);
     let display = path::display(Some(root), &target);
 
     // 1. the snapshot: the original bytes, the file mode and the time the
     //    file was written last.
-    let snapshot = Snapshot::take(&target)
+    let mut snapshot = Snapshot::take(&target)
         .map_err(|error| Error::new(format!("cannot read {display}: {error}")))?;
 
     // 1b. the marker: the file is touched with an old time, so that the
@@ -378,20 +380,31 @@ fn produce_in_place(
     let marker = fsutil::marker_time();
     let _ = fsutil::set_modified(&target, marker);
 
-    // 1c. the directory of the file is created if it does not exist: a
+    // 1c. the directories the file needs are created if they do not exist: a
     //     generator that writes a file into a new directory would otherwise
     //     fail, and a project cannot commit an empty directory.  The
     //     directories that were missing are removed again by the restore.
     //     A directory that cannot be created is an error of the engine, not
     //     of the generator: the user is not sent to the wrong place.
-    if let Some(directory) = target.parent() {
-        fs::create_dir_all(directory).map_err(|error| {
-            Error::new(format!(
-                "cannot create the directory {} of {display}: {error}",
-                path::display(Some(root), directory)
-            ))
-        })?;
-    }
+    //
+    //     The engine creates the directories the **operating system** needs
+    //     to walk the named path: the missing directories of the traversal —
+    //     a `..` can only pop a directory that exists — and the directory
+    //     the path resolves to, the place the file lands in when a link
+    //     leads there.
+    //
+    //     The error names the directory that could not be created: it is
+    //     named as it was created — the resolved one as the system resolves
+    //     it, the named one as the project named it — and it is the place the
+    //     user has to look.
+    let created = create_directories(root, &entry.path, resolved).map_err(|error| {
+        Error::new(format!(
+            "cannot create the directory {} of {display}: {}",
+            directory_name(root, &error.directory),
+            error.cause
+        ))
+    })?;
+    snapshot.created = created;
 
     // 2. the generator.
     let run = run_generator(&entry.command, root, &display, debug);
@@ -438,11 +451,138 @@ fn produce_in_place(
     Ok(produced)
 }
 
+/// A directory the engine could not create.
+struct DirectoryError {
+    /// The directory the engine tried to create.
+    directory: PathBuf,
+    /// The cause: what the operating system said.
+    cause: io::Error,
+}
+
+/// Creates the directories the generated file needs.
+///
+/// The **union** of two sets of directories, and both of them are needed:
+///
+/// * the **missing directories of the named traversal**: the directories the
+///   operating system walks to reach the file.  A `..` can only pop a
+///   directory that exists, so `sub/../x.md` needs `sub` — even though the
+///   file itself lands in the root;
+/// * the **directory the path resolves to**: the place the operating system
+///   puts the file.  A link in the path leads to its target, and the target
+///   is the place the file lands in.
+///
+/// The missing directories of the traversal are created **as they are named**:
+/// the path the project named is the path the engine walks.  The directory
+/// the path resolves to is created **where the path resolves to** — the place
+/// the system puts the file.
+///
+/// The list that comes back is in the order the directories have to be
+/// **removed**: the directories below a directory come before it, so that it
+/// is empty when it is removed.
+fn create_directories(
+    root: &Path,
+    relative: &str,
+    resolved: &Path,
+) -> Result<Vec<PathBuf>, DirectoryError> {
+    let mut chains: Vec<Vec<PathBuf>> = Vec::new();
+
+    // 1. the directory the path resolves to.  It has to lie inside the
+    //    repository root: the engine never writes outside the tree it owns.
+    //    The root itself exists — there is nothing to create.
+    if let Some(directory) = resolved.parent() {
+        if path::inside_root_directory(root, directory) {
+            chains.push(fsutil::missing_directories(directory));
+            fs::create_dir_all(directory).map_err(|cause| DirectoryError {
+                directory: directory.to_path_buf(),
+                cause,
+            })?;
+        }
+    }
+
+    // 2. the missing directories of the named traversal.  They come after
+    //    the resolved directory: a link in the path is only a directory when
+    //    its target exists.
+    for directory in traversal_directories(root, relative) {
+        if directory.is_dir() {
+            // The system walks into it: there is nothing to create.
+            continue;
+        }
+        if path::is_link(&directory) {
+            // A link is not the engine's to create: the system walks into
+            // its target, and the resolved directory above has created it.
+            continue;
+        }
+        chains.push(fsutil::missing_directories(&directory));
+        fs::create_dir_all(&directory).map_err(|cause| DirectoryError {
+            directory: directory.clone(),
+            cause,
+        })?;
+    }
+
+    // The removal is the other way round: the directories of the named
+    // traversal lie inside the directory the path resolves to, and a
+    // directory is removed after the one below it.
+    let mut created = Vec::new();
+    for chain in chains.into_iter().rev() {
+        created.extend(chain);
+    }
+    Ok(created)
+}
+
+/// The directories the operating system walks to reach the file.
+///
+/// Every component of the named path but the last is a directory the system
+/// walks into: a `..` pops the prefix, and the directory it pops is the one
+/// before it.
+///
+/// The directories are **as the path names them**: the engine walks the path
+/// the project named.
+fn traversal_directories(root: &Path, relative: &str) -> Vec<PathBuf> {
+    let components: Vec<Component<'_>> = Path::new(relative).components().collect();
+    let mut prefix = PathBuf::new();
+    let mut directories = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Normal(name) => {
+                prefix.push(name);
+                // The last component is the file itself.
+                if index + 1 < components.len() {
+                    directories.push(root.join(&prefix));
+                }
+            }
+            // A `..` pops the prefix: the path goes up again.
+            Component::ParentDir => {
+                prefix.pop();
+            }
+            Component::CurDir => {}
+            _ => {}
+        }
+    }
+    directories
+}
+
+/// The name of a directory in an error: the path relative to the repository
+/// root.
+///
+/// The directory is named as it was created: the resolved one as the system
+/// resolves it, the named one as the project named it.
+fn directory_name(root: &Path, directory: &Path) -> String {
+    path::relative_to(&path::canonical_root(root), directory)
+        .or_else(|| path::relative_to(root, directory))
+        .unwrap_or_else(|| path::file_name(directory))
+}
+
 /// Writes the produced content into the generated file.
 ///
 /// The mode of an existing file is kept: `--fix` changes the content of the
 /// generated files, nothing else.
-fn write_fixed(root: &Path, target: &Path, produced: &[u8]) -> Result<(), Error> {
+fn write_fixed(
+    root: &Path,
+    target: &Path,
+    relative: &str,
+    resolved: &Path,
+    produced: &[u8],
+) -> Result<(), Error> {
     let display = path::display(Some(root), target);
     if target.exists() {
         // Writing in place keeps the mode of the file.
@@ -450,10 +590,11 @@ fn write_fixed(root: &Path, target: &Path, produced: &[u8]) -> Result<(), Error>
             .map_err(|error| Error::new(format!("cannot write {display}: {error}")))?;
         return Ok(());
     }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| Error::new(format!("cannot write {display}: {error}")))?;
-    }
+    // The directories the file needs are created: the engine's business, not
+    // the generator's.  The write follows the link, and the file lands
+    // behind it.
+    create_directories(root, relative, resolved)
+        .map_err(|error| Error::new(format!("cannot write {display}: {}", error.cause)))?;
     fs::write(target, produced)
         .map_err(|error| Error::new(format!("cannot write {display}: {error}")))
 }
@@ -529,7 +670,11 @@ struct Snapshot {
     mode: Option<u32>,
     /// The symbolic link the target pointed to, if it was one.
     link: Option<Link>,
-    /// The directories the generator created.
+    /// The directories the engine created for the file.
+    ///
+    /// The list is in the order the directories have to be **removed**: the
+    /// directories below a directory come before it, so that it is empty when
+    /// it is removed.
     created: Vec<PathBuf>,
 }
 
@@ -552,7 +697,6 @@ struct Link {
 impl Snapshot {
     /// Takes the snapshot of `target`.
     fn take(target: &Path) -> io::Result<Self> {
-        let created = fsutil::created_directories(target);
         match fs::symlink_metadata(target) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Snapshot {
                 target: target.to_path_buf(),
@@ -561,7 +705,7 @@ impl Snapshot {
                 inode: None,
                 mode: None,
                 link: None,
-                created,
+                created: Vec::new(),
             }),
             Err(error) => Err(error),
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -590,7 +734,7 @@ impl Snapshot {
                         inode,
                         mode,
                     }),
-                    created,
+                    created: Vec::new(),
                 })
             }
             Ok(metadata) => Ok(Snapshot {
@@ -600,7 +744,7 @@ impl Snapshot {
                 inode: fsutil::inode_of(&metadata),
                 mode: fsutil::mode_of(&metadata),
                 link: None,
-                created,
+                created: Vec::new(),
             }),
         }
     }
@@ -710,7 +854,7 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Removes the directories the generator created and left empty.
+    /// Removes the directories the engine created and left empty.
     fn remove_created_directories(&self) -> Result<(), String> {
         fsutil::remove_empty_directories(&self.created);
         Ok(())

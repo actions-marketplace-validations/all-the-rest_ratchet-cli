@@ -287,10 +287,10 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
 /// follow the link.
 fn inside_root(root: &Path, relative: &str) -> Result<PathBuf, Error> {
     let subject = format!("the path {relative}");
-    if let Some(refusal) = crate::path::inside_repository(root, relative)
-        .refusal(&subject, "must lie inside the repository root")
-    {
-        return Err(Error::new(refusal));
+    if let Err(refusal) = crate::path::inside_repository(root, relative) {
+        return Err(Error::new(
+            refusal.message(&subject, "must lie inside the repository root"),
+        ));
     }
     Ok(crate::path::normalize(&root.join(Path::new(relative))))
 }
