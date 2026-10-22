@@ -77,26 +77,6 @@ the file either — but the diagnosis points at the wrong place.
   resolved path to the caller, not only the verdict), or name the named path
   and the resolved one in the error.
 
-### The moving action tag `v1` drifts
-
-Logged 2026-10-21 (found by the review of the release workflow, before the
-first release).
-
-**Why.** The action is pinned by a tag of this repository (`v1` — a moving
-major tag), and nothing moves it: every change to `action.yml` or `action/`
-needs a `git tag -f v1 && git push -f origin v1`, and a forgotten move is
-invisible — a consumer on `all-the-rest/ratchet-cli@v1` silently runs an old
-action. The tag was pushed with the first release (`v0.1.0`) and moved by hand
-with the releases of `0.2.0` and `0.3.0`; the drift is the open part — nothing
-does it automatically.
-
-**Open.**
-
-- A workflow that moves the tag to the commit that last touched the action, or
-  a check that fails when the tag and the action disagree. A project that
-  pins the tag by its commit SHA — as the portal does, because its
-  supply-chain contract allows no moving tag — is not affected.
-
 ### The artifact actions of the release run on a deprecated Node.js
 
 Logged 2026-10-21 (the annotation of the release run of `v0.3.0`).
@@ -114,3 +94,23 @@ today; a forced fallback is a courtesy, not a promise.
   exists, and check the two workflows of this repository (the CI and the
   release) for the same pair. The action is used in the release only — the CI
   of this repository builds and tests, it publishes no artifact.
+
+### The workflows of this repository do not pin their checkout
+
+Logged 2026-10-22 (found by the implementation of the moving tag `v1`).
+
+**Why.** The CI (`.github/workflows/ci.yml`) and the release
+(`.github/workflows/release.yml`) use the moving label `actions/checkout@v5`,
+while the workflow that moves the tag is pinned to a commit: a workflow that
+writes to the repository may not depend on a moving label. The release pins
+its **runners** for a stated reason — „a release is an artefact that has to be
+rebuildable from the same source" — and the checkout is the same kind of
+input: a moving label can change the code that checks the repository out
+under the release.
+
+**Open.**
+
+- Pin the checkout of the CI and of the release to a commit SHA and keep the
+  three workflows of this repository on one version. The SHA the moving tag
+  uses is `3d3c42e5aac5ba805825da76410c181273ba90b1` (`actions/checkout`
+  v7.0.1) — the two projects that adopted the action already pin it that way.

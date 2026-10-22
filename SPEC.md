@@ -681,7 +681,8 @@ report's content. `ratchet check` is the gate.
 ## 12. The GitHub Action
 
 A native action in this repository (`action.yml`), usable as
-`uses: all-the-rest/ratchet-cli@v1` in any project.
+`uses: all-the-rest/ratchet-cli@v1` in any project. The tag `v1` is a
+**moving major tag** — §12.1.
 
 **Two modes** (the input `mode`):
 
@@ -729,6 +730,36 @@ file, and the commit contains it and nothing else.
 **Two version lines:** the action is pinned by a tag in this repository, the
 binary by the action's `version` input. A project pins the action; the action
 pins the binary — the project never downloads a binary itself.
+
+### 12.1 The moving tag `v1`
+
+The tag `v1` is a **moving major tag**: it names the commit that last touched
+the action — `action.yml` and the `action/` directory with the scripts of the
+composite action. A consumer on `uses: all-the-rest/ratchet-cli@v1` runs the
+action of that commit, and the tag is what makes "the action of this
+repository" a name that needs no version of its own.
+
+The tag is moved by a **workflow**, not by hand. The run finds the last commit
+of the history that touched the action and points the tag at it, and the push
+that changes the action is the push that moves the tag. A forgotten move is
+then not a thing that can happen: the drift that a hand-moved tag hides — a
+consumer on an old action, with nothing in the history to show it — has no way
+in. The move happens on the push of a **release commit** as well: a release
+moves the `version` input of the action, and that is a change of `action.yml`.
+The release itself never touches the tag — the tag of the action names the
+action, the tag of the release names a version (§16.3).
+
+The run **fails closed**: a history in which no commit touched the action ends
+it with an error, because a tag that names nothing names nothing. It is
+**idempotent**: when the tag already names the target, the run pushes nothing
+— a run that has nothing to say does not touch the remote. A manual run moves
+the tag as well, which is the repair after a rebase: a rewritten history has
+a new commit that touched the action, and the tag follows it.
+
+**The permission** belongs to that workflow alone: the write it needs is the
+tag, and no other workflow of the repository has it. The CI keeps
+`contents: read`, and the release writes only in the job that publishes the
+release — a workflow that does not need the write does not get it.
 
 ## 13. The findings registry
 
@@ -1069,6 +1100,12 @@ a pre-release (`v1.2.3-rc.1`) is not a release, and the moving major tag of
 the action (`v1`) is not a release either. A tag that is not a release tag
 does not count, and naming one explicitly is refused — the version it stands
 for would be a guess.
+
+The moving major tag of the action follows the action (§12.1): a release
+moves the `version` input of the action, so the release commit touches
+`action.yml`, and the push of that commit is what moves the tag. The release
+itself does not touch it — the tag of the action names the action, the tag of
+the release names a version.
 
 With **no release tag at all**, the version in the version file is the
 version of the release: the first release is the version the project chose,

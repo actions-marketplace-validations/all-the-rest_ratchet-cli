@@ -1,0 +1,90 @@
+name: Action tag
+
+# The moving major tag `v1` names the commit that last touched the action.
+# A consumer pins it — `uses: all-the-rest/ratchet-cli@v1` — so a forgotten
+# move is a consumer on an old action, and the drift is invisible: nothing in
+# the history says that the tag is behind.  The move is therefore not a step
+# somebody remembers, it is a run.
+#
+# The trigger is every push to `main` and a manual run (a repair after a
+# rebase, for example).  There is **no** `paths:` filter: the run is cheap and
+# idempotent, and a filter would make the workflow unobservable on the commit
+# that introduces it — the first commit that touches the action would be the
+# first one no run could ever see.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The only workflow of this repository that writes.  The CI and the release
+# keep `contents: read`: a workflow that does not need the write does not
+# get it.  The write that is needed here is the tag.
+permissions:
+  contents: write
+
+# Two runs must not move the tag at the same time: a run that checked out an
+# older `main` would push its target over the target of a newer run and the
+# tag would move *backwards*.  The newer run wins and the older one is
+# dropped.
+concurrency:
+  group: action-tag
+  cancel-in-progress: true
+
+jobs:
+  tag:
+    name: The tag follows the action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # The checkout is pinned to a commit: a workflow that writes to the
+        # repository may not depend on a moving label.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The whole history: the target is the commit that last touched the
+          # action, and the history is where that commit lives.
+          fetch-depth: 0
+          # The tag names a commit of `main`.  A manual run from another
+          # branch would otherwise move the tag to a commit that `main` does
+          # not contain — a new drift, made by the repair itself.
+          ref: main
+
+      - name: Move the tag
+        env:
+          # The constants of the repository: the name of the tag and the
+          # message it carries.
+          TAG: v1
+          MESSAGE: "The action: a moving major tag. The action of this repository, pinned by a project."
+        run: |
+          set -euo pipefail
+
+          # An annotated tag needs an author, and the checkout does not
+          # configure one: without the identity `git tag -a` fails.  The
+          # identity is the one of the bot of the platform, so that the author
+          # of the tag says who moved it.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The commit that last touched the action: the tag follows the
+          # action, not the other way round.
+          target=$(git log -1 --format=%H -- action.yml action/)
+          if [ -z "$target" ]; then
+            echo "::error::no commit in the history touched the action — the tag would name nothing"
+            exit 1
+          fi
+
+          # The commit the tag names today.  A tag that does not exist yet is
+          # created; `-q` keeps the missing tag quiet.
+          current=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)
+
+          if [ "$current" = "$target" ]; then
+            echo "the tag $TAG already names $target — nothing to push"
+            exit 0
+          fi
+
+          echo "the tag $TAG names ${current:-nothing} and will name $target"
+          git log -1 --format='  %h %s' "$target"
+
+          git tag -f -a "$TAG" "$target" -m "$MESSAGE"
+          git push -f origin "$TAG"
+
+          echo "the tag $TAG now names $target — it was pushed"

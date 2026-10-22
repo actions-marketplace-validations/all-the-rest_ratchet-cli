@@ -1210,6 +1210,28 @@ compares it with the version of `Cargo.toml`: a release has to name its
 version in the action as well, or the action would install a release that
 does not exist.
 
+### The moving tag `v1`
+
+The tag `v1` **names the commit that last touched the action** — `action.yml`
+and the `action/` directory with the scripts of the composite action. It is
+moved by a **workflow** of this repository, on the push that changes the
+action: a forgotten move is not a thing that can happen, and a consumer on
+`all-the-rest/ratchet-cli@v1` always runs the action as it is on `main`.
+
+The push of a **release commit** moves the tag as well — a release changes the
+`version` input of the action, and that is a change of `action.yml`. The
+release workflow itself never touches the tag: the tag of the action names the
+action, the tag of the release names a version.
+
+The run is **idempotent** — when the tag already names the commit that last
+touched the action, nothing is pushed — and it can be started by hand, which
+is the repair after a rebase: a rewritten history has a new commit that
+touched the action, and the tag follows it.
+
+A project that pins the action by its **commit SHA** — as the portal does,
+because its supply-chain contract allows no moving tag — is not affected: the
+SHA names one commit, and the workflow never moves it.
+
 ### The install step
 
 The action installs the **raw binary** of the release
@@ -1420,14 +1442,13 @@ What the gates do **not** cover, named here rather than in a footnote:
 
 `SPEC.md` describes more than this binary does today. The self-update, the
 release workflow, the GitHub Action and the release step exist now, and the
-first release (`v0.1.0`) is published — but two things are still open: the
-**moving action tag** (`v1`) has to be moved by hand whenever `action.yml`
-changes, and the **release step** writes the version into **one** file of the
-project — a project that keeps its version in several places (a lock file
-beside the manifest, the default of the action's `version` input) still has to
-move the second one by hand. In this repository the second place is the action:
-the test that compares the default with the manifest catches a forgotten
-move, but the release commit has to make it.
+first release (`v0.1.0`) is published — but one thing is still open: the
+**release step** writes the version into **one** file of the project — a
+project that keeps its version in several places (a lock file beside the
+manifest, the default of the action's `version` input) still has to move the
+second one by hand. In this repository the second place is the action: the
+test that compares the default with the manifest catches a forgotten move,
+but the release commit has to make it.
 
 ## Specification
 
