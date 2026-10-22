@@ -42,3 +42,10 @@ block is written by `ratchet release`.
 ### Fixed
 
 - the paths of a project may not leave the repository root (path)
+
+## [0.3.1] - 2026-10-22
+
+### Fixed
+
+- the moving tag `v1` follows the action (action)
+- the drift gate creates the directories the system needs (drift)
