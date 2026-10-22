@@ -5855,6 +5855,44 @@ fn verify_restore_removes_a_directory_created_behind_a_missing_link_target() {
     assert_eq!(repo.status(), "", "the verify run changed the working tree");
 }
 
+#[cfg(unix)]
+#[test]
+fn verify_restore_removes_a_directory_created_before_a_parent_traversal_behind_a_link() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &[
+                "sh",
+                "-c",
+                "mkdir -p docs/x; printf '100 ops/s\\n' > docs/x/../snapshot.txt; \
+                 printf '100 ops/s\\n'",
+            ],
+            "docs/x/../snapshot.txt",
+        ),
+        None,
+    );
+    repo.write("sub/snapshot.txt", "100 ops/s\n");
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked snapshot traversal"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("sub/snapshot.txt"), "100 ops/s\n");
+    assert!(
+        !repo.path().join("sub/x").exists(),
+        "the intermediate directory created through the link was left behind"
+    );
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("docs"))
+            .expect("the link remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
 #[test]
 fn verify_update_creates_the_resolved_snapshot_without_a_traversal_directory() {
     let repo = Repo::new(

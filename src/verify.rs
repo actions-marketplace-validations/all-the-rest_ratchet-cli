@@ -197,7 +197,10 @@ fn run_one(
     // its time are restored after the command, whatever the command did to
     // it.  A command that writes elsewhere in the tree is the command's
     // doing — the engine cannot undo that.
-    let created = command_directories(root, &entry.snapshot, resolved);
+    let subject = format!("the check {name}: the snapshot {}", entry.snapshot);
+    let created = command_directories(root, &entry.snapshot, resolved).map_err(|refusal| {
+        Error::new(refusal.message(&subject, "must lie inside the repository root"))
+    })?;
     let mut guard = Guard::take(resolved, root, created)
         .map_err(|error| Error::new(format!("the check {name}: cannot read {display}: {error}")))?;
 
@@ -485,9 +488,14 @@ fn write_snapshot(
 }
 
 /// Directories the command could have created along the snapshot's named
-/// traversal or at the resolved target. Paths are ordered deepest-first for
-/// removal, and paths behind a link are taken from the resolved target only.
-fn command_directories(root: &Path, relative: &str, resolved: &Path) -> Vec<PathBuf> {
+/// traversal or at the resolved target. Every intermediate prefix is resolved
+/// by `path`, so directories behind links and before a later `..` are included.
+/// Paths are ordered deepest-first for removal.
+fn command_directories(
+    root: &Path,
+    relative: &str,
+    resolved: &Path,
+) -> Result<Vec<PathBuf>, path::Refusal> {
     let mut directories = Vec::new();
     if let Some(parent) = resolved.parent() {
         directories.extend(fsutil::missing_directories(parent));
@@ -495,26 +503,18 @@ fn command_directories(root: &Path, relative: &str, resolved: &Path) -> Vec<Path
 
     let components: Vec<_> = Path::new(relative).components().collect();
     let mut prefix = PathBuf::new();
-    let mut through_link = false;
     for (index, component) in components.iter().enumerate() {
         match component {
-            Component::Normal(name) => {
-                prefix.push(name);
-                if index + 1 < components.len() {
-                    let directory = root.join(&prefix);
-                    if path::is_link(&directory) {
-                        through_link = true;
-                    }
-                    if !through_link && !directory.is_dir() {
-                        directories.extend(fsutil::missing_directories(&directory));
-                    }
-                }
-            }
-            Component::ParentDir => {
-                prefix.pop();
-            }
-            Component::CurDir => {}
+            Component::Normal(name) => prefix.push(name),
+            Component::ParentDir => prefix.push(".."),
+            Component::CurDir => prefix.push("."),
             _ => {}
+        }
+
+        if index + 1 < components.len() {
+            let prefix = prefix.to_string_lossy();
+            let directory = path::inside_repository(root, &prefix)?;
+            directories.extend(fsutil::missing_directories(&directory));
         }
     }
 
@@ -526,7 +526,7 @@ fn command_directories(root: &Path, relative: &str, resolved: &Path) -> Vec<Path
             .then_with(|| left.cmp(right))
     });
     directories.dedup();
-    directories
+    Ok(directories)
 }
 
 /// The state of the snapshot file: its bytes, its mode, its time and its
