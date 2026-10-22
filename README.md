@@ -1154,7 +1154,7 @@ the **validate** mode.
 | Input | Default | Meaning |
 |---|---|---|
 | `mode` | `validate` | `validate` or `update`. An unknown mode fails the job. |
-| `version` | `v0.1.0` | The version of the binary the action installs — the tag of the release. |
+| `version` | `v0.3.1` | The version of the binary the action installs — the tag of the release. |
 | `config` | `ratchet.config.jsonc` | The path of the config, relative to the workspace. |
 | `tier` | *(empty)* | `fast`, `slow`, or empty for every tier. The **validate mode only**: `ratchet baseline update` has no tier selection, so the update mode ignores the input. |
 | `args` | *(empty)* | Extra arguments for `ratchet check`; they are split on whitespace. |
