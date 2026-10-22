@@ -598,10 +598,10 @@ The generator must be able to write to a **given path**:
      a file created behind a **dangling** link is not removed, which is why a
      dangling link is refused;
   6. **verify** the restore (read the bytes back and compare);
-  7. a directory the generator created and left **empty** is removed — and so
-     are the directories of step 2, which the engine created for the file. A
-     directory that still holds something is not the engine's to remove: it
-     was not left behind by the engine alone.
+  7. the directories of step 2, which the engine created for the file, are
+     removed — when they are **empty**. A directory that still holds
+     something is not the engine's to remove: it was not left behind by the
+     engine alone.
 
   If the restore fails, the run ends with an **operational error** that names
   the file and says that the working tree was modified. A swallowed restore

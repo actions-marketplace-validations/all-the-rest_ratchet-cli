@@ -138,29 +138,3 @@ drift gate — it neither fixed them nor made them worse.
   leave the root alone in the restore: a path that resolves to the root must
   not be restored, and the message has to name the directory that stays
   behind.
-
-### The drift gate does not remove the directories the generator created
-
-Logged 2026-10-22 (found by the verification of the drift gate work of the
-same day).
-
-**Why.** `SPEC.md` §7, step 7 says: "a directory **the generator** created and
-left **empty** is removed — and so are the directories of step 2, which the
-engine created for the file". The code does the second half and not the
-first: `Snapshot::created` holds the directories the **engine** created (the
-list that `create_directories` returns), and the restore removes only that
-list. A directory the generator created and left empty stays behind. The
-README says the same as the SPEC.
-
-The difference exists since `v0.1.0` — it is not a regression of the change of
-the drift gate.
-
-What "the tree is as it was" means is a **decision** of the owner: either the
-engine removes the empty directories the generator left behind, or the
-sentences are corrected to say that it removes only what it created.
-
-**Open.**
-
-- Decide whether the restore removes the directories the **generator** created
-  and left empty, and make the code, `SPEC.md` §7 and the README say the same
-  thing.
