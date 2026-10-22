@@ -953,6 +953,11 @@ ratchet**: it has no direction.
   `output_arg`), so the tree is not modified by the check.
 * The comparison is a diff, and the report shows it — a benchmark that moved by
   3 % is not a failure of the code, it is a number a human looks at.
+* The comparison is against the **committed** snapshot, not the working-tree
+  copy. A symbolic link in a directory component is followed for the Git
+  lookup, which uses the repository-relative resolved path because Git does
+  not traverse a committed link blob. The final snapshot itself must still be
+  a regular file. Messages and diffs keep the configured path.
 * It runs in the **release pipeline**, not in the commit gate: it needs the
   infrastructure the release needs, and a permanent gate over a measurement
   would be noise.

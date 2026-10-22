@@ -219,8 +219,14 @@ fn run_one(
 
     let produced = produced?;
 
-    // The comparison is against the committed snapshot (SPEC §15).
-    let (status, committed) = compare(git, name, &entry.snapshot, &produced)?;
+    // The committed lookup follows the path the system resolves the named
+    // snapshot to. A linked directory is a blob in Git, so Git cannot traverse
+    // it to find the target file. The resolved path is already contained by
+    // `inside_repository`; this only makes it repository-relative. Keep the
+    // configured path for user-facing messages and the diff.
+    let lookup = path::relative_to(&path::canonical_root(root), resolved)
+        .unwrap_or_else(|| entry.snapshot.clone());
+    let (status, committed) = compare(git, name, &lookup, &entry.snapshot, &produced)?;
 
     let mut detail = None;
     let mut diff = None;
@@ -415,24 +421,25 @@ fn read_output(entry: &Verify, temporary: &Path, transcript: &str) -> Result<Vec
 fn compare(
     git: &Git,
     name: &str,
-    relative: &str,
+    lookup: &str,
+    named: &str,
     produced: &[u8],
 ) -> Result<(VerifyStatus, Option<Vec<u8>>), Error> {
     if !git.is_repo() {
         return Ok((VerifyStatus::New, None));
     }
-    match git.head_entry(relative) {
+    match git.head_entry(lookup) {
         HeadEntry::Missing => Ok((VerifyStatus::New, None)),
         HeadEntry::Directory => Err(Error::new(format!(
-            "the check {name}: the committed snapshot {relative} is a directory, not a file"
+            "the check {name}: the committed snapshot {named} is a directory, not a file"
         ))),
         HeadEntry::Unreadable => Err(Error::new(format!(
-            "the check {name}: the committed snapshot {relative} cannot be read"
+            "the check {name}: the committed snapshot {named} cannot be read"
         ))),
         HeadEntry::Blob(object) => {
             let committed = git.show_object(&object).ok_or_else(|| {
                 Error::new(format!(
-                    "the check {name}: the committed snapshot {relative} cannot be read"
+                    "the check {name}: the committed snapshot {named} cannot be read"
                 ))
             })?;
             if committed == produced {

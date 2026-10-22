@@ -517,8 +517,11 @@ The `verify` entries of the config name the checks:
   lies inside the repository root — resolved.
 * The command runs with the working directory set to the **repository root**
   and writes to a **temporary path** — the check does not modify the tree.
-* The comparison is against the **committed** snapshot
-  (`git show HEAD:<snapshot>`), and the difference is shown as a unified diff:
+* The comparison is against the **committed** snapshot, not the working-tree
+  copy. A symbolic link in a directory component is followed for the Git
+  lookup, which uses the repository-relative resolved path because Git does
+  not traverse a committed link blob. The final snapshot itself must still be
+  a regular file. Messages and diffs keep the configured path:
 
   ```
   --- snapshots/benchmark.txt
@@ -558,6 +561,10 @@ named error: the committed content of a link is its target, and comparing the
 *output* with the target's content would say nothing about the output. (The
 drift gate resolves a link instead — there the *file* is the subject, here the
 *output* is. The two gates have different subjects and say so.)
+
+A link in a directory component is different: the comparison follows it to the
+resolved committed path, while messages and diffs continue to name the
+configured snapshot path.
 
 `ratchet verify` runs the checks; `--name <name>` runs one of them. The exit
 code is `0` when every check is `ok` or `new`, `1` when a snapshot differs

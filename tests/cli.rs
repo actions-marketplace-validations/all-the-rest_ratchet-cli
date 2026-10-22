@@ -5483,6 +5483,63 @@ fn a_snapshot_that_differs_fails_with_a_unified_diff() {
     assert!(text.contains("NOT COHERENT"), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn verify_compares_a_committed_file_behind_a_link_and_update_writes_there() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "docs/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '103 ops/s\\n'\n");
+    repo.write("sub/benchmark.txt", "100 ops/s\n");
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked snapshot"]);
+
+    let output = repo.run(&["verify", "--format", "json"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["verify"][0]["status"], "drift");
+    let diff = report["verify"][0]["diff"]
+        .as_str()
+        .expect("the diff exists");
+    assert!(diff.contains("--- docs/benchmark.txt"), "{diff}");
+    assert!(diff.contains("+++ docs/benchmark.txt"), "{diff}");
+    assert!(diff.contains("-100 ops/s"), "{diff}");
+    assert!(diff.contains("+103 ops/s"), "{diff}");
+    assert_eq!(repo.read("sub/benchmark.txt"), "100 ops/s\n");
+    assert_eq!(repo.status(), "", "verify changed the working tree");
+
+    let output = repo.run(&["verify", "--update", "--format", "json"]);
+
+    // The update writes through the named directory link, but the committed
+    // snapshot remains stale and the report continues to use the named path.
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["verify"][0]["status"], "drift");
+    assert!(
+        report["verify"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("docs/benchmark.txt")
+    );
+    assert_eq!(repo.read("sub/benchmark.txt"), "103 ops/s\n");
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("docs"))
+            .expect("the link remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(repo.status(), " M sub/benchmark.txt\n");
+
+    repo.git(&["add", "sub/benchmark.txt"]);
+    repo.git(&["commit", "-q", "-m", "updated linked snapshot"]);
+    let output = repo.run(&["verify"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+}
+
 #[test]
 fn a_snapshot_that_is_not_committed_is_new_and_not_a_failure() {
     let repo = Repo::new(
