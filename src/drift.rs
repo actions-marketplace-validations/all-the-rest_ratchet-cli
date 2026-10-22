@@ -856,7 +856,7 @@ impl Snapshot {
 
     /// Removes the directories the engine created and left empty.
     fn remove_created_directories(&self) -> Result<(), String> {
-        fsutil::remove_empty_directories(&self.created);
+        let _ = fsutil::remove_empty_directories(&self.created);
         Ok(())
     }
 

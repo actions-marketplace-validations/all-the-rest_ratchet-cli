@@ -2140,6 +2140,96 @@ fn baseline_path_names_the_file_the_other_commands_write() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn baseline_writer_creates_the_resolved_directory_behind_a_link() {
+    let repo = Repo::new(
+        r#"[
+          {
+            "baseline": "linked/ratchet.baseline.json",
+            "rules": {
+              "a": {
+                "class": "c",
+                "incident": "i",
+                "unit": "u",
+                "direction": "ceiling",
+                "count": { "command": ["echo", "1"] }
+              }
+            }
+          }
+        ]"#,
+        None,
+    );
+    std::os::unix::fs::symlink("sub", repo.path().join("linked")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked baseline directory"]);
+
+    let output = repo.run(&["baseline", "init"]);
+    let path = repo.run(&["baseline", "path"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(stdout(&path), "sub/ratchet.baseline.json\n");
+    let written: Value = serde_json::from_str(&repo.read("sub/ratchet.baseline.json"))
+        .expect("the baseline is written behind the link");
+    assert_eq!(written["rules"]["a"]["value"], 1);
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("linked"))
+            .expect("the link remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(repo.status(), "?? sub/\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn baseline_writer_rolls_back_resolved_directories_when_a_later_creation_fails() {
+    let too_long = "x".repeat(300);
+    let repo = Repo::new(
+        &format!(
+            r#"[
+              {{
+                "baseline": "linked/ok/{too_long}/ratchet.baseline.json",
+                "rules": {{
+                  "a": {{
+                    "class": "c",
+                    "incident": "i",
+                    "unit": "u",
+                    "direction": "ceiling",
+                    "count": {{ "command": ["echo", "1"] }}
+                  }}
+                }}
+              }}
+            ]"#
+        ),
+        None,
+    );
+    std::os::unix::fs::symlink("sub", repo.path().join("linked")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked baseline directory"]);
+
+    let output = repo.run(&["baseline", "init"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains(&format!(
+            "cannot create the baseline directory sub/ok/{too_long}"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("working tree was modified"), "{text}");
+    assert!(
+        !repo.path().join("sub").exists(),
+        "directories from the failed attempt were left behind"
+    );
+    assert_eq!(
+        repo.status(),
+        "",
+        "the failed baseline write changed the tree"
+    );
+}
+
 #[test]
 fn baseline_path_of_a_javascript_config_names_its_baseline() {
     if !node_available() {
@@ -5645,6 +5735,143 @@ fn the_update_writes_a_snapshot_that_is_not_committed_yet() {
     assert_eq!(repo.read("snapshots/benchmark.txt"), "100 ops/s\n");
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(repo.status(), "?? snapshots/\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_update_creates_a_missing_resolved_directory_behind_a_link() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "docs/benchmark.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked snapshot directory"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("sub/benchmark.txt"), "100 ops/s\n");
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("docs"))
+            .expect("the link remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(repo.status(), "?? sub/\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_restore_removes_a_directory_created_behind_a_missing_link_target() {
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "docs/benchmark.txt",
+        ),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        "#!/bin/sh\nmkdir -p sub\nprintf 'side effect\\n' > docs/benchmark.txt\n\
+         printf '100 ops/s\\n' > \"$1\"\n",
+    );
+    std::os::unix::fs::symlink("sub", repo.path().join("docs")).expect("the link is made");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "linked snapshot directory"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        !repo.path().join("sub").exists(),
+        "the resolved directory created by the command was left behind"
+    );
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("docs"))
+            .expect("the link remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(repo.status(), "", "the verify run changed the working tree");
+}
+
+#[test]
+fn verify_update_creates_the_resolved_snapshot_without_a_traversal_directory() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "a/../snapshot.txt"),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("snapshot.txt"), "100 ops/s\n");
+    assert!(
+        !repo.path().join("a").exists(),
+        "the traversal directory was created unnecessarily"
+    );
+    assert!(repo.path().is_dir(), "the repository root was removed");
+}
+
+#[test]
+fn a_snapshot_that_resolves_to_the_repository_root_is_refused_without_changes() {
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "a/.."),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("the snapshot a/.. is a directory, not a file"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(repo.path().is_dir(), "the repository root was removed");
+    assert!(
+        !repo.path().join("a").exists(),
+        "the traversal directory was left behind"
+    );
+    assert_eq!(repo.status(), "", "the refused update changed the tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_update_rolls_back_directories_when_a_later_creation_fails() {
+    let too_long = "x".repeat(300);
+    let snapshot = format!("ok/{too_long}/snapshot.txt");
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], &snapshot),
+        None,
+    );
+    repo.write("bench.sh", "#!/bin/sh\nprintf '100 ops/s\\n'\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "command"]);
+
+    let output = repo.run(&["verify", "--update"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("cannot create the snapshot directory ok/"),
+        "{text}"
+    );
+    assert!(!text.contains("working tree was modified"), "{text}");
+    assert!(
+        !repo.path().join("ok").exists(),
+        "the earlier directory was left behind"
+    );
+    assert_eq!(repo.status(), "", "the failed update changed the tree");
 }
 
 #[test]

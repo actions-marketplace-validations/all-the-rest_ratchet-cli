@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -129,18 +129,17 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
         // The snapshot lies inside the repository root: a path that points
         // outside it would let the engine write outside the tree it owns.
         let subject = format!("the check {}: the snapshot {}", entry.name, entry.snapshot);
-        if let Err(refusal) = path::inside_repository(options.root, &entry.snapshot) {
-            return Err(Error::new(
-                refusal.message(&subject, "must lie inside the repository root"),
-            ));
-        }
+        let resolved =
+            path::inside_repository(options.root, &entry.snapshot).map_err(|refusal| {
+                Error::new(refusal.message(&subject, "must lie inside the repository root"))
+            })?;
         if let Some(filter) = options.name {
             if filter != entry.name {
                 continue;
             }
         }
         selected += 1;
-        let result = run_one(entry, git, options, &mut outcome.debug)?;
+        let result = run_one(entry, &resolved, git, options, &mut outcome.debug)?;
         outcome.entries.push(result);
     }
 
@@ -156,6 +155,7 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
 /// Runs one pre-release check.
 fn run_one(
     entry: &Verify,
+    resolved: &Path,
     git: &Git,
     options: &Options,
     debug: &mut Vec<String>,
@@ -182,13 +182,23 @@ fn run_one(
                 "the check {name}: the snapshot {display} is a directory, not a file"
             )));
         }
+    } else if let Ok(metadata) = fs::symlink_metadata(resolved) {
+        // The named path can be unwalkable even though its resolved target
+        // exists (for example `a/..` when `a` is missing). A directory at the
+        // resolved file position is still not a snapshot file.
+        if metadata.is_dir() {
+            return Err(Error::new(format!(
+                "the check {name}: the snapshot {display} is a directory, not a file"
+            )));
+        }
     }
 
     // The snapshot is the one file the engine owns: its bytes, its mode and
     // its time are restored after the command, whatever the command did to
     // it.  A command that writes elsewhere in the tree is the command's
     // doing — the engine cannot undo that.
-    let mut guard = Guard::take(&snapshot)
+    let created = command_directories(root, &entry.snapshot, resolved);
+    let mut guard = Guard::take(resolved, root, created)
         .map_err(|error| Error::new(format!("the check {name}: cannot read {display}: {error}")))?;
 
     // The marker: the file is touched with an old time, so that the engine
@@ -231,7 +241,7 @@ fn run_one(
     // is machine-written, never hand-edited (SPEC §15).  The check stays
     // **failed**: the committed snapshot is still stale until the file is
     // committed — the same rule the drift gate follows (SPEC §7).
-    if options.update && write_snapshot(name, root, &snapshot, &produced)? {
+    if options.update && write_snapshot(name, root, &display, resolved, &produced)? {
         detail = Some(match status {
             VerifyStatus::Drift => "the snapshot was written to the working tree; commit it — \
                  the committed snapshot is still stale"
@@ -439,22 +449,77 @@ fn compare(
 /// Returns true when the file was written: a snapshot that already holds the
 /// produced bytes is left alone, and a check that is in sync does not touch
 /// the tree.
-fn write_snapshot(name: &str, root: &Path, target: &Path, produced: &[u8]) -> Result<bool, Error> {
-    let display = path::display(Some(root), target);
+fn write_snapshot(
+    name: &str,
+    root: &Path,
+    display: &str,
+    target: &Path,
+    produced: &[u8],
+) -> Result<bool, Error> {
     if let Ok(current) = fs::read(target) {
         if current == produced {
             return Ok(false);
         }
     }
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            Error::new(format!("the check {name}: cannot write {display}: {error}"))
+        fsutil::create_directories(parent).map_err(|error| {
+            let directory = path::display(Some(root), &error.directory);
+            let rollback = error.rollback_message(|path| path::display(Some(root), path));
+            Error::new(format!(
+                "the check {name}: cannot create the snapshot directory {directory}: {}{rollback}",
+                error.cause
+            ))
         })?;
     }
     fs::write(target, produced).map_err(|error| {
         Error::new(format!("the check {name}: cannot write {display}: {error}"))
     })?;
     Ok(true)
+}
+
+/// Directories the command could have created along the snapshot's named
+/// traversal or at the resolved target. Paths are ordered deepest-first for
+/// removal, and paths behind a link are taken from the resolved target only.
+fn command_directories(root: &Path, relative: &str, resolved: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(parent) = resolved.parent() {
+        directories.extend(fsutil::missing_directories(parent));
+    }
+
+    let components: Vec<_> = Path::new(relative).components().collect();
+    let mut prefix = PathBuf::new();
+    let mut through_link = false;
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Normal(name) => {
+                prefix.push(name);
+                if index + 1 < components.len() {
+                    let directory = root.join(&prefix);
+                    if path::is_link(&directory) {
+                        through_link = true;
+                    }
+                    if !through_link && !directory.is_dir() {
+                        directories.extend(fsutil::missing_directories(&directory));
+                    }
+                }
+            }
+            Component::ParentDir => {
+                prefix.pop();
+            }
+            Component::CurDir => {}
+            _ => {}
+        }
+    }
+
+    directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    directories.dedup();
+    directories
 }
 
 /// The state of the snapshot file: its bytes, its mode, its time and its
@@ -500,6 +565,8 @@ impl State {
 struct Guard {
     /// The path of the snapshot.
     target: PathBuf,
+    /// The repository root, used to keep cleanup errors repository-relative.
+    root: PathBuf,
     /// The state of the file before the command ran.
     before: State,
     /// The time the engine touched the file with, if it touched it.
@@ -510,7 +577,7 @@ struct Guard {
 
 impl Guard {
     /// Takes the snapshot of `target`.
-    fn take(target: &Path) -> io::Result<Self> {
+    fn take(target: &Path, root: &Path, created: Vec<PathBuf>) -> io::Result<Self> {
         let content = match fs::read(target) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -527,9 +594,10 @@ impl Guard {
         };
         Ok(Guard {
             target: target.to_path_buf(),
+            root: root.to_path_buf(),
             before,
             marker: None,
-            created: fsutil::created_directories(target),
+            created,
         })
     }
 
@@ -555,45 +623,52 @@ impl Guard {
     /// Restores the snapshot and verifies the restore.
     fn restore(&self) -> Result<(), String> {
         let after = State::read(&self.target);
-        if !self.was_written(&after) {
+        let restored = if !self.was_written(&after) {
             // The command left the file alone: only the marker has to go.
             self.restore_time(&after);
-            self.remove_created_directories();
-            return Ok(());
-        }
-        let restored = match &self.before.content {
-            Some(content) => {
-                fsutil::write_atomic(
-                    &self.target,
-                    content,
-                    self.before.mode,
-                    self.before.modified,
-                )
-                .map_err(|error| error.to_string())?;
-                let read = fs::read(&self.target).map_err(|error| error.to_string())?;
-                if &read != content {
-                    return Err("the bytes differ from the snapshot".to_string());
-                }
-                if let Some(mode) = self.before.mode {
-                    let metadata = fs::metadata(&self.target).map_err(|error| error.to_string())?;
-                    if fsutil::mode_of(&metadata) != Some(mode) {
-                        return Err("the mode differs from the snapshot".to_string());
+            Ok(())
+        } else {
+            match &self.before.content {
+                Some(content) => (|| {
+                    fsutil::write_atomic(
+                        &self.target,
+                        content,
+                        self.before.mode,
+                        self.before.modified,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let read = fs::read(&self.target).map_err(|error| error.to_string())?;
+                    if &read != content {
+                        return Err("the bytes differ from the snapshot".to_string());
                     }
-                }
-                Ok(())
-            }
-            None => {
-                // The file did not exist before: the command created it.
-                if fs::symlink_metadata(&self.target).is_ok() {
-                    fs::remove_file(&self.target).map_err(|error| error.to_string())?;
-                }
-                Ok(())
+                    if let Some(mode) = self.before.mode {
+                        let metadata =
+                            fs::metadata(&self.target).map_err(|error| error.to_string())?;
+                        if fsutil::mode_of(&metadata) != Some(mode) {
+                            return Err("the mode differs from the snapshot".to_string());
+                        }
+                    }
+                    Ok(())
+                })(),
+                None => (|| {
+                    // The file did not exist before: the command created it.
+                    if fs::symlink_metadata(&self.target).is_ok() {
+                        fs::remove_file(&self.target).map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                })(),
             }
         };
+
         // The directories the command created are removed on every path: an
         // empty directory left behind is a change of the tree.
-        self.remove_created_directories();
-        restored
+        let removed = self.remove_created_directories();
+        match (restored, removed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(restore), Ok(())) => Err(restore),
+            (Ok(()), Err(remove)) => Err(remove),
+            (Err(restore), Err(remove)) => Err(format!("{restore}; {remove}")),
+        }
     }
 
     /// True when the command wrote the file.
@@ -640,7 +715,18 @@ impl Guard {
     }
 
     /// Removes the directories the command created and left empty.
-    fn remove_created_directories(&self) {
-        fsutil::remove_empty_directories(&self.created);
+    fn remove_created_directories(&self) -> Result<(), String> {
+        let failures = fsutil::remove_empty_directories(&self.created);
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let failures = failures
+            .iter()
+            .map(|(directory, error)| {
+                format!("{}: {error}", path::display(Some(&self.root), directory))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("could not remove the directory {failures}"))
     }
 }

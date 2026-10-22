@@ -139,17 +139,6 @@ pub fn inode_of(_metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
-/// The directories that do not exist yet below the target.
-///
-/// The list is ordered from the deepest directory to the shallowest one: an
-/// empty parent can only be removed after its child is gone.
-pub fn created_directories(target: &Path) -> Vec<PathBuf> {
-    match target.parent() {
-        Some(parent) => missing_directories(parent),
-        None => Vec::new(),
-    }
-}
-
 /// The directories that do not exist yet, from `directory` up to the first one
 /// that exists.
 ///
@@ -173,21 +162,106 @@ pub fn missing_directories(directory: &Path) -> Vec<PathBuf> {
     missing
 }
 
+/// A directory that could not be created, including any directories that
+/// could not be removed while rolling back the attempt.
+#[derive(Debug)]
+pub struct DirectoryCreationError {
+    /// The directory whose creation failed.
+    pub directory: PathBuf,
+    /// The cause of the creation failure.
+    pub cause: io::Error,
+    /// Directories created during this attempt that rollback could not remove.
+    pub rollback: Vec<(PathBuf, io::Error)>,
+}
+
+impl DirectoryCreationError {
+    /// A deterministic, caller-formatted description of any changes rollback
+    /// could not undo.
+    pub fn rollback_message(&self, display: impl Fn(&Path) -> String) -> String {
+        if self.rollback.is_empty() {
+            return String::new();
+        }
+
+        let failures = self
+            .rollback
+            .iter()
+            .map(|(directory, error)| format!("{}: {error}", display(directory)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("; rollback could not remove {failures} — the working tree was modified")
+    }
+}
+
+/// Creates a directory and its missing parents one at a time.
+///
+/// Only directories successfully created by this attempt are returned, in
+/// deepest-first order so they can be removed safely. If any later creation
+/// fails, the new directories are removed in that same order. A rollback
+/// failure is retained for the caller to report.
+pub fn create_directories(directory: &Path) -> Result<Vec<PathBuf>, DirectoryCreationError> {
+    create_directories_with(directory, |path| fs::create_dir(path))
+}
+
+fn create_directories_with<F>(
+    directory: &Path,
+    mut create: F,
+) -> Result<Vec<PathBuf>, DirectoryCreationError>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    let mut created = Vec::new();
+    for candidate in missing_directories(directory).into_iter().rev() {
+        if let Err(cause) = create(&candidate) {
+            let rollback = rollback_directories(&created);
+            return Err(DirectoryCreationError {
+                directory: candidate,
+                cause,
+                rollback,
+            });
+        }
+        created.push(candidate);
+    }
+
+    created.reverse();
+    Ok(created)
+}
+
+fn rollback_directories(created: &[PathBuf]) -> Vec<(PathBuf, io::Error)> {
+    let mut failures = Vec::new();
+    for directory in created.iter().rev() {
+        if let Err(error) = fs::remove_dir(directory) {
+            if error.kind() != io::ErrorKind::NotFound {
+                failures.push((directory.clone(), error));
+            }
+        }
+    }
+    failures
+}
+
 /// Removes the directories that are empty.
 ///
 /// A directory that still holds something was not left behind by the command
 /// alone — it is not the engine's to remove.
-pub fn remove_empty_directories(directories: &[PathBuf]) {
+pub fn remove_empty_directories(directories: &[PathBuf]) -> Vec<(PathBuf, io::Error)> {
+    let mut failures = Vec::new();
     for directory in directories {
         match fs::read_dir(directory) {
-            Ok(mut entries) => {
-                if entries.next().is_none() {
-                    let _ = fs::remove_dir(directory);
+            Ok(mut entries) => match entries.next() {
+                None => {
+                    if let Err(error) = fs::remove_dir(directory) {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            failures.push((directory.clone(), error));
+                        }
+                    }
                 }
-            }
-            Err(_) => continue,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => failures.push((directory.clone(), error)),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push((directory.clone(), error)),
         }
     }
+    failures
 }
 
 /// The mode of a file, on the platforms that have one.
@@ -214,4 +288,57 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 #[cfg(not(unix))]
 pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_directory_chain_rolls_back_every_directory_it_created() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let too_long = "x".repeat(300);
+        let target = root.path().join("ok").join(too_long);
+
+        let error = create_directories(&target).expect_err("the component exceeds NAME_MAX");
+
+        assert!(error.rollback.is_empty(), "rollback succeeded: {error:?}");
+        assert!(
+            !root.path().join("ok").exists(),
+            "the earlier directory was left behind"
+        );
+    }
+
+    #[test]
+    fn a_failed_rollback_names_the_directory_left_behind() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let target = root.path().join("ok").join("later");
+        let mut calls = 0;
+
+        let error = create_directories_with(&target, |directory| {
+            calls += 1;
+            if calls == 1 {
+                fs::create_dir(directory)?;
+                fs::write(directory.join("kept.txt"), "external change")?;
+                Ok(())
+            } else {
+                Err(io::Error::other("injected creation failure"))
+            }
+        })
+        .expect_err("the second creation fails");
+
+        assert_eq!(error.directory, target);
+        assert_eq!(error.rollback.len(), 1);
+        assert_eq!(error.rollback[0].0, root.path().join("ok"));
+        let message = error.rollback_message(|path| {
+            path.strip_prefix(root.path())
+                .expect("the path is under the temp root")
+                .display()
+                .to_string()
+        });
+        assert!(message.contains("ok"), "{message}");
+        assert!(message.contains("working tree was modified"), "{message}");
+        assert!(root.path().join("ok/kept.txt").exists());
+    }
 }

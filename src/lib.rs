@@ -1223,13 +1223,13 @@ fn load_context(cli: &Cli, cwd: &Path) -> Result<Context, Error> {
     // The baseline has to be comparable with its committed version, and that
     // only works inside the repository root (SPEC 2).  The check resolves the
     // path — a link cannot carry it out of the root.
-    if let Err(refusal) = path::inside_root(&root, &config_dir, &baseline_rel) {
-        return Err(Error::new(format!(
-            "config error at baseline: {}",
-            refusal.message("the baseline", "must be inside the repository root")
-        )));
-    }
-    let baseline_path = path::normalize(&config_dir.join(&baseline_rel));
+    let baseline_path =
+        path::inside_root(&root, &config_dir, &baseline_rel).map_err(|refusal| {
+            Error::new(format!(
+                "config error at baseline: {}",
+                refusal.message("the baseline", "must be inside the repository root")
+            ))
+        })?;
 
     let baseline_rel = path::relative_to(&root, &baseline_path);
 

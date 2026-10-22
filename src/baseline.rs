@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fsutil;
+
 /// The baseline file format version.
 pub const BASELINE_VERSION: u32 = 1;
 
@@ -95,8 +97,15 @@ impl Baseline {
         let label = crate::path::display(root, path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| BaselineError {
-                    message: format!("cannot create the baseline directory: {e}"),
+                fsutil::create_directories(parent).map_err(|error| {
+                    let directory = crate::path::display(root, &error.directory);
+                    let rollback = error.rollback_message(|path| crate::path::display(root, path));
+                    BaselineError {
+                        message: format!(
+                            "cannot create the baseline directory {directory}: {}{rollback}",
+                            error.cause
+                        ),
+                    }
                 })?;
             }
         }

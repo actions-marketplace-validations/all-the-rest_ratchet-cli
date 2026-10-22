@@ -585,6 +585,13 @@ gate follows. A snapshot outside the repository root is refused — and the
 refusal holds for a path that leaves the root through a symbolic link, so
 `--update` cannot write outside the tree.
 
+If its parent directory is missing, `--update` creates it at the snapshot's
+resolved path, so an in-root link to a missing directory works. The command's
+restore tracks missing directories at that resolved location and removes those
+it finds empty. Parent creation is one directory at a time and rolls back
+directories created by a failed attempt; if rollback leaves a directory
+behind, the error names it and says that the working tree was modified.
+
 The engine does not modify the tree: the command writes into a temporary
 directory, and the snapshot — the one file the engine owns — is restored
 afterwards, byte-, mode- **and** time-identical. The engine touches the file
@@ -639,6 +646,12 @@ file URL. The failure is closed and the error names the cause; use
 
 `ratchet.baseline.json` is written by the tool and never hand-edited. The
 rules are sorted by id, so the file is a stable diff.
+
+When a baseline's parent directory is missing, the writer creates it at the
+path the baseline resolves to — including behind an in-root directory link.
+Directories are created one at a time; if a later creation fails, only the
+directories created by that attempt are rolled back. An unsuccessful rollback
+names the directory left behind and says that the working tree was modified.
 
 ```json
 {

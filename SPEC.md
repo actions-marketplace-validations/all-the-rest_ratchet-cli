@@ -306,6 +306,14 @@ failure, not a pass — the rule that would have run is not silently skipped.
   the baseline file carries it.
 * Rules are sorted by id — the file is a stable diff.
 
+The writer creates a missing parent directory at the path the baseline
+**resolves to** (§2.1), not at a name that happens to lead there through a
+link. It creates missing directories one at a time and tracks only those it
+created. If a later creation fails, those directories are removed in reverse
+order. A rollback failure names every directory left behind and says that the
+working tree was modified; a failed creation that rolls back cleanly leaves no
+directories behind. The error names the directory whose creation failed.
+
 ## 5. Commands
 
 ```
@@ -995,7 +1003,18 @@ file — the snapshot — and it gives it back unchanged:
 3. run the command;
 4. restore: the bytes, the mode **and the time** — and **verify** the
    restore;
-5. a directory the command created and left empty is removed.
+5. a directory the command created and left empty is removed. Directory
+   tracking follows the resolved parent of the snapshot, including when a
+   linked directory leads to a target that did not exist before the command;
+   a link itself and the repository root are never treated as directories to
+   remove.
+
+When `--update` writes a snapshot whose parent does not exist, the missing
+parent directories are created at the snapshot's **resolved** path. They are
+created one at a time, and only directories created by that attempt are
+tracked. If a later creation fails, the attempt rolls those directories back;
+if rollback cannot remove one, the error names what remains and says that the
+working tree was modified.
 
 A command that rewrites the snapshot with the same bytes is detected through
 the marker and restored like any other write. If the restore fails, the run
