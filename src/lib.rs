@@ -23,6 +23,10 @@ pub mod update_check;
 pub mod verify;
 pub mod version;
 
+#[cfg(test)]
+#[path = "../tests/common/tempdir.rs"]
+pub(crate) mod test_tempdir;
+
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;

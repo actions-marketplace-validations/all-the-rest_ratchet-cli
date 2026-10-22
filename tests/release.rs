@@ -3,9 +3,11 @@
 //! The tests run the real binary in a temporary git repository: the version
 //! comes from the history, and the history is what the tests build.
 
+mod common;
+
+use common::TempDir;
 use std::path::Path;
 use std::process::{Command, Output};
-use tempfile::TempDir;
 
 /// A config with the release section and no rule.
 fn config(version: &str) -> String {

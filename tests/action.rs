@@ -5,14 +5,16 @@
 //! binary — the one the test suite built — so the resolution of the baseline
 //! path is the resolution of the binary and not a second implementation.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::TempDir;
 use ratchet::update::{self, Platform, Version};
-use tempfile::TempDir;
 
 /// The root of the crate; the files of the action are read from there.
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");

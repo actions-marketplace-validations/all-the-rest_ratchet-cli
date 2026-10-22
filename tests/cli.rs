@@ -1,10 +1,12 @@
 //! End to end tests: a temporary git repository, the real binary.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::TempDir;
 use serde_json::Value;
-use tempfile::TempDir;
 
 /// The command that runs the binary.
 ///
@@ -1286,7 +1288,7 @@ fn the_arguments_of_a_counter_arrive_verbatim() {
         "argv.sh",
         "#!/bin/sh\nout=\"$1\"\nshift\n: > \"$out\"\nfor arg in \"$@\"; do printf '%s\\0' \"$arg\" >> \"$out\"; done\nprintf '%s' \"$#\"\n",
     );
-    let outside = tempfile::tempdir().expect("a temporary directory");
+    let outside = TempDir::new().expect("a temporary directory");
     let output_file = outside.path().join("argv.bin");
 
     let arguments = vec![
@@ -2856,7 +2858,7 @@ fn a_failing_generator_leaves_no_temporary_directory_behind() {
     repo.git(&["commit", "-q", "-m", "generator"]);
 
     // The engine writes its temporary output into TMPDIR.
-    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let temporary = TempDir::new().expect("a temporary directory");
     let output = binary()
         .arg("check")
         .current_dir(repo.path())
@@ -2902,7 +2904,7 @@ fn a_generator_that_writes_nothing_leaves_no_temporary_directory_behind() {
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "generator"]);
 
-    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let temporary = TempDir::new().expect("a temporary directory");
     let output = binary()
         .arg("check")
         .current_dir(repo.path())
@@ -3123,7 +3125,7 @@ fn the_stylish_output_is_the_documented_one() {
 
 #[test]
 fn a_document_without_an_example_is_an_error() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
+    let directory = TempDir::new().expect("a temporary directory");
     let document = directory.path().join("without-example.md");
     std::fs::write(&document, "# A document\n\nNo example here.\n").expect("the file is written");
 
@@ -3139,7 +3141,7 @@ fn a_document_without_an_example_is_an_error() {
 
 #[test]
 fn a_document_with_two_examples_is_an_error() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
+    let directory = TempDir::new().expect("a temporary directory");
     let document = directory.path().join("two-examples.md");
     std::fs::write(
         &document,
@@ -4128,6 +4130,140 @@ fn the_fix_writes_a_generated_file_that_is_not_committed_yet() {
     let output = repo.run(&["drift", "--format", "json"]);
     let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
     assert_eq!(report["generated"][0]["status"], "new");
+}
+
+#[test]
+fn a_temporary_output_fix_removes_its_traversal_directory_for_a_root_target() {
+    let repo = Repo::new(
+        &generated_config_at("a/../x.md", &["sh", "generate.sh"], Some("--output")),
+        None,
+    );
+    repo.write("generate.sh", "#!/bin/sh\nprintf 'fresh\\n' > \"$2\"\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("x.md"), "fresh\n");
+    assert!(
+        !repo.path().join("a").exists(),
+        "the traversal-only directory was left behind"
+    );
+}
+
+#[test]
+fn an_in_place_fix_keeps_the_resolved_parent_and_removes_traversal_only_dirs() {
+    let repo = Repo::new(
+        &generated_config_at("a/b/../x.md", &["sh", "generate.sh"], None),
+        None,
+    );
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nmkdir -p a/b\nprintf 'fresh\\n' > a/b/../x.md\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("a/x.md"), "fresh\n");
+    assert!(
+        repo.path().join("a").is_dir(),
+        "the resolved target parent was removed"
+    );
+    assert!(
+        !repo.path().join("a/b").exists(),
+        "the traversal-only directory was left behind"
+    );
+}
+
+#[test]
+fn an_in_place_fix_leaves_a_nonempty_traversal_directory_alone() {
+    let repo = Repo::new(
+        &generated_config_at("a/../x.md", &["sh", "generate.sh"], None),
+        None,
+    );
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'fresh\\n' > a/../x.md\nprintf 'keep\\n' > a/side.txt\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(repo.read("x.md"), "fresh\n");
+    assert_eq!(repo.read("a/side.txt"), "keep\n");
+}
+
+#[test]
+fn an_in_place_fix_leaves_an_empty_replacement_traversal_directory_alone() {
+    let repo = Repo::new(
+        &generated_config_at("a/../x.md", &["sh", "generate.sh"], None),
+        None,
+    );
+    // Keep the old directory at another name so its filesystem ID cannot be
+    // reused before cleanup checks the replacement at `a`.
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'fresh\\n' > a/../x.md\nmv a a-original\nmkdir a\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let replacement = repo.path().join("a");
+    assert!(
+        replacement.is_dir(),
+        "the replacement directory was removed"
+    );
+    assert!(
+        std::fs::read_dir(&replacement)
+            .expect("the replacement directory is readable")
+            .next()
+            .is_none(),
+        "the replacement directory is not empty"
+    );
+    let text = stderr(&output);
+    assert!(
+        text.contains("directory identity changed; refusing cleanup"),
+        "{text}"
+    );
+    assert!(text.contains("the working tree was modified"), "{text}");
+    assert!(repo.path().join("a-original").is_dir());
+}
+
+#[test]
+fn an_in_place_fix_reports_traversal_cleanup_failures_as_modified_tree_errors() {
+    let repo = Repo::new(
+        &generated_config_at("a/../x.md", &["sh", "generate.sh"], None),
+        None,
+    );
+    repo.write(
+        "generate.sh",
+        "#!/bin/sh\nprintf 'fresh\\n' > a/../x.md\nrmdir a\nprintf 'replacement' > a\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "generator"]);
+
+    let output = repo.run(&["drift", "--fix"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("could not remove created traversal directories: a"),
+        "{text}"
+    );
+    assert!(text.contains("the working tree was modified"), "{text}");
+    assert!(
+        !text.contains(repo.path().to_str().expect("the root is UTF-8")),
+        "the error contains an absolute path: {text}"
+    );
 }
 
 #[test]
@@ -6517,7 +6653,7 @@ fn a_symlinked_snapshot_is_refused() {
 #[cfg(unix)]
 #[test]
 fn a_snapshot_that_leaves_the_root_through_a_link_is_refused() {
-    let outside = tempfile::tempdir().expect("a temporary directory");
+    let outside = TempDir::new().expect("a temporary directory");
     let repo = Repo::new(
         &verify_config(
             "benchmark",
@@ -6724,7 +6860,6 @@ fn a_drift_gate_creates_the_directory_of_the_generated_file() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     // And the tree is unchanged: the file the generator wrote is gone again.
     assert_eq!(repo.status(), "", "the drift run changed the working tree");
-    // The directory the engine created is gone again, too.
     assert!(
         !repo.path().join("docs").exists(),
         "the directory the engine created was left behind"
@@ -6755,7 +6890,6 @@ fn a_drift_gate_creates_the_directory_a_link_points_at() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     // And the tree is unchanged: the file the generator wrote is gone again.
     assert_eq!(repo.status(), "", "the drift run changed the working tree");
-    // The directory the engine created is gone again, too.
     assert!(
         !repo.path().join("sub").exists(),
         "the directory the engine created was left behind"
@@ -6813,14 +6947,12 @@ fn a_drift_gate_removes_every_directory_it_created() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     // And the tree is unchanged: the file the generator wrote is gone again.
     assert_eq!(repo.status(), "", "the drift run changed the working tree");
-    // Both directories the engine created are gone again — the deeper one
-    // first, so that the shallower one is empty when it is removed.
     assert!(
         !repo.path().join("a").exists(),
         "the directory the engine created was left behind"
     );
     assert!(
-        !repo.path().join("a").join("b").exists(),
+        !repo.path().join("a/b").exists(),
         "the directory the engine created was left behind"
     );
 }
@@ -6895,18 +7027,16 @@ fn a_drift_gate_removes_the_deeper_directory_before_the_shallower_one() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     // And the tree is unchanged: the file the generator wrote is gone again.
     assert_eq!(repo.status(), "", "the drift run changed the working tree");
-    // Every directory the engine created is gone again — the deeper one
-    // first, so that the shallower one is empty when it is removed.
     assert!(
         !repo.path().join("a").exists(),
         "the directory the engine created was left behind"
     );
     assert!(
-        !repo.path().join("a").join("b").exists(),
+        !repo.path().join("a/b").exists(),
         "the directory the engine created was left behind"
     );
     assert!(
-        !repo.path().join("a").join("b").join("c").exists(),
+        !repo.path().join("a/b/c").exists(),
         "the directory the engine created was left behind"
     );
 }

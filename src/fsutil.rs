@@ -297,7 +297,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_directory_chain_rolls_back_every_directory_it_created() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         let too_long = "x".repeat(300);
         let target = root.path().join("ok").join(too_long);
 
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_failed_rollback_names_the_directory_left_behind() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         let target = root.path().join("ok").join("later");
         let mut calls = 0;
 

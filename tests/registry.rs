@@ -5,11 +5,13 @@
 //! file, the baseline from the baseline file, the direction from the rule —
 //! the mechanic of every other counter, unchanged.
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
+use common::TempDir;
 use serde_json::Value;
-use tempfile::TempDir;
 
 /// The command that runs the binary.
 ///

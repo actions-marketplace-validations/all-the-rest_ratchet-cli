@@ -6,11 +6,13 @@
 //! The report runs the **rules** only — the drift gates are gates over the
 //! generated files, and the report is one of them.
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
+use common::TempDir;
 use serde_json::Value;
-use tempfile::TempDir;
 
 /// The command that runs the binary.
 ///

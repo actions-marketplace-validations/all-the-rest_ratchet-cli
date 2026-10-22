@@ -3,6 +3,8 @@
 //! The tests never touch the network: a fake release is served from a local
 //! socket and the endpoints of the binary are pointed at it.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,8 +12,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::thread;
 
+use common::TempDir;
 use ratchet::update::{self, Platform, Version};
-use tempfile::TempDir;
 
 /// The config of the test project: one rule with a counter that always works.
 const CONFIG: &str = r#"[
@@ -166,7 +168,7 @@ fn platform() -> Platform {
 /// The cache of the update check points into a temporary directory: the tests
 /// never touch the cache of the machine that runs them.
 fn run_update(release: &FakeRelease, target: &Path) -> Output {
-    let cache = tempfile::tempdir().expect("a temporary directory");
+    let cache = TempDir::new().expect("a temporary directory");
     Command::new(env!("CARGO_BIN_EXE_ratchet"))
         .arg("update")
         .env("RATCHET_UPDATE_API_BASE", &release.api_base)

@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn writes_to_a_temporary_path() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
+        let directory = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         let artifact = directory.path().join("artifact.json");
         fs::write(&artifact, "original").expect("the file is written");
 
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_failing_generator_reports_its_status_and_keeps_its_output() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
+        let directory = crate::test_tempdir::TempDir::new().expect("a temporary directory");
 
         let generator = Generator {
             command: vec![

@@ -885,7 +885,7 @@ mod tests {
         // the restore cannot be created.  The restore must **say** so — a
         // swallowed restore error is a mutated tree that nobody was told
         // about (SPEC §7).
-        let directory = tempfile::TempDir::new().expect("a temporary directory");
+        let directory = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         let file = directory.path().join("Cargo.toml");
         std::fs::write(&file, "[package]\n").expect("the file is written");
 

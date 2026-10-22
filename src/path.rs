@@ -290,7 +290,7 @@ mod tests {
         // The helper hands the resolved path to the caller: the place the
         // operating system puts the file — the place a directory of the file
         // has to be created.
-        let root = tempfile::TempDir::new().expect("a temporary directory");
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         std::os::unix::fs::symlink("sub", root.path().join("docs")).expect("the link is made");
 
         let resolved = inside_repository(root.path(), "docs/generated.md")

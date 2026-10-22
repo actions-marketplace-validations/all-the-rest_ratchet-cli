@@ -595,10 +595,39 @@ The generator must be able to write to a **given path**:
      cannot be created is an **operational error** that names the directory
      and the cause: the failure is the engine's, and the user is not sent to
      the generator. Directories are created one at a time and tracked as they
-     succeed. If a later creation fails, the engine rolls back every
-     directory from that attempt; if rollback cannot remove one or more, the
-     error names every directory left behind and says that the working tree
-     was modified;
+     succeed. On Unix, identity is the device and inode from a retained open
+     directory handle. Directory creation itself returns no handle: POSIX
+     `mkdirat` returns only status, and Linux rejects `open` with
+     `O_CREAT | O_DIRECTORY`. Opening the created pathname is therefore a
+     separate operation, and a replacement between creation and opening may
+     be recorded as the candidate. This create-to-open race is accepted. On
+     Windows, identity is the volume serial number and full 128-bit file ID
+     from the high-resolution file-ID API; the legacy
+     64-bit file index is never used because it can collide on filesystems
+     such as ReFS. The high-resolution Windows ID is captured through the
+     pathname rather than from the retained handle, leaving a narrow race
+     between checking/opening the directory and capturing the pathname
+     identity: a replacement in that interval may be recorded as the
+     candidate.
+     This race is accepted, in addition to the final check-to-remove race
+     below. The retained handle helps prevent identity reuse where possible.
+     If the filesystem cannot provide a high-resolution ID, that candidate
+     is left in place and reported as an operational error; earlier candidates
+     from the attempt are rolled back when they can still be identified.
+     Existing directories remain usable. Each candidate is checked through
+     the path authority before creation; after creation, its filesystem
+     identity and containment are checked again. If post-creation validation
+     fails, the candidate is left in place and named in the operational error.
+     If a later creation fails, the engine attempts rollback only for paths
+     it can still identify by their captured identity. Immediately before
+     removing a path, it verifies both that the pathname still matches the
+     identity captured for that candidate and that it still resolves inside
+     the repository root. If identity cannot be established, has changed, or
+     containment fails, cleanup leaves the pathname alone and reports the
+     failure. Removal uses the pathname. Portable APIs do not make the final
+     identity-and-containment check and removal atomic, so a replacement in
+     that narrow check-to-remove interval may still be removed. This race is
+     accepted;
   3. run the generator;
   4. read the produced bytes;
   5. restore: write the snapshot to a **temporary file in the same directory**,
@@ -611,14 +640,24 @@ The generator must be able to write to a **given path**:
      **behind** a link, so the file behind the link is the one that changes —
      a file created behind a **dangling** link is not removed, which is why a
      dangling link is refused;
-  6. the directories of step 2, which the engine created for the file, are
-     removed — when they are **empty**. Cleanup is attempted even if file or
-     link restoration failed. A directory that still holds something is not
-     the engine's to remove: it was not left behind by the engine alone. A
-     cleanup failure is an operational error that names every directory it
-     could not remove relative to the repository root;
-  7. **verify** the restore (read the bytes back and compare), when file
-     restoration and cleanup succeeded.
+  6. in an ordinary check (without `--fix`), the engine attempts to remove the
+     empty directories of step 2. A directory that still holds something is
+     not the engine's to remove: it was not left behind by the engine alone.
+     Cleanup is attempted even if file or link restoration failed. Immediately
+     before each removal, the engine verifies that the pathname still matches
+     the identity captured for the created directory and still resolves
+     inside the repository root. If identity differs, cannot be established,
+     or containment fails, it leaves the path and reports an operational
+     error.
+     Removal is pathname-based, so the check and removal have a narrow,
+     unavoidable TOCTOU race: a replacement in that interval may be removed.
+     This race is accepted after the complete identity-and-containment check;
+     the operation is not an atomic identity-bound deletion. A cleanup error
+     names every directory it could not remove
+     relative to the repository root and says that the working tree was
+     modified;
+  7. in an ordinary check, **verify** the restore (read the bytes back and
+     compare), when file restoration and cleanup succeeded.
 
   If the restore fails, the run ends with an **operational error** that names
   the file and says that the working tree was modified. A swallowed restore
@@ -642,7 +681,26 @@ did. The gate stays **failed**: the committed file is still stale — the gate
 measures the **committed** artifact, and it only turns green once the fix is
 committed. A run with `--fix` in a pipeline is therefore never green against a
 stale HEAD; that is deliberate, not a bug. `--fix` touches **only** the
-generated files, never hand-written text.
+content of generated files, never hand-written text. In either generator mode,
+after the content has been fixed, the engine attempts to remove empty,
+engine-created directories used only to traverse the named path; the resolved
+target's parent directories are retained. Pre-existing and non-empty
+directories are never removed. Immediately before each pathname removal the
+engine verifies that the path still matches the identity captured for the
+created directory and still resolves inside the repository root. If identity
+differs, cannot be established, or containment fails, the path is left alone
+and the run reports an operational error. The identity-and-containment check
+and pathname removal cannot be made atomic with the portable APIs used here:
+a replacement in the narrow check-to-remove interval may still be removed.
+This TOCTOU race is accepted; cleanup is not claimed to be atomic
+identity-bound deletion. Normal cleanup succeeds when the path is still the
+tracked empty directory. A cleanup error names each path relative to the
+repository root and says that the working tree was modified. The same
+behavior applies to ordinary check restore cleanup above. Unix create-to-open
+identity capture and Windows pathname identity capture have the accepted
+races described above. Windows uses the high-resolution 128-bit file ID, not
+the legacy 64-bit index; if that ID is unavailable, the newly created
+candidate is left in place and the run reports an operational error.
 
 ## 8. Git
 

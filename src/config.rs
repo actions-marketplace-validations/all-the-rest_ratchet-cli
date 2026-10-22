@@ -1541,7 +1541,7 @@ mod tests {
         }
         // `#`, `?` and `%` are not valid in a URL specifier: the bridge has to
         // resolve the path as a file URL.
-        let directory = tempfile::tempdir().expect("a temporary directory");
+        let directory = crate::test_tempdir::TempDir::new().expect("a temporary directory");
         let path = directory.path().join("ratchet#config?100%.mjs");
         std::fs::write(
             &path,
