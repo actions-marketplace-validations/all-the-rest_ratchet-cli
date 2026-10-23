@@ -527,6 +527,7 @@ struct CreatedDirectory {
 }
 
 /// A directory the engine could not create or safely identify.
+#[derive(Debug)]
 struct DirectoryError {
     /// The directory the engine tried to create.
     directory: PathBuf,
