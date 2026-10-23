@@ -486,7 +486,8 @@ impl DirectoryIdentity {
         #[cfg(windows)]
         {
             let _ = handle;
-            high_resolution_windows_identity(file_id::get_high_res_file_id(path)?)
+            let (volume, file) = fsutil::high_resolution_identity(path)?;
+            Ok(Self::Windows { volume, file })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -497,23 +498,6 @@ impl DirectoryIdentity {
                 "filesystem directory identity is unavailable on this platform",
             ))
         }
-    }
-}
-
-#[cfg(windows)]
-fn high_resolution_windows_identity(identity: file_id::FileId) -> io::Result<DirectoryIdentity> {
-    match identity {
-        file_id::FileId::HighRes {
-            volume_serial_number,
-            file_id,
-        } => Ok(DirectoryIdentity::Windows {
-            volume: volume_serial_number,
-            file: file_id,
-        }),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the filesystem did not provide a high-resolution file identity",
-        )),
     }
 }
 
@@ -1729,21 +1713,6 @@ mod tests {
         assert!(candidate.is_dir(), "the directory was not created");
         assert!(remove_created_empty_directories(root.path(), &created).is_empty());
         assert!(!candidate.exists(), "the tracked directory was not removed");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn legacy_windows_file_ids_are_not_accepted_for_cleanup() {
-        let error = high_resolution_windows_identity(file_id::FileId::LowRes {
-            volume_serial_number: 7,
-            file_index: 11,
-        })
-        .expect_err("the low-resolution ID can collide on ReFS");
-
-        assert!(
-            error.to_string().contains("high-resolution file identity"),
-            "{error}"
-        );
     }
 
     #[cfg(unix)]

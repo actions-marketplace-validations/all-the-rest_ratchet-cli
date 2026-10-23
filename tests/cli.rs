@@ -6146,6 +6146,59 @@ fn verify_traversal_cleanup_refuses_a_parent_replaced_with_an_outside_link() {
     assert_eq!(repo.read("sub-original/snapshot.txt"), "command-modified\n");
 }
 
+#[cfg(windows)]
+#[test]
+fn verify_refuses_a_junction_to_an_outside_directory_in_a_traversal_path() {
+    let outside = Outside::new("verify-windows-traversal-junction");
+    std::fs::create_dir(outside.file("x")).expect("the outside x directory is created");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["cmd", "/c", "bench.bat"],
+            "sub/x/../snapshot.txt",
+        ),
+        None,
+    );
+    // The command replaces the missing traversal directory with a junction to
+    // outside the repository. Replacing the tracked parent itself is refused by
+    // the retained no-delete handles, so the junction is the reachable attack.
+    repo.write(
+        "bench.bat",
+        &format!(
+            "@echo off\r\necho produced> \"%~1\"\r\nmklink /J \"sub\\x\" \"{}\" >nul\r\n",
+            outside.path().display()
+        ),
+    );
+    repo.write("sub/snapshot.txt", "committed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains("the working tree may be modified"),
+        "the refusal is reported as an operational failure: {message}"
+    );
+    assert!(
+        outside.file("x").is_dir(),
+        "the outside directory referenced by the junction was removed"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.file("x"))
+            .expect("outside/x remains readable")
+            .count(),
+        0,
+        "outside/x is no longer empty"
+    );
+    assert!(
+        !outside.file("snapshot.txt").exists(),
+        "the restore wrote the snapshot outside the repository"
+    );
+    assert_eq!(repo.read("sub/snapshot.txt"), "committed\n");
+}
+
 #[test]
 fn verify_update_creates_the_resolved_snapshot_without_a_traversal_directory() {
     let repo = Repo::new(

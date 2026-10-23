@@ -17,8 +17,20 @@ outside that vocabulary is a hard error, never a fallback.
 
 ### Follow-ups from the approved Verify-containment review
 
-Logged 2026-10-23, from the independent review that approved PR #1. None of
-these is release-blocking: the review verdict was APPROVED, and the four
+Logged 2026-10-23, from the independent review that approved PR #1.
+
+**Status 2026-10-23.** All four are addressed on branch
+`fix/verify-review-followups`: the SPEC wording now describes the refusal of a
+reparse point in the resolved parent chain, at the target and at the temporary
+restore file; the Windows high-resolution identity helper lives once in
+`fsutil` and carries the low-resolution refusal test; the cleanup heading is set
+once; and the Windows reparse test uses a privilege-free junction while a
+Windows regression covers a junction to an outside directory in a traversal
+path. Independent review of these follow-ups is still pending — the free
+DeepSeek subagent hit its usage limit, and the release waits for it. The
+original four findings follow.
+
+None of these is release-blocking: the review verdict was APPROVED, and the four
 security requirements of the Verify containment work are covered by code and
 regressions.
 
