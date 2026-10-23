@@ -1292,7 +1292,34 @@ action and in the release workflow. A test substitutes the template of the
 action and compares the result with the function of the binary for every
 platform: a renamed asset fails the test instead of the action.
 
+### The Marketplace listing
+
+The action is listed in the **GitHub Marketplace** under the name
+`@all-the-rest/ratchet-cli`. The name in `action.yml` must be **unique** across
+the Marketplace: a plain `ratchet` is refused because it collides with an
+existing action, user or organisation name, and the release form reports that
+before it publishes.
+
+The listing is attached to a **release**, not to the repository, and only a
+human can create it: the release form carries the checkbox *Publish this Action
+to the GitHub Marketplace* and the once-only agreement to the Marketplace
+developer terms. A workflow cannot tick that box — so the release workflow
+creates a **draft** with the assets, and publishing the draft is the click that
+also publishes the listing. Without that click the release stays invisible in
+the Marketplace, which is silent: the tag, the action and the binary all work.
+
+The click is owed **per release**: a new release that is published without the
+checkbox leaves the Marketplace on the older version. The draft is therefore the
+normal state of a release of this repository — `Releases → the draft →
+Publish release` is the last step of a release, not an optional one.
+
 ## The release step
+
+A release of this repository is **two steps**: the tag pushes the release
+workflow, the workflow creates a **draft** release with the assets of the five
+platforms, and the draft is published by hand — that is the click that also
+publishes the Marketplace listing (see [the Marketplace
+listing](#the-marketplace-listing)).
 
 `ratchet release` computes the next version from the commits since the last
 release tag and renders the changelog block of that version. The version and
