@@ -47,6 +47,11 @@ downloads the newest release asset for the platform, verifies the SHA-256
 against `checksums.txt` and replaces the binary. See
 [the self-update](#the-self-update) below.
 
+The **linux binaries are built on Ubuntu 22.04** (glibc 2.35), not on the
+newest runner image: a binary built on 24.04 links glibc 2.39 and refuses to
+start on Debian 12 or Ubuntu 22.04 with `GLIBC_2.39 not found`. The oldest
+supported image sets the floor for every consumer.
+
 ## Usage
 
 ```sh

@@ -772,6 +772,36 @@ fn the_release_covers_every_platform() {
 }
 
 #[test]
+fn the_linux_assets_are_built_on_the_oldest_supported_glibc() {
+    let workflow = workflow();
+    let runners: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- runner: "))
+        .collect();
+    let linux: Vec<&str> = runners
+        .iter()
+        .copied()
+        .filter(|runner| runner.starts_with("ubuntu-"))
+        .collect();
+
+    assert_eq!(
+        linux.len(),
+        2,
+        "the release builds two linux assets: {runners:?}"
+    );
+    for runner in linux {
+        // The binary links against the glibc of the runner it is built on. A
+        // binary built on 24.04 (glibc 2.39) refuses to start on Debian 12 or
+        // Ubuntu 22.04 with "GLIBC_2.39 not found" — the oldest supported
+        // image is the floor for every consumer.
+        assert_eq!(
+            runner, "ubuntu-22.04",
+            "the linux binary would need a newer glibc than the platform it targets"
+        );
+    }
+}
+
+#[test]
 fn the_release_checks_the_tag_against_the_manifest() {
     // The step of the workflow is not read but **executed**: a check that
     // only looks for two words in the file would still pass if the
