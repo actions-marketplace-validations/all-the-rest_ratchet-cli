@@ -14,6 +14,7 @@ pub mod drift;
 pub mod fsutil;
 pub mod generate;
 pub mod git;
+pub mod issues;
 pub mod path;
 pub mod registry;
 pub mod release;

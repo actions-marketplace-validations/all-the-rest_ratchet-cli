@@ -71,11 +71,11 @@ pub struct RuleResult {
     pub detail: Option<String>,
     /// The committed baseline, for the monotonicity statuses.
     pub committed: Option<i64>,
-    /// The findings that count, when the rule counts a findings registry.
+    /// The findings that count, when the rule counts a findings backend.
     ///
     /// They are the findings the count was made of — the report says *which*
     /// findings are open, not only how many (SPEC 14).  They are `None` for
-    /// every rule that does not count a registry.
+    /// every rule that does not count findings.
     pub findings: Option<Vec<Finding>>,
 }
 
