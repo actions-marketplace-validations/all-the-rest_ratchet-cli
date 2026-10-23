@@ -24,6 +24,36 @@ fn path_of(name: &str) -> PathBuf {
     Path::new(ROOT).join(name)
 }
 
+/// A path as the Bash scripts expect to receive it.
+fn bash_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.into_owned()
+    }
+}
+
+/// A path with platform-specific separators normalized for comparison.
+fn normalized_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+/// A path quoted for use as a Bash word.
+fn bash_quote(path: &Path) -> String {
+    format!("'{}'", bash_path(path).replace('\'', "'\\''"))
+}
+
 /// The action itself.
 const ACTION: &str = "action.yml";
 
@@ -434,12 +464,19 @@ struct Install {
     bin: PathBuf,
     /// The file that holds the PATH of the following steps.
     path_file: PathBuf,
+    /// The operating system of the simulated runner.
+    runner_os: String,
 }
 
 impl Install {
     /// The binary that was installed.
     fn binary(&self) -> PathBuf {
-        self.bin.join("ratchet")
+        let executable = if self.runner_os == "Windows" {
+            "ratchet.exe"
+        } else {
+            "ratchet"
+        };
+        self.bin.join(executable)
     }
 
     /// The PATH of the following steps.
@@ -455,7 +492,7 @@ fn run_install(release: &FakeRelease, version: &str, os: &str, arch: &str) -> In
     let path_file = directory.path().join("github-path");
     fs::write(&path_file, "").expect("the path file is written");
     let output = Command::new("bash")
-        .arg(path_of(INSTALL))
+        .arg(bash_path(&path_of(INSTALL)))
         .env("RUNNER_OS", os)
         .env("RUNNER_ARCH", arch)
         .env("RATCHET_VERSION", version)
@@ -469,6 +506,7 @@ fn run_install(release: &FakeRelease, version: &str, os: &str, arch: &str) -> In
         _directory: directory,
         bin: install,
         path_file,
+        runner_os: os.to_string(),
     }
 }
 
@@ -481,9 +519,9 @@ fn stub(directory: &Path, log: &Path) -> PathBuf {
     fs::create_dir_all(&bin).expect("the directory is created");
     let script = format!(
         "#!/usr/bin/env bash\n\
-         printf '%s\\n' \"$*\" >>\"{log}\"\n\
+         printf '%s\\n' \"$*\" >>{log}\n\
          exit \"${{RATCHET_STUB_EXIT:-0}}\"\n",
-        log = log.display()
+        log = bash_quote(log)
     );
     let path = bin.join("ratchet");
     fs::write(&path, script).expect("the stub is written");
@@ -498,8 +536,13 @@ fn stub(directory: &Path, log: &Path) -> PathBuf {
 
 /// The PATH with the given directory in front of it.
 fn path_with(bin: &Path) -> String {
-    let current = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{current}", bin.display())
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin.to_path_buf()];
+    paths.extend(std::env::split_paths(&current));
+    std::env::join_paths(paths)
+        .expect("the PATH can be joined")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The PATH with the **real** binary in front of it.
@@ -511,6 +554,39 @@ fn path_with_the_binary() -> String {
     let binary = Path::new(env!("CARGO_BIN_EXE_ratchet"));
     let directory = binary.parent().expect("the binary has a directory");
     path_with(directory)
+}
+
+#[test]
+fn path_with_uses_the_native_path_list_format() {
+    let bin = PathBuf::from("test-bin");
+    let actual: Vec<PathBuf> = std::env::split_paths(&path_with(&bin)).collect();
+    let mut expected = vec![bin];
+    expected.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn bash_paths_use_forward_slashes_on_windows() {
+    #[cfg(windows)]
+    assert_eq!(
+        bash_path(Path::new(r"D:\runner\work\action\mode.sh")),
+        "D:/runner/work/action/mode.sh"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        bash_path(Path::new("runner/work/action/mode.sh")),
+        "runner/work/action/mode.sh"
+    );
+}
+
+#[test]
+fn bash_quoted_paths_escape_single_quotes() {
+    assert_eq!(
+        bash_quote(Path::new("a path/'quoted'")),
+        r#"'a path/'\''quoted'\'''"#
+    );
 }
 
 /// The arguments the stub recorded.
@@ -585,7 +661,7 @@ fn committed_content(project: &TempDir, path: &str) -> String {
 /// Runs the update mode in a project.
 fn run_update(project: &TempDir, config: &str, reason: &str) -> Output {
     Command::new("bash")
-        .arg(path_of(UPDATE))
+        .arg(bash_path(&path_of(UPDATE)))
         .current_dir(project.path())
         .env("PATH", path_with_the_binary())
         .env("RATCHET_NO_UPDATE_CHECK", "1")
@@ -732,8 +808,10 @@ fn the_install_step_installs_the_binary_on_the_path() {
         fs::read(install.binary()).expect("the binary is installed"),
         b"the binary"
     );
+    let path = normalized_path(&install.path());
+    let bin = bash_path(&install.bin);
     assert!(
-        install.path().contains(&install.bin.display().to_string()),
+        path.contains(&bin),
         "the directory of the binary goes on the PATH: {}",
         install.path()
     );
@@ -886,7 +964,7 @@ fn an_unknown_platform_fails_the_install_step() {
 fn the_mode_check_accepts_the_two_modes() {
     for mode in ["validate", "update"] {
         let output = Command::new("bash")
-            .arg(path_of(MODE))
+            .arg(bash_path(&path_of(MODE)))
             .env("RATCHET_MODE", mode)
             .output()
             .expect("the mode script runs");
@@ -901,7 +979,7 @@ fn the_mode_check_accepts_the_two_modes() {
 #[test]
 fn an_unknown_mode_fails_the_action() {
     let output = Command::new("bash")
-        .arg(path_of(MODE))
+        .arg(bash_path(&path_of(MODE)))
         .env("RATCHET_MODE", "whatever")
         .output()
         .expect("the mode script runs");
@@ -919,10 +997,10 @@ fn a_mode_with_a_quote_does_not_run_a_command() {
     let marker = directory.path().join("INJECTED");
     // The mode of a hostile workflow: it would close the quote and run a
     // command if the mode reached the shell as text.
-    let mode = format!("x\"; touch \"{}\"; #", marker.display());
+    let mode = format!("x\"; touch \"{}\"; #", bash_path(&marker));
 
     let output = Command::new("bash")
-        .arg(path_of(MODE))
+        .arg(bash_path(&path_of(MODE)))
         .current_dir(directory.path())
         .env("RATCHET_MODE", &mode)
         .output()
@@ -1064,7 +1142,7 @@ fn the_validate_mode_runs_the_gates_without_a_reason() {
     let bin = stub(directory.path(), &log);
 
     let output = Command::new("bash")
-        .arg(path_of(VALIDATE))
+        .arg(bash_path(&path_of(VALIDATE)))
         .env("PATH", path_with(&bin))
         .env("RATCHET_CONFIG", "ratchet.config.jsonc")
         .env("RATCHET_TIER", "fast")
@@ -1093,7 +1171,7 @@ fn a_failing_gate_fails_the_validate_mode() {
     let bin = stub(directory.path(), &log);
 
     let output = Command::new("bash")
-        .arg(path_of(VALIDATE))
+        .arg(bash_path(&path_of(VALIDATE)))
         .env("PATH", path_with(&bin))
         .env("RATCHET_CONFIG", "ratchet.config.jsonc")
         .env("RATCHET_STUB_EXIT", "1")
@@ -1387,7 +1465,7 @@ fn the_update_mode_needs_a_reason() {
     );
 
     let output = Command::new("bash")
-        .arg(path_of(UPDATE))
+        .arg(bash_path(&path_of(UPDATE)))
         .current_dir(project.path())
         .env("PATH", path_with_the_binary())
         .env("RATCHET_CONFIG", "ratchet.config.jsonc")
