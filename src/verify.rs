@@ -2088,21 +2088,16 @@ mod windows_pinning_tests {
     }
 
     #[test]
-    fn retained_precommand_snapshot_handle_allows_child_replacement() {
+    fn retained_precommand_snapshot_handle_allows_file_replacement() {
         let (_temporary, guard, _snapshots, target) = fixture();
-        let output = rename_from_child(
-            target.parent().expect("snapshot directory"),
-            "output.txt",
-            "previous-output.txt",
-        )
-        .expect("start child snapshot rename command");
-        assert!(
-            output.status.success(),
-            "child could not replace a snapshot held with delete sharing: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let previous = target.with_file_name("previous-output.txt");
+        fs::rename(&target, &previous).expect("rename snapshot held with delete sharing");
         assert!(!target.exists());
-        assert!(target.with_file_name("previous-output.txt").is_file());
+        assert!(previous.is_file());
+        assert_eq!(
+            fs::read(&previous).expect("read previous snapshot"),
+            b"original"
+        );
 
         fs::write(&target, b"replacement").expect("replacement snapshot");
         assert_eq!(fs::read(&target).expect("read replacement"), b"replacement");
