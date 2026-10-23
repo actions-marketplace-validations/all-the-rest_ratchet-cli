@@ -806,10 +806,18 @@ fn the_help_of_the_report_command_offers_no_fix() {
 
 /// The drift gate of the report itself: the binary writes the report.
 fn report_gate(path: &str) -> String {
-    format!(
-        r#"{{ "path": "{path}", "command": ["{}", "report", "--format", "md", "--output", "{path}"] }}"#,
-        env!("CARGO_BIN_EXE_ratchet")
-    )
+    serde_json::json!({
+        "path": path,
+        "command": [
+            env!("CARGO_BIN_EXE_ratchet"),
+            "report",
+            "--format",
+            "md",
+            "--output",
+            path
+        ]
+    })
+    .to_string()
 }
 
 /// A repository whose only generated file is the report.
