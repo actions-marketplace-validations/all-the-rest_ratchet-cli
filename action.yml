@@ -1,4 +1,4 @@
-name: @all-the-rest/ratchet-cli
+name: all-the-rest-ratchet-cli
 description: Run the ratchet gates of a repository — validate them, or move the baseline deliberately.
 author: all-the-rest
 
