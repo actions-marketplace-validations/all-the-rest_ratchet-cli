@@ -49,3 +49,21 @@ block is written by `ratchet release`.
 
 - the moving tag `v1` follows the action (action)
 - the drift gate creates the directories the system needs (drift)
+
+## [0.3.2] - 2026-10-23
+
+### Fixed
+
+- create verify and baseline directories at resolved paths (paths)
+- compare linked snapshots at the resolved path (verify)
+- roll back partial directory creation (drift)
+- clean traversal directories behind links (verify)
+- clean traversal directories during fixes (drift)
+- revalidate snapshot restore paths (verify)
+- resolve Windows-only clippy errors (ci)
+- support config paths and pinning tests (windows)
+- resolve action CI path failures (windows)
+- resolve CI portability failures (windows)
+- escape paths in report test config (windows)
+- test deferred binary updates (windows)
+- address approved-review follow-ups (verify)
