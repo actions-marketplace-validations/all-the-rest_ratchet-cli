@@ -6150,23 +6150,27 @@ fn verify_traversal_cleanup_refuses_a_parent_replaced_with_an_outside_link() {
 #[test]
 fn verify_refuses_a_junction_to_an_outside_directory_in_a_traversal_path() {
     let outside = Outside::new("verify-windows-traversal-junction");
-    std::fs::create_dir(outside.file("x")).expect("the outside x directory is created");
+    let escape = outside.file("x");
+    std::fs::create_dir(&escape).expect("the outside x directory is created");
     let repo = Repo::new(
         &verify_config(
             "benchmark",
-            &["cmd", "/c", "bench.bat"],
+            &["cmd", "/c", "bench.bat", "<out>"],
             "sub/x/../snapshot.txt",
         ),
         None,
     );
     // The command replaces the missing traversal directory with a junction to
-    // outside the repository. Replacing the tracked parent itself is refused by
-    // the retained no-delete handles, so the junction is the reachable attack.
+    // outside/x, so `sub/x/..` resolves to `outside` although Win32 normalizes
+    // the `..` lexically. Replacing the tracked parent itself is refused by the
+    // retained no-delete handles, so the junction is the reachable attack.
     repo.write(
         "bench.bat",
         &format!(
-            "@echo off\r\necho produced> \"%~1\"\r\nmklink /J \"sub\\x\" \"{}\" >nul\r\n",
-            outside.path().display()
+            "@echo off\r\necho produced> \"%~1\"\r\n\
+             echo command-modified> \"sub\\snapshot.txt\"\r\n\
+             mklink /J \"sub\\x\" \"{}\" >nul\r\n",
+            escape.display()
         ),
     );
     repo.write("sub/snapshot.txt", "committed\n");
@@ -6178,15 +6182,21 @@ fn verify_refuses_a_junction_to_an_outside_directory_in_a_traversal_path() {
     assert_eq!(code(&output), 2, "{}", stderr(&output));
     let message = stderr(&output);
     assert!(
-        message.contains("the working tree may be modified"),
-        "the refusal is reported as an operational failure: {message}"
+        message.contains("left alone because cleanup validation failed"),
+        "the junction candidate is refused: {message}"
     );
     assert!(
-        outside.file("x").is_dir(),
-        "the outside directory referenced by the junction was removed"
+        message.contains("could not safely remove the created directories"),
+        "the refusal is reported as a cleanup failure: {message}"
     );
+    assert!(
+        repo.read("sub/snapshot.txt")
+            .starts_with("command-modified"),
+        "the command did not run against the tracked snapshot"
+    );
+    assert!(escape.is_dir(), "outside/x was removed");
     assert_eq!(
-        std::fs::read_dir(outside.file("x"))
+        std::fs::read_dir(&escape)
             .expect("outside/x remains readable")
             .count(),
         0,
@@ -6196,7 +6206,6 @@ fn verify_refuses_a_junction_to_an_outside_directory_in_a_traversal_path() {
         !outside.file("snapshot.txt").exists(),
         "the restore wrote the snapshot outside the repository"
     );
-    assert_eq!(repo.read("sub/snapshot.txt"), "committed\n");
 }
 
 #[test]
