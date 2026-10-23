@@ -1971,8 +1971,8 @@ mod final_containment_tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    fn fixture() -> (Temporary, Guard, FileIdentity, PathBuf, PathBuf) {
-        let temporary = Temporary::new("verify-final-validation").expect("temporary directory");
+    fn fixture(prefix: &str) -> (Temporary, Guard, FileIdentity, PathBuf, PathBuf) {
+        let temporary = Temporary::new(prefix).expect("temporary directory");
         let root = temporary.path().join("repo");
         fs::create_dir(&root).expect("repository directory");
         let root = fs::canonicalize(root).expect("canonical repository directory");
@@ -1993,7 +1993,7 @@ mod final_containment_tests {
 
     #[test]
     fn target_validation_rechecks_path_identity_after_handle_identity_capture() {
-        let (_temporary, guard, identity, _snapshots, target) = fixture();
+        let (_temporary, guard, identity, _snapshots, target) = fixture("verify-final-identity");
         let previous = target.with_file_name("previous-output.txt");
 
         let error = guard
@@ -2009,7 +2009,7 @@ mod final_containment_tests {
 
     #[test]
     fn target_validation_runs_final_containment_after_identity_capture() {
-        let (_temporary, guard, identity, snapshots, target) = fixture();
+        let (_temporary, guard, identity, snapshots, target) = fixture("verify-final-containment");
         let root = guard.canonical_root.clone();
         let moved = root.join("snapshots-original");
         let outside = guard.root.join("outside");

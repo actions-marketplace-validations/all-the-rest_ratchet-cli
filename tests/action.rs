@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -535,14 +536,16 @@ fn stub(directory: &Path, log: &Path) -> PathBuf {
 }
 
 /// The PATH with the given directory in front of it.
-fn path_with(bin: &Path) -> String {
+fn path_with(bin: &Path) -> OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
+    path_with_from(bin, &current)
+}
+
+/// The PATH with the given directory in front of the supplied path list.
+fn path_with_from(bin: &Path, current: &OsStr) -> OsString {
     let mut paths = vec![bin.to_path_buf()];
-    paths.extend(std::env::split_paths(&current));
-    std::env::join_paths(paths)
-        .expect("the PATH can be joined")
-        .to_string_lossy()
-        .into_owned()
+    paths.extend(std::env::split_paths(current));
+    std::env::join_paths(paths).expect("the PATH can be joined")
 }
 
 /// The PATH with the **real** binary in front of it.
@@ -550,7 +553,7 @@ fn path_with(bin: &Path) -> String {
 /// The mode scripts call `ratchet`: the tests put the binary that the test
 /// suite built on the PATH, so the resolution of the baseline path is the
 /// resolution of the binary.
-fn path_with_the_binary() -> String {
+fn path_with_the_binary() -> OsString {
     let binary = Path::new(env!("CARGO_BIN_EXE_ratchet"));
     let directory = binary.parent().expect("the binary has a directory");
     path_with(directory)
@@ -559,12 +562,29 @@ fn path_with_the_binary() -> String {
 #[test]
 fn path_with_uses_the_native_path_list_format() {
     let bin = PathBuf::from("test-bin");
-    let actual: Vec<PathBuf> = std::env::split_paths(&path_with(&bin)).collect();
+    let actual_path = path_with(&bin);
+    let actual: Vec<PathBuf> = std::env::split_paths(&actual_path).collect();
     let mut expected = vec![bin];
     expected.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     assert_eq!(actual, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_with_preserves_non_utf8_entries() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bin = PathBuf::from("test-bin");
+    let non_utf8_entry = OsString::from_vec(b"/path/with/\xFF".to_vec());
+    let current = std::env::join_paths([&non_utf8_entry]).expect("the PATH can be joined");
+
+    let actual_path = path_with_from(&bin, &current);
+    let actual: Vec<PathBuf> = std::env::split_paths(&actual_path).collect();
+
+    assert_eq!(actual, vec![bin, PathBuf::from(&non_utf8_entry)]);
+    assert_eq!(actual[1].as_os_str().as_bytes(), b"/path/with/\xFF");
 }
 
 #[test]
