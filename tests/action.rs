@@ -38,6 +38,18 @@ fn bash_path(path: &Path) -> String {
     }
 }
 
+/// Starts the Git Bash found on PATH, rather than a system `bash` launcher.
+///
+/// On Windows, Rust searches system directories before the parent PATH when
+/// `Command::new` has no explicit child PATH. Supplying the inherited PATH
+/// makes the runner's Git Bash entry take precedence.
+fn bash_command() -> Command {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut command = Command::new("bash");
+    command.env("PATH", path);
+    command
+}
+
 /// A path with platform-specific separators normalized for comparison.
 fn normalized_path(path: &str) -> String {
     #[cfg(windows)]
@@ -492,7 +504,7 @@ fn run_install(release: &FakeRelease, version: &str, os: &str, arch: &str) -> In
     let install = directory.path().join("bin");
     let path_file = directory.path().join("github-path");
     fs::write(&path_file, "").expect("the path file is written");
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(INSTALL)))
         .env("RUNNER_OS", os)
         .env("RUNNER_ARCH", arch)
@@ -680,7 +692,7 @@ fn committed_content(project: &TempDir, path: &str) -> String {
 
 /// Runs the update mode in a project.
 fn run_update(project: &TempDir, config: &str, reason: &str) -> Output {
-    Command::new("bash")
+    bash_command()
         .arg(bash_path(&path_of(UPDATE)))
         .current_dir(project.path())
         .env("PATH", path_with_the_binary())
@@ -983,7 +995,7 @@ fn an_unknown_platform_fails_the_install_step() {
 #[test]
 fn the_mode_check_accepts_the_two_modes() {
     for mode in ["validate", "update"] {
-        let output = Command::new("bash")
+        let output = bash_command()
             .arg(bash_path(&path_of(MODE)))
             .env("RATCHET_MODE", mode)
             .output()
@@ -998,7 +1010,7 @@ fn the_mode_check_accepts_the_two_modes() {
 
 #[test]
 fn an_unknown_mode_fails_the_action() {
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(MODE)))
         .env("RATCHET_MODE", "whatever")
         .output()
@@ -1019,7 +1031,7 @@ fn a_mode_with_a_quote_does_not_run_a_command() {
     // command if the mode reached the shell as text.
     let mode = format!("x\"; touch \"{}\"; #", bash_path(&marker));
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(MODE)))
         .current_dir(directory.path())
         .env("RATCHET_MODE", &mode)
@@ -1161,7 +1173,7 @@ fn the_validate_mode_runs_the_gates_without_a_reason() {
     let log = directory.path().join("log");
     let bin = stub(directory.path(), &log);
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(VALIDATE)))
         .env("PATH", path_with(&bin))
         .env("RATCHET_CONFIG", "ratchet.config.jsonc")
@@ -1190,7 +1202,7 @@ fn a_failing_gate_fails_the_validate_mode() {
     let log = directory.path().join("log");
     let bin = stub(directory.path(), &log);
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(VALIDATE)))
         .env("PATH", path_with(&bin))
         .env("RATCHET_CONFIG", "ratchet.config.jsonc")
@@ -1484,7 +1496,7 @@ fn the_update_mode_needs_a_reason() {
         "ratchet.baseline.json",
     );
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(bash_path(&path_of(UPDATE)))
         .current_dir(project.path())
         .env("PATH", path_with_the_binary())

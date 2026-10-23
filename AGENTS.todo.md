@@ -58,3 +58,12 @@ absolute-path expectations, generator/counter behavior, and patch application.
 The action/path follow-up is on `fix/verify-path-revalidation`; the Windows CI
 gate remains unresolved. Do not release `v0.3.2` or re-pin adopters until all
 three CI jobs pass and the milestone review is approved.
+
+**Windows CI follow-up 2026-10-23.** Run `39933128158` compiled the Windows
+Verify code and passed all 124 library tests, but 19 of 39 action integration
+tests failed. The current correction sets inherited `PATH` explicitly for
+every Bash test invocation and computes the baseline's repository-relative
+name against the canonical repository root, matching the resolved baseline's
+Windows path spelling. These changes are not validated on Windows yet; keep
+release and adopter re-pins blocked until a fresh Ubuntu/macOS/Windows PR run is
+green.
