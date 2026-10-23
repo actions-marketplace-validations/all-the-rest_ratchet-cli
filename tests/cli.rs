@@ -1282,11 +1282,11 @@ fn without_git_the_committed_comparison_is_skipped_with_a_note() {
 #[test]
 fn the_arguments_of_a_counter_arrive_verbatim() {
     let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
-    // The script writes the arguments it received, NUL separated, and prints
-    // how many it got.
+    // Use a native process rather than a POSIX shell: this checks that ratchet
+    // preserves argv on Windows as well as Unix.
     repo.write(
-        "argv.sh",
-        "#!/bin/sh\nout=\"$1\"\nshift\n: > \"$out\"\nfor arg in \"$@\"; do printf '%s\\0' \"$arg\" >> \"$out\"; done\nprintf '%s' \"$#\"\n",
+        "argv.js",
+        "const fs = require('node:fs');\nconst args = process.argv.slice(2);\nconst output = args.shift();\nfs.writeFileSync(output, Buffer.from(args.join('\\0') + '\\0'));\nprocess.stdout.write(String(args.length));\n",
     );
     let outside = TempDir::new().expect("a temporary directory");
     let output_file = outside.path().join("argv.bin");
@@ -1300,7 +1300,7 @@ fn the_arguments_of_a_counter_arrive_verbatim() {
         "$(echo x)".to_string(),
         "line1\nline2".to_string(),
     ];
-    let mut command = vec!["sh".to_string(), "argv.sh".to_string()];
+    let mut command = vec!["node".to_string(), "argv.js".to_string()];
     command.push(output_file.to_string_lossy().into_owned());
     command.extend(arguments.iter().cloned());
 
@@ -3440,7 +3440,10 @@ fn set_mode(repo: &Repo, name: &str, mode: u32) {
 
 /// Sets the time a file in the repository was written last.
 fn set_modified(repo: &Repo, name: &str, time: std::time::SystemTime) {
-    let file = std::fs::File::open(repo.path().join(name)).expect("the file is readable");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(repo.path().join(name))
+        .expect("the file is writable");
     let times = std::fs::FileTimes::new().set_modified(time);
     file.set_times(times).expect("the time is set");
 }
@@ -4656,6 +4659,7 @@ fn a_slow_generator_does_not_count_towards_the_floor_of_the_slow_tier() {
 // --- the findings of the verification round ----------------------------------
 
 /// True when `patch` is on the PATH.
+#[cfg(unix)]
 fn patch_available() -> bool {
     Command::new("patch")
         .arg("--version")
@@ -4768,6 +4772,7 @@ fn a_difference_that_is_only_the_trailing_newline_is_shown() {
     assert!(diff.contains("@@"), "{diff}");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_diff_is_a_patch_that_patch_accepts() {
     let repo = Repo::new(
@@ -4870,12 +4875,12 @@ fn a_drift_command_without_a_generated_entry_fails() {
 
 #[test]
 fn a_generator_that_replaces_the_file_is_not_mistaken_for_one_that_did_nothing() {
-    let repo = Repo::new(&generated_config(&["sh", "generate.sh"], None), None);
+    let repo = Repo::new(&generated_config(&["node", "generate.js"], None), None);
     // The reproducible-build pattern: the file is replaced by a copy that
     // keeps the time of the original.
     repo.write(
-        "generate.sh",
-        "#!/bin/sh\ncp -p docs/generated.md docs/generated.md.tmp && mv docs/generated.md.tmp docs/generated.md\n",
+        "generate.js",
+        "const fs = require('node:fs');\nconst source = 'docs/generated.md';\nconst temporary = source + '.tmp';\nconst stat = fs.statSync(source);\nfs.copyFileSync(source, temporary);\nfs.utimesSync(temporary, stat.atime, stat.mtime);\nfs.renameSync(temporary, source);\n",
     );
     repo.write("docs/generated.md", "original\n");
     repo.git(&["add", "-A"]);
@@ -6029,6 +6034,118 @@ fn verify_restore_removes_a_directory_created_before_a_parent_traversal_behind_a
     assert_eq!(repo.status(), "", "the verify run changed the working tree");
 }
 
+#[cfg(unix)]
+#[test]
+fn verify_restore_refuses_a_snapshot_parent_replaced_with_an_outside_link() {
+    let outside = Outside::new("verify-restore-parent-swap");
+    std::fs::write(outside.file("snapshot.txt"), "outside sentinel\n")
+        .expect("the outside sentinel is written");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "sub/snapshot.txt",
+        ),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'produced\\n' > \"$1\"\nprintf 'command-modified\\n' > sub/snapshot.txt\n\
+             mv sub sub-original\nln -s '{}' sub\n",
+            outside.path().display()
+        ),
+    );
+    repo.write("sub/snapshot.txt", "committed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains("the restore of sub/snapshot.txt failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the working tree may be modified"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.file("snapshot.txt")).expect("the sentinel remains"),
+        "outside sentinel\n"
+    );
+    assert_eq!(
+        repo.read("sub-original/snapshot.txt"),
+        "command-modified\n",
+        "the moved in-repository object was not modified by restore"
+    );
+    assert!(
+        std::fs::symlink_metadata(repo.path().join("sub"))
+            .expect("the replacement link remains")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_traversal_cleanup_refuses_a_parent_replaced_with_an_outside_link() {
+    let outside = Outside::new("verify-traversal-parent-swap");
+    std::fs::create_dir(outside.file("x")).expect("the outside x directory is created");
+    let repo = Repo::new(
+        &verify_config(
+            "benchmark",
+            &["sh", "bench.sh", "<out>"],
+            "sub/x/../snapshot.txt",
+        ),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'produced\\n' > \"$1\"\nmkdir -p sub/x\n\
+             printf 'command-modified\\n' > sub/x/../snapshot.txt\nmv sub sub-original\n\
+             ln -s '{}' sub\n",
+            outside.path().display()
+        ),
+    );
+    repo.write("sub/snapshot.txt", "committed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "snapshot"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains("the restore of sub/x/../snapshot.txt failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("could not safely remove the created directories"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the working tree may be modified"),
+        "{message}"
+    );
+    assert!(outside.file("x").is_dir(), "outside/x was removed");
+    assert_eq!(
+        std::fs::read_dir(outside.file("x"))
+            .expect("outside/x remains readable")
+            .count(),
+        0,
+        "outside/x is no longer empty"
+    );
+    assert!(
+        repo.path().join("sub-original/x").is_dir(),
+        "the moved in-repository traversal directory was removed"
+    );
+    assert_eq!(repo.read("sub-original/snapshot.txt"), "command-modified\n");
+}
+
 #[test]
 fn verify_update_creates_the_resolved_snapshot_without_a_traversal_directory() {
     let repo = Repo::new(
@@ -6592,7 +6709,7 @@ fn a_restore_that_fails_is_an_operational_error() {
     let message = stderr(&output);
     assert!(message.contains("the restore of"), "{message}");
     assert!(
-        message.contains("the working tree was modified"),
+        message.contains("the working tree may be modified"),
         "{message}"
     );
 }

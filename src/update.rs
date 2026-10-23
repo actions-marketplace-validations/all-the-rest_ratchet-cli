@@ -456,7 +456,7 @@ fn symlink_of(path: &Path) -> Result<Option<PathBuf>, Error> {
 ///
 /// A relative target is relative to the directory of the link.
 fn resolve(target: &Path, raw: &Path) -> PathBuf {
-    if raw.is_absolute() {
+    if crate::path::is_absolute(raw) {
         crate::path::normalize(raw)
     } else {
         let directory = match target.parent() {

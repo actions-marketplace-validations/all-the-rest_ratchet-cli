@@ -114,7 +114,7 @@ fn walk(start: &Path, path: &Path, depth: usize) -> Result<PathBuf, Failure> {
                     return Err(Failure::Unresolvable);
                 }
                 let target = fs::read_link(&candidate).map_err(|_| Failure::Unresolvable)?;
-                let target = if target.is_absolute() {
+                let target = if is_absolute(&target) {
                     target
                 } else {
                     // The target of a link is relative to the directory of
@@ -226,7 +226,7 @@ impl Refusal {
 /// SPEC §7).  The `Err` carries the reason the path was refused.
 pub fn inside_root(root: &Path, base: &Path, relative: &str) -> Result<PathBuf, Refusal> {
     let path = Path::new(relative);
-    if path.is_absolute() {
+    if is_absolute(path) {
         return Err(Refusal::Absolute);
     }
     let start = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
@@ -241,6 +241,17 @@ pub fn inside_root(root: &Path, base: &Path, relative: &str) -> Result<PathBuf, 
         Err(Failure::Unresolvable) => Err(Refusal::Unresolvable),
         Err(Failure::Ambiguous) => Err(Refusal::Ambiguous),
     }
+}
+
+/// True when a path has a root or platform prefix. `Path::is_absolute()` is
+/// false for rooted-but-unprefixed Windows paths such as `\\etc\\file`, and
+/// for drive-relative paths such as `C:file`; neither is portable config data.
+pub fn is_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        || path.has_root()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
 }
 
 /// The same check for a path that is resolved against the repository root.
@@ -264,6 +275,22 @@ mod tests {
             display(Some(root), Path::new("/repo/docs/audit.json")),
             "docs/audit.json"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_rooted_and_drive_relative_windows_paths() {
+        for value in [r"\outside\file", r"C:\outside\file", r"C:outside\file"] {
+            assert!(
+                is_absolute(Path::new(value)),
+                "{value:?} must not be accepted as portable relative config data"
+            );
+            assert_eq!(
+                inside_root(Path::new("."), Path::new("."), value),
+                Err(Refusal::Absolute),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

@@ -433,8 +433,10 @@ pub fn load_js_config(path: &Path) -> Result<Config, ConfigError> {
     let absolute = absolute_path(path);
     let name = file_name(path);
 
-    // A backslash cannot survive the file URL: node rejects the
-    // percent-encoded backslash.  The failure is closed and names the cause.
+    // On Unix, backslash is a legal filename character, but Node's file-URL
+    // module loader rejects its percent-encoded form. Windows paths use
+    // backslashes as separators and are supported by `pathToFileURL`.
+    #[cfg(unix)]
     if absolute.to_string_lossy().contains('\\') {
         return Err(ConfigError::new(
             "",
@@ -1539,9 +1541,12 @@ mod tests {
             );
             return;
         }
-        // `#`, `?` and `%` are not valid in a URL specifier: the bridge has to
-        // resolve the path as a file URL.
+        // `#` and `%` (and `?` on Unix) are not valid in a URL specifier: the
+        // bridge has to resolve the path as a file URL.
         let directory = crate::test_tempdir::TempDir::new().expect("a temporary directory");
+        #[cfg(windows)]
+        let path = directory.path().join("ratchet#config100%.mjs");
+        #[cfg(unix)]
         let path = directory.path().join("ratchet#config?100%.mjs");
         std::fs::write(
             &path,

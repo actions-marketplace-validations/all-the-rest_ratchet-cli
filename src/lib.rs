@@ -1235,7 +1235,10 @@ fn load_context(cli: &Cli, cwd: &Path) -> Result<Context, Error> {
             ))
         })?;
 
-    let baseline_rel = path::relative_to(&root, &baseline_path);
+    // `baseline_path` has been resolved through the filesystem above. On
+    // Windows that path has the extended `\\?\` prefix, while Git's root
+    // spelling does not; compare against the same canonical root spelling.
+    let baseline_rel = path::relative_to(&path::canonical_root(&root), &baseline_path);
 
     Ok(Context {
         config,

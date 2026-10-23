@@ -43,13 +43,18 @@ impl TempDir {
 }
 
 fn create_temp_dir(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
+        builder.create(path)
     }
-    builder.create(path)
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
 }
 
 #[cfg(unix)]

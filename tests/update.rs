@@ -261,6 +261,7 @@ fn a_current_binary_is_left_alone() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_newer_release_replaces_the_binary() {
     let current = current_version();
     let newer = Version::parse("99.0.0").expect("the version parses");
@@ -286,6 +287,40 @@ fn a_newer_release_replaces_the_binary() {
         b"the new binary"
     );
     assert!(!directory.path().join("ratchet.new").exists());
+}
+
+#[test]
+#[cfg(windows)]
+fn a_newer_release_is_staged_when_the_running_binary_cannot_be_replaced() {
+    let current = current_version();
+    let newer = Version::parse("99.0.0").expect("the version parses");
+    let tag = format!("v{newer}");
+    let name = update::asset_name(&newer, &platform());
+    let body = b"the new binary".to_vec();
+    let checksums = format!("{}  {name}\n", update::sha256_hex(&body));
+    let release = FakeRelease::start(&routes(&tag, &[(name.as_str(), body)], &checksums));
+    let directory = TempDir::new().expect("a temporary directory");
+    let target = directory.path().join("ratchet");
+    fs::write(&target, b"the old binary").expect("the target is written");
+
+    let output = run_update(&release, &target);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains(&current.to_string()), "{text}");
+    assert!(text.contains("99.0.0"), "{text}");
+    assert!(
+        text.contains("a running executable cannot be replaced on windows"),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read(&target).expect("the target is readable"),
+        b"the old binary"
+    );
+    assert_eq!(
+        fs::read(directory.path().join("ratchet.new")).expect("the staged binary is readable"),
+        b"the new binary"
+    );
 }
 
 /// The release that replaces the binary, with the asset for this platform.

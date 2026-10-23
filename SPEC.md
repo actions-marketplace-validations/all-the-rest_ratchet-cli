@@ -1081,17 +1081,94 @@ file — the snapshot — and it gives it back unchanged:
    a link itself and the repository root are never treated as directories to
    remove.
 
+Before the command, Verify retains the filesystem identity of the resolved
+snapshot target (when it exists) and each existing directory in its resolved
+parent chain. Unix identities use device and inode from held handles; those
+handles do not prevent a directory from being renamed. Windows uses the
+high-resolution 128-bit file ID; the low-resolution file index is not an
+identity because it can collide on ReFS. Windows directory handles are opened
+without delete sharing and with final-reparse-point following disabled. Their
+metadata is checked and a reparse point is refused. The handles for the
+resolved parent chain, including the repository root, remain open while the
+command runs. Consequently, on Windows the child command cannot rename or
+delete a tracked snapshot-parent directory. This is an intentional prototype
+trade-off; commands that need to move one of those directories may fail. The
+pre-command snapshot-file handle is the exception: it permits delete sharing,
+so the command can still rename or replace the snapshot file itself.
+Because Windows identity capture is path-based, this permissive initial file
+handle does not pin the name against an independent concurrent rename during
+initial state capture; the post-command no-delete pinning guarantee begins only
+with the post-command operation handles.
+
+After the command, Verify resolves the configured path again against the
+canonical repository root and requires it to resolve to the same authorized
+target; it also checks the retained parent identities before each pathname-
+based operation, timestamp update, removal, rename, or verification. Windows
+post-command target and temporary-file handles deny delete sharing, permit read
+and write sharing, and open the final component without following a reparse
+point. Handle metadata is checked and a reparse point is refused. While such a
+file handle and the resolved directory-chain handles are alive, pathname-based
+high-resolution file-ID capture cannot be redirected by replacing or renaming
+that file entry. The Windows ID API is still path-based: Verify does not claim
+that it atomically obtains an ID from the retained handle or binds every later
+pathname operation to that handle.
+
+Reads and writes through retained file handles are issued as individual calls;
+Verify repeats the complete containment and target-or-temporary identity check
+immediately before every `read` or `write` call. A short transfer is followed
+by a fresh check before the next call. Windows no-delete sharing prevents a
+post-command file entry from being renamed or replaced while that I/O handle is
+open, but read/write sharing still permits another process to modify its
+contents. Unix and Windows both retain the per-call validation; neither claims
+that path validation and a later pathname operation are one atomic operation.
+A regular snapshot file replaced by the command is treated as a write to the
+snapshot and restored as before. Final reparse points observed by Verify are
+refused; Windows file and directory opens also refuse a final reparse point.
+Existing in-repository directory-link resolution and the configured path shown
+in diagnostics remain unchanged.
+
+Cleanup considers only the missing traversal/resolved-parent candidates
+recorded before the command. For a candidate that now exists, Verify checks
+canonical repository containment before reading it, captures its identity,
+and checks containment and identity again immediately before `read_dir` and,
+if it is empty, immediately before `remove_dir`. Pre-existing directories are
+not candidates; non-empty directories are left alone. A candidate that was
+replaced, cannot be identified, or no longer resolves inside the repository is
+left alone and reported as an operational failure. On Windows, candidate
+directory handles are retained while they are inspected. Immediately after the
+final validation and before pathname removal, Verify releases only the
+candidate's handle; its tracked ancestors remain pinned. If the directory is
+not empty after that check, Verify attempts to pin the same captured directory
+again before continuing. A pathname replacement in the final check-to-
+`remove_dir` interval remains possible. Windows `remove_dir` acts on a
+replacement symlink or junction object itself, or fails; it does not traverse
+the link to remove its target.
+
+These checks do not make pathname operations atomic or derive a file ID from
+the retained handle. For every pathname operation, the accepted race includes
+the interval between the final complete containment-and-identity validation
+and that operation. For Unix handle-based I/O, a path may also be redirected
+after validation even though the open handle continues to refer to its original
+object. On Windows, while the post-command I/O handle is open, no-delete sharing
+prevents that file entry and its pinned resolved parents from being renamed or
+deleted; this does not prevent in-place writes through another handle and does
+not make path-based rename/removal atomic. No validation covers a sequence of
+calls. If a later check detects redirection, the affected loop stops before its
+next read/write call and Verify reports the restore or update failure. A
+restore, cleanup, or snapshot-update failure says that the working tree may be
+modified.
+
 When `--update` writes a snapshot whose parent does not exist, the missing
 parent directories are created at the snapshot's **resolved** path. They are
 created one at a time, and only directories created by that attempt are
 tracked. If a later creation fails, the attempt rolls those directories back;
 if rollback cannot remove one, the error names what remains and says that the
-working tree was modified.
+working tree may be modified.
 
 A command that rewrites the snapshot with the same bytes is detected through
 the marker and restored like any other write. If the restore fails, the run
 ends with an **operational error** that names the file and says that the
-working tree was modified — the same rule as the drift gate (§7). A swallowed
+working tree may be modified — the same rule as the drift gate (§7). A swallowed
 restore error is a mutated tree that nobody was told about.
 
 ## 16. The release step and the changelog

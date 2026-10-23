@@ -527,6 +527,7 @@ struct CreatedDirectory {
 }
 
 /// A directory the engine could not create or safely identify.
+#[derive(Debug)]
 struct DirectoryError {
     /// The directory the engine tried to create.
     directory: PathBuf,
@@ -1453,7 +1454,7 @@ impl Snapshot {
 
 /// The path a symbolic link points to.
 fn resolve(target: &Path, raw: &Path) -> PathBuf {
-    if raw.is_absolute() {
+    if path::is_absolute(raw) {
         path::normalize(raw)
     } else {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
