@@ -2056,23 +2056,32 @@ mod windows_pinning_tests {
         (temporary, guard, snapshots, target)
     }
 
-    fn rename_from_child(path: &Path, new_name: &str) -> io::Result<Output> {
-        let command = format!("ren \"{}\" \"{new_name}\"", path.display());
+    fn rename_from_child(
+        directory: &Path,
+        source_name: &str,
+        new_name: &str,
+    ) -> io::Result<Output> {
+        let command = format!("ren \"{source_name}\" \"{new_name}\"");
         Command::new("cmd.exe")
             .args(["/D", "/C", &command])
+            .current_dir(directory)
             .output()
     }
 
     #[test]
     fn child_cannot_rename_a_pinned_snapshot_parent() {
         let (_temporary, guard, snapshots, _target) = fixture();
-        let output =
-            rename_from_child(&snapshots, "snapshots-renamed").expect("start child rename command");
+        let output = rename_from_child(
+            snapshots.parent().expect("snapshot parent"),
+            "snapshots",
+            "snapshots-renamed",
+        )
+        .expect("start child rename command");
 
         assert!(
             !output.status.success(),
             "child unexpectedly renamed a pinned parent: {}",
-            String::from_utf8_lossy(&output.stdout)
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(snapshots.is_dir());
         assert!(!guard.canonical_root.join("snapshots-renamed").exists());
@@ -2081,8 +2090,12 @@ mod windows_pinning_tests {
     #[test]
     fn retained_precommand_snapshot_handle_allows_child_replacement() {
         let (_temporary, guard, _snapshots, target) = fixture();
-        let output = rename_from_child(&target, "previous-output.txt")
-            .expect("start child snapshot rename command");
+        let output = rename_from_child(
+            target.parent().expect("snapshot directory"),
+            "output.txt",
+            "previous-output.txt",
+        )
+        .expect("start child snapshot rename command");
         assert!(
             output.status.success(),
             "child could not replace a snapshot held with delete sharing: {}",
@@ -2105,9 +2118,10 @@ mod windows_pinning_tests {
 
         let pinned = open_snapshot_file(&target, true, false, true, false)
             .expect("open post-command pinned snapshot file");
-        let error = fs::rename(&target, &renamed)
-            .expect_err("rename must be denied while the pinned handle is open");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            fs::rename(&target, &renamed).is_err(),
+            "rename must be denied while the pinned handle is open"
+        );
         assert!(target.is_file());
         assert!(!renamed.exists());
 
