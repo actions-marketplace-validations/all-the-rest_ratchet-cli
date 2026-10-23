@@ -67,3 +67,9 @@ block is written by `ratchet release`.
 - escape paths in report test config (windows)
 - test deferred binary updates (windows)
 - address approved-review follow-ups (verify)
+
+## [0.3.3] - 2026-10-23
+
+### Fixed
+
+- build the linux assets on ubuntu 22.04 (release)

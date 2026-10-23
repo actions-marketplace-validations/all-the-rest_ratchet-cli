@@ -1300,10 +1300,12 @@ platform: a renamed asset fails the test instead of the action.
 ### The Marketplace listing
 
 The action is listed in the **GitHub Marketplace** under the name
-`@all-the-rest/ratchet-cli`. The name in `action.yml` must be **unique** across
-the Marketplace: a plain `ratchet` is refused because it collides with an
-existing action, user or organisation name, and the release form reports that
-before it publishes.
+`all-the-rest-ratchet-cli` — the slug GitHub derives from the name in
+`action.yml`. The name must be **unique** across the Marketplace: a plain
+`ratchet` is refused because it collides with an existing action, user or
+organisation name, and the release form reports that before it publishes. The
+name is the identity of the listing — renaming it creates a second listing and
+leaves the first one behind.
 
 The listing is attached to a **release**, not to the repository, and only a
 human can create it: the release form carries the checkbox *Publish this Action
