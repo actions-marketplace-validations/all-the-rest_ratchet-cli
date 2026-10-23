@@ -1122,10 +1122,14 @@ open, but read/write sharing still permits another process to modify its
 contents. Unix and Windows both retain the per-call validation; neither claims
 that path validation and a later pathname operation are one atomic operation.
 A regular snapshot file replaced by the command is treated as a write to the
-snapshot and restored as before. Final reparse points observed by Verify are
-refused; Windows file and directory opens also refuse a final reparse point.
-Existing in-repository directory-link resolution and the configured path shown
-in diagnostics remain unchanged.
+snapshot and restored as before. Verify refuses a reparse point anywhere in the
+resolved parent chain, at the snapshot target, and at the temporary restore
+file. The resolved chain contains no link by construction, so a reparse point
+appearing there is a replacement and fails closed; the same checks refuse
+non-name-surrogate reparse points such as cloud placeholders, which are not
+followed. Configured in-repository directory-link resolution — including Windows
+junctions, which resolve before the chain is captured — and the configured path
+shown in diagnostics remain unchanged.
 
 Cleanup considers only the missing traversal/resolved-parent candidates
 recorded before the command. For a candidate that now exists, Verify checks

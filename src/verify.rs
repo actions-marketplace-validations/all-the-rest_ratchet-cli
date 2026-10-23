@@ -567,7 +567,8 @@ impl FileIdentity {
 
         #[cfg(windows)]
         {
-            high_resolution_windows_identity(file_id::get_high_res_file_id(path)?)
+            let (volume, file) = fsutil::high_resolution_identity(path)?;
+            Ok(Self::Windows { volume, file })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -578,23 +579,6 @@ impl FileIdentity {
                 "filesystem identity is unavailable on this platform",
             ))
         }
-    }
-}
-
-#[cfg(windows)]
-fn high_resolution_windows_identity(identity: file_id::FileId) -> io::Result<FileIdentity> {
-    match identity {
-        file_id::FileId::HighRes {
-            volume_serial_number,
-            file_id,
-        } => Ok(FileIdentity::Windows {
-            volume: volume_serial_number,
-            file: file_id,
-        }),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the filesystem did not provide a high-resolution file identity",
-        )),
     }
 }
 
@@ -698,15 +682,11 @@ impl Guard {
     }
 
     /// Restores the snapshot, verifies it, and attempts cleanup even if a
-    /// restore operation fails.
+    /// restore operation fails. Every cleanup failure is reported once, under
+    /// one heading; the restore failure stands beside it.
     fn restore(&mut self) -> Result<(), String> {
-        let mut failures = self.capture_command_directories();
-        if !failures.is_empty() {
-            failures = vec![format!(
-                "could not safely remove the created directories: {}",
-                failures.join(", ")
-            )];
-        }
+        let mut cleanup = self.capture_command_directories();
+        let mut failures = Vec::new();
         let restored = self
             .read_state()
             .map_err(|error| error.to_string())
@@ -722,7 +702,13 @@ impl Guard {
         if let Err(error) = restored {
             failures.push(error);
         }
-        failures.extend(self.remove_created_directories());
+        cleanup.extend(self.remove_created_directories());
+        if !cleanup.is_empty() {
+            failures.push(format!(
+                "could not safely remove the created directories: {}",
+                cleanup.join(", ")
+            ));
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1166,7 +1152,8 @@ impl Guard {
     }
 
     /// Removes only the missing-before-command candidates whose current
-    /// directory identity is still the one captured after the command.
+    /// directory identity is still the one captured after the command. Returns
+    /// the raw per-candidate failures; the caller sets the heading.
     fn remove_created_directories(&mut self) -> Vec<String> {
         let mut failures = Vec::new();
         for candidate in self.missing.clone() {
@@ -1272,14 +1259,7 @@ impl Guard {
                 }
             }
         }
-        if failures.is_empty() {
-            failures
-        } else {
-            vec![format!(
-                "could not safely remove the created directories: {}",
-                failures.join(", ")
-            )]
-        }
+        failures
     }
 
     /// Checks the repository root and retained identities, then finishes with
@@ -2128,41 +2108,50 @@ mod windows_pinning_tests {
 
     #[test]
     fn final_reparse_point_opens_are_refused() {
-        use std::os::windows::fs::{symlink_dir, symlink_file};
-
         let temporary = Temporary::new("verify-windows-reparse").expect("temporary directory");
+
+        // A junction needs no privilege, so this half always asserts.
+        let directory = temporary.path().join("directory");
+        let junction = temporary.path().join("directory-junction");
+        fs::create_dir(&directory).expect("regular directory");
+        make_junction(&junction, &directory);
+        assert!(
+            open_directory(&junction).is_err(),
+            "directory reparse point must not be followed"
+        );
+
+        // A file symlink needs SeCreateSymbolicLinkPrivilege. Where it is not
+        // available the test says so; the junction half above has already
+        // asserted the refusal, so nothing passes silently.
+        use std::os::windows::fs::symlink_file;
+
         let regular = temporary.path().join("regular.txt");
         let file_link = temporary.path().join("file-link.txt");
         fs::write(&regular, b"contents").expect("regular file");
-        if let Err(error) = symlink_file(&regular, &file_link) {
-            assert!(
+        match symlink_file(&regular, &file_link) {
+            Ok(()) => assert!(
+                open_snapshot_file(&file_link, true, false, true, false).is_err(),
+                "final file symlink must not be followed"
+            ),
+            Err(error) => assert!(
                 matches!(
                     error.kind(),
                     io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
                 ),
                 "could not create test file symlink: {error}"
-            );
-            return;
+            ),
         }
-        let _error = open_snapshot_file(&file_link, true, false, true, false)
-            .expect_err("final file symlink must not be followed");
+    }
 
-        let directory = temporary.path().join("directory");
-        let junction = temporary.path().join("directory-link");
-        fs::create_dir(&directory).expect("regular directory");
-        if let Err(error) = symlink_dir(&directory, &junction) {
-            assert!(
-                matches!(
-                    error.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
-                ),
-                "could not create test directory symlink: {error}"
-            );
-            return;
-        }
-        assert!(
-            open_directory(&junction).is_err(),
-            "directory reparse point must not be followed"
-        );
+    /// Creates a directory junction — a reparse point that needs no privilege.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "the junction {link:?} was not created");
     }
 }
