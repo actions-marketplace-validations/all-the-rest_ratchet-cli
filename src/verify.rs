@@ -2097,6 +2097,27 @@ mod windows_pinning_tests {
     }
 
     #[test]
+    fn postcommand_pinned_snapshot_handle_blocks_rename_until_drop() {
+        let temporary = Temporary::new("verify-windows-file-pinning").expect("temporary directory");
+        let target = temporary.path().join("output.txt");
+        let renamed = temporary.path().join("previous-output.txt");
+        fs::write(&target, b"contents").expect("snapshot file");
+
+        let pinned = open_snapshot_file(&target, true, false, true, false)
+            .expect("open post-command pinned snapshot file");
+        let error = fs::rename(&target, &renamed)
+            .expect_err("rename must be denied while the pinned handle is open");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(target.is_file());
+        assert!(!renamed.exists());
+
+        drop(pinned);
+        fs::rename(&target, &renamed).expect("rename after dropping pinned handle");
+        assert!(!target.exists());
+        assert!(renamed.is_file());
+    }
+
+    #[test]
     fn final_reparse_point_opens_are_refused() {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 
