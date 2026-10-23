@@ -256,7 +256,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish the release
+    name: Create the draft release
     needs: [version, checksums]
     runs-on: ubuntu-latest
     # The release is written: this job and this job alone needs the write.
@@ -286,17 +286,24 @@ jobs:
           name: checksums
           path: dist
 
-      - name: Publish the release
+      - name: Create the draft release
+        # The release is a **draft**: publishing it is the click that also
+        # offers "Publish this Action to the GitHub Marketplace".  A workflow
+        # cannot tick that box — so a run that published the release by itself
+        # would produce a release that is invisible in the Marketplace, and
+        # nothing in the history would say why.  The draft carries the assets;
+        # a human publishes it and, once, agrees to the Marketplace terms.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$RELEASE_TAG" dist/* \
             --title "$RELEASE_TAG" \
+            --draft \
             --verify-tag \
             --generate-notes
 
       - name: Check the release
-        # The release is published — and then it is checked.  A release without
+        # The draft is created — and then it is checked.  A release without
         # the assets is a broken release that nobody would notice: the action
         # would fail to install the binary with a 404 that names no cause.
         #

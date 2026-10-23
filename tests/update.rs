@@ -820,7 +820,7 @@ fn the_release_reads_the_tag_from_one_place() {
     // differ in a run that was started by hand.
     for step in [
         "Read the version from the manifest",
-        "Publish the release",
+        "Create the draft release",
         "Check the release",
     ] {
         let script = step_script(&workflow, step);
@@ -833,6 +833,20 @@ fn the_release_reads_the_tag_from_one_place() {
             "{step} does not read the tag of the release"
         );
     }
+}
+
+#[test]
+fn the_release_is_a_draft_so_the_marketplace_click_is_possible() {
+    let workflow = workflow();
+    let script = step_script(&workflow, "Create the draft release");
+    // Publishing a release is the click that also publishes the Marketplace
+    // listing; a workflow cannot tick that box. A release the workflow
+    // published by itself is invisible in the Marketplace, and nothing in the
+    // history would say why.
+    assert!(
+        script.contains("--draft"),
+        "the release workflow publishes the release instead of drafting it"
+    );
 }
 
 #[test]
