@@ -167,6 +167,8 @@ shorthand for a one-element array.
 | `exclude` | string[] | no | glob patterns removed from the counted **items** (path-shaped exemptions only) |
 | `files` | string[] | no | glob scope of the rule; without it the rule always runs |
 | `description` | string | no | free text |
+| `aggregate` | `count` \| `max` | required for per-file measurements | how file values reduce |
+| `scopes` | array | no | named file scopes with independent baselines |
 
 `exclude` requires a counter that yields **items**; a scalar counter plus
 `exclude` is a configuration error.
@@ -217,6 +219,7 @@ Exactly one of:
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites", "generate": ["node", "scripts/audit-inventory.mjs"], "output_arg": "--output" }
 { "registry": "ratchet.findings.json", "severities": ["critical", "high"], "statuses": ["open", "in-progress"] }
 { "issues": { "repository": "owner/repo", "label": "ratchet" }, "severities": ["critical", "high"], "statuses": ["open"] }
+{ "file_metrics": { "files": ["**/*.java"], "metric": "size_bytes" } }
 ```
 
 * `command` — an argv array. **No shell** is involved; the arguments are passed
@@ -257,9 +260,41 @@ The value the counter produces may be:
 | array of strings | the items; the count is the number of items after `exclude` |
 | object `{"count": N}` | the count |
 | object `{"count": N, "items": [...]}` | the count and the items |
+| object `{"measurements": [{"path":"src/a.java", "value":N}]}` | nonnegative per-file values |
 
 For the `command` form the stdout is parsed: trimmed, then tried as an integer,
 then as JSON in the shapes above. Anything else is a counter error.
+
+Per-file measurements may be emitted by a command counter using the
+`measurements` object shape. Paths must be unique, repository-relative regular
+files; malformed values, duplicates, absolute paths, traversal and paths that
+resolve outside the root are operational errors. The `aggregate` is `count`
+(distinct measured files) or `max` (greatest value). A rule with named scopes
+must emit measurements; a scalar counter is rejected rather than silently
+applying one value to every scope.
+
+`file_metrics` is the built-in per-file source. Its `files` are path globs and
+its metric is `size_bytes`, `line_count` or `max_line_length`. Byte size counts
+raw bytes. Line count treats CRLF as one terminator, handles CR and LF, returns
+zero for an empty file and adds no phantom line after a trailing terminator.
+Maximum line length counts Unicode scalar values excluding terminators. The
+walk is deterministic and refuses symbolic links.
+
+Named scopes take this shape:
+
+```jsonc
+"description": "All Java source files",
+"aggregate": "max",
+"scopes": [
+  { "id": "auth", "description": "Authentication module", "files": ["src/auth/**"] },
+  { "id": "legacy-login", "description": "Legacy login", "file": "src/auth/LegacyLogin.java" }
+]
+```
+
+Exact files take precedence over module globs. Among globs, the greatest
+literal/component specificity wins; equal specificity is an error. Unmatched
+files contribute only to the global fallback. A configured scope that selects
+no files is an error. The rule-level `description` labels the global fallback.
 
 ### 3.5 Unknown fields
 
@@ -298,7 +333,8 @@ failure, not a pass — the rule that would have run is not silently skipped.
 {
   "version": 1,
   "rules": {
-    "unwrapped-action-calls": { "value": 11, "reason": "F-09 remainder, tracked in P1.2" }
+    "unwrapped-action-calls": { "value": 11, "reason": "F-09 remainder, tracked in P1.2" },
+    "java-file-size": { "value": 600, "reason": "current global fallback", "scopes": { "auth": { "value": 180 } } }
   }
 }
 ```
@@ -311,6 +347,11 @@ failure, not a pass — the rule that would have run is not silently skipped.
   direction** reviewable — the reason travels with the record, so the diff on
   the baseline file carries it.
 * Rules are sorted by id — the file is a stable diff.
+* Each scope record stores its own `value` and optional `reason` under the
+  parent rule's `scopes` map. Existing version-1 records without that map remain
+  valid. `baseline init` and `baseline update` act independently on all
+  executed scopes; `baseline raise --scope <id>` changes only that scope, while
+  omitting `--scope` raises the global fallback.
 
 The writer creates a missing parent directory at the path the baseline
 **resolves to** (§2.1), not at a name that happens to lead there through a
@@ -328,7 +369,7 @@ ratchet count [--rule <id>] [--format <stylish|json>]
 ratchet baseline init [--rule <id>] [--reason <text>]
 ratchet baseline update [--rule <id>] [--reason <text>]
 ratchet baseline path
-ratchet baseline raise --rule <id> --value <n> --reason "<text>"
+ratchet baseline raise --rule <id> [--scope <id>] --value <n> --reason "<text>"
 ratchet drift [--path <path>] [--format <stylish|json>]
 ratchet verify [--name <name>] [--update]
 ratchet report [--output <path>] [--format md]
@@ -350,6 +391,7 @@ The default command is `check`.
 | `--fix` | apply the fixable: regenerate generated files — a **`check`/`drift`** option, not a global one |
 | `--tier <fast\|slow>` | run only the rules of that tier — a `check` option |
 | `--rule <id>` | restrict to one rule |
+| `--scope <id>` | address one named scope — `baseline raise` only |
 | `--ignore <pattern>` | glob of paths to exclude from the run (repeatable) |
 | `--name <name>` | run only this check — a `verify` option |
 | `--update` | write the snapshot instead of comparing it — a `verify` option |

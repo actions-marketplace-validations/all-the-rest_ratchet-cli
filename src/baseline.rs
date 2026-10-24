@@ -16,8 +16,20 @@ pub const BASELINE_VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct BaselineRecord {
     /// The committed number the count is compared against.
-    pub value: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<i64>,
     /// Why the baseline has this value; only present when one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Independent records for named path scopes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scopes: BTreeMap<String, ScopeBaselineRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeBaselineRecord {
+    pub value: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -145,7 +157,7 @@ mod tests {
         }"#;
         let baseline = Baseline::parse(text, "ratchet.baseline.json").expect("parses");
         assert_eq!(baseline.version, 1);
-        assert_eq!(baseline.get("a").unwrap().value, 1);
+        assert_eq!(baseline.get("a").unwrap().value, Some(1));
         assert_eq!(
             baseline.get("a").unwrap().reason.as_deref(),
             Some("because")
@@ -168,6 +180,18 @@ mod tests {
         let error = Baseline::parse(r#"{"version": 2, "rules": {}}"#, "b.json")
             .expect_err("the version is checked");
         assert!(error.message.contains("version 2"));
+    }
+
+    #[test]
+    fn version_one_records_without_scopes_remain_compatible_and_scoped_records_round_trip() {
+        let old = Baseline::parse(r#"{"version":1,"rules":{"old":{"value":7}}}"#, "b.json")
+            .expect("old baseline");
+        assert_eq!(old.get("old").expect("record").value, Some(7));
+        assert!(old.get("old").expect("record").scopes.is_empty());
+        let scoped = Baseline::parse(r#"{"version":1,"rules":{"r":{"value":8,"scopes":{"auth":{"value":3,"reason":"reviewed"}}}}}"#, "b.json").expect("scoped baseline");
+        assert_eq!(scoped.get("r").expect("record").scopes["auth"].value, 3);
+        let encoded = serde_json::to_string(&scoped).expect("serialize");
+        assert!(encoded.contains("\"auth\""));
     }
 
     #[test]

@@ -727,12 +727,12 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
             }
         }
 
-        let existing = baseline.get(id).map(|record| record.value);
+        let existing = baseline.get(id).and_then(|record| record.value);
 
         // `baseline init` only writes the rules that have no baseline: the
         // counters of the other rules are not needed and a broken counter
         // must not fail the command (SPEC 5.4).
-        if !update {
+        if !update && rule.scopes.is_empty() && rule.aggregate.is_none() {
             if let Some(value) = existing {
                 actions.push(BaselineAction {
                     id: id.clone(),
@@ -769,6 +769,161 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
             rule.count.describe(),
             run.output
         ));
+        if let Some(measurements) = run.value.measurements.as_ref() {
+            let scoped = match check::scoped_counts(rule, measurements) {
+                Ok(scoped) => scoped,
+                Err(error) => {
+                    counter_errors += 1;
+                    failed += 1;
+                    actions.push(BaselineAction {
+                        id: id.clone(),
+                        kind: ActionKind::Refused,
+                        value: None,
+                        message: error.message,
+                    });
+                    continue;
+                }
+            };
+            let global_value = scoped
+                .iter()
+                .find(|(scope, _, _)| scope.is_none())
+                .map(|(_, _, value)| *value);
+            if baseline.get(id).is_none() {
+                baseline.rules.insert(
+                    id.clone(),
+                    BaselineRecord {
+                        value: global_value,
+                        reason: reason.map(str::to_string),
+                        scopes: Default::default(),
+                    },
+                );
+                changed = true;
+            }
+            for (scope_id, description, value) in scoped {
+                if let Some(scope_id) = scope_id {
+                    let current = baseline
+                        .get(id)
+                        .and_then(|record| record.scopes.get(&scope_id))
+                        .cloned();
+                    let label = format!("{id}#{scope_id}");
+                    if !update && current.is_some() {
+                        actions.push(BaselineAction {
+                            id: label,
+                            kind: ActionKind::Kept,
+                            value: current.map(|record| record.value),
+                            message: format!("kept scope {description}"),
+                        });
+                        continue;
+                    }
+                    if update && current.is_none() {
+                        failed += 1;
+                        actions.push(BaselineAction { id: label, kind: ActionKind::Refused, value: None, message: format!("refusing: no baseline for scope {scope_id} — run ratchet baseline init") });
+                        continue;
+                    }
+                    let allowed = current.as_ref().is_some_and(|record| match rule.direction {
+                        Direction::Ceiling => value <= record.value,
+                        Direction::Floor => value >= record.value,
+                    });
+                    if current.is_some() && !allowed {
+                        failed += 1;
+                        actions.push(BaselineAction {
+                            id: label,
+                            kind: ActionKind::Refused,
+                            value: current.map(|record| record.value),
+                            message: format!(
+                                "refusing: scope count {value} moves against the rule direction"
+                            ),
+                        });
+                        continue;
+                    }
+                    let record = baseline
+                        .rules
+                        .get_mut(id)
+                        .ok_or_else(|| Error::new(format!("missing baseline record for {id}")))?;
+                    let scope_reason = reason
+                        .map(str::to_string)
+                        .or_else(|| current.as_ref().and_then(|record| record.reason.clone()));
+                    record.scopes.insert(
+                        scope_id,
+                        baseline::ScopeBaselineRecord {
+                            value,
+                            reason: scope_reason,
+                        },
+                    );
+                    changed = true;
+                    actions.push(BaselineAction {
+                        id: label,
+                        kind: if current.is_some() {
+                            ActionKind::Updated
+                        } else {
+                            ActionKind::Added
+                        },
+                        value: Some(value),
+                        message: format!(
+                            "scope {description}: {}",
+                            current
+                                .map(|record| format!("{} → {value}", record.value))
+                                .unwrap_or_else(|| format!("added {value}"))
+                        ),
+                    });
+                } else {
+                    let current = baseline.get(id).and_then(|record| record.value);
+                    if !update && existing.is_some() {
+                        continue;
+                    }
+                    if update && current.is_none() {
+                        failed += 1;
+                        actions.push(BaselineAction {
+                            id: id.clone(),
+                            kind: ActionKind::Refused,
+                            value: None,
+                            message: format!(
+                                "refusing: no baseline for {id} — run ratchet baseline init"
+                            ),
+                        });
+                        continue;
+                    }
+                    let allowed = current.is_some_and(|old| match rule.direction {
+                        Direction::Ceiling => value <= old,
+                        Direction::Floor => value >= old,
+                    });
+                    if current.is_some() && !allowed {
+                        failed += 1;
+                        actions.push(BaselineAction {
+                            id: id.clone(),
+                            kind: ActionKind::Refused,
+                            value: current,
+                            message: format!(
+                                "refusing: count {value} moves against the rule direction"
+                            ),
+                        });
+                        continue;
+                    }
+                    let record = baseline
+                        .rules
+                        .get_mut(id)
+                        .ok_or_else(|| Error::new(format!("missing baseline record for {id}")))?;
+                    record.value = Some(value);
+                    if reason.is_some() {
+                        record.reason = reason.map(str::to_string);
+                    }
+                    changed = true;
+                    actions.push(BaselineAction {
+                        id: id.clone(),
+                        kind: if current.is_some() {
+                            ActionKind::Updated
+                        } else {
+                            ActionKind::Added
+                        },
+                        value: Some(value),
+                        message: current
+                            .map(|old| format!("{old} → {value}"))
+                            .unwrap_or_else(|| format!("added baseline {value}")),
+                    });
+                }
+            }
+            continue;
+        }
         let count = match counter::finalize(
             run.value,
             &rule.exclude_globs,
@@ -802,8 +957,9 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
                 baseline.rules.insert(
                     id.clone(),
                     BaselineRecord {
-                        value: count,
+                        value: Some(count),
                         reason: reason.map(str::to_string),
+                        scopes: Default::default(),
                     },
                 );
                 changed = true;
@@ -826,8 +982,12 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
                     baseline.rules.insert(
                         id.clone(),
                         BaselineRecord {
-                            value: count,
+                            value: Some(count),
                             reason,
+                            scopes: baseline
+                                .get(id)
+                                .map(|record| record.scopes.clone())
+                                .unwrap_or_default(),
                         },
                     );
                     changed = true;
@@ -984,7 +1144,58 @@ fn cmd_baseline_raise(cli: &Cli, args: &BaselineRaiseArgs, cwd: &Path) -> Result
     let rule = &context.config.rules[id];
 
     let mut baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
-    let current = baseline.get(id).map(|record| record.value);
+    if let Some(scope_id) = args.scope.as_deref() {
+        let scope = rule
+            .scopes
+            .iter()
+            .find(|scope| scope.id == scope_id)
+            .ok_or_else(|| Error::new(format!("unknown scope for rule {id}: {scope_id}")))?;
+        let current = baseline
+            .get(id)
+            .and_then(|record| record.scopes.get(scope_id))
+            .map(|record| record.value);
+        let mut actions = Vec::new();
+        let mut failed = 0usize;
+        match decide_raise(rule, current, args.value, args.reason.as_deref()) {
+            Raise::Refuse { message } => {
+                failed += 1;
+                actions.push(BaselineAction {
+                    id: format!("{id}#{}", scope.id),
+                    kind: ActionKind::Refused,
+                    value: current,
+                    message,
+                });
+            }
+            Raise::Move {
+                value,
+                reason,
+                message,
+            } => {
+                let record = baseline.rules.get_mut(id).ok_or_else(|| {
+                    Error::new(format!(
+                        "refusing: no baseline for {id} — run ratchet baseline init"
+                    ))
+                })?;
+                record.scopes.insert(
+                    scope_id.to_string(),
+                    baseline::ScopeBaselineRecord {
+                        value,
+                        reason: Some(reason),
+                    },
+                );
+                baseline.save(Some(&context.root), &context.baseline_path)?;
+                actions.push(BaselineAction {
+                    id: format!("{id}#{}", scope.id),
+                    kind: ActionKind::Updated,
+                    value: Some(value),
+                    message,
+                });
+            }
+        }
+        print_baseline(cli, &context, "raise", &actions, failed)?;
+        return Ok(if failed > 0 { 1 } else { 0 });
+    }
+    let current = baseline.get(id).and_then(|record| record.value);
 
     let mut actions: Vec<BaselineAction> = Vec::new();
     let mut failed = 0usize;
@@ -1010,8 +1221,12 @@ fn cmd_baseline_raise(cli: &Cli, args: &BaselineRaiseArgs, cwd: &Path) -> Result
             baseline.rules.insert(
                 id.to_string(),
                 BaselineRecord {
-                    value,
+                    value: Some(value),
                     reason: Some(reason),
+                    scopes: baseline
+                        .get(id)
+                        .map(|record| record.scopes.clone())
+                        .unwrap_or_default(),
                 },
             );
             baseline.save(Some(&context.root), &context.baseline_path)?;
@@ -1386,8 +1601,9 @@ const SUBCOMMANDS: [&str; 9] = [
 ];
 
 /// The options that take a value; the value is not a positional argument.
-const OPTIONS_WITH_VALUE: [&str; 10] = [
+const OPTIONS_WITH_VALUE: [&str; 11] = [
     "config", "format", "rule", "tier", "ignore", "path", "reason", "value", "output", "name",
+    "scope",
 ];
 
 /// Inserts the default command when the first argument is not a subcommand:
@@ -1645,6 +1861,10 @@ struct BaselineRaiseArgs {
     /// The reason the baseline moves against its direction; it is required.
     #[arg(long, value_name = "TEXT")]
     reason: Option<String>,
+
+    /// The named scope whose baseline is raised instead of the global fallback.
+    #[arg(long, value_name = "ID")]
+    scope: Option<String>,
 }
 
 /// The output format.
@@ -1736,6 +1956,8 @@ mod tests {
             exclude: Vec::new(),
             files: Vec::new(),
             description: None,
+            aggregate: None,
+            scopes: Vec::new(),
             exclude_globs: Vec::new(),
             file_globs: Vec::new(),
         }
