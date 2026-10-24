@@ -407,7 +407,7 @@ fn run_file_metrics(
     let globs = crate::config::compile_globs(patterns, &format!("{path}.file_metrics.files"))
         .map_err(|error| CounterError::config(error.to_string()))?;
     let mut paths = Vec::new();
-    collect_files(root, root, &mut paths)?;
+    collect_files(root, root, &globs, &mut paths)?;
     paths.sort();
     let mut measurements = Vec::new();
     for (relative, full) in paths {
@@ -490,6 +490,7 @@ fn line_metrics(text: &str) -> (usize, usize) {
 fn collect_files(
     root: &Path,
     directory: &Path,
+    globs: &[GlobMatcher],
     out: &mut Vec<(String, std::path::PathBuf)>,
 ) -> Result<(), CounterError> {
     let entries = fs::read_dir(directory).map_err(|error| {
@@ -502,18 +503,36 @@ fn collect_files(
         let kind = entry.file_type().map_err(|error| {
             CounterError::runtime(format!("cannot inspect repository entry: {error}"))
         })?;
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| CounterError::runtime("file path is outside repository root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
         if kind.is_symlink() {
-            return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+            // A directory link could contain selected descendants, and walking
+            // through it would weaken the repository boundary. Fail closed.
+            if globs.iter().any(|glob| glob.is_match(&relative)) {
+                return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+            }
+            match fs::metadata(entry.path()) {
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+                }
+                Ok(_) => {}
+                // A dangling, unselected link has no descendants to collect.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CounterError::runtime(format!(
+                        "cannot inspect symbolic link {relative}: {error}"
+                    )));
+                }
+            }
+            continue;
         }
         if kind.is_dir() {
-            collect_files(root, &entry.path(), out)?;
+            collect_files(root, &entry.path(), globs, out)?;
         } else if kind.is_file() {
-            let relative = entry
-                .path()
-                .strip_prefix(root)
-                .map_err(|_| CounterError::runtime("file path is outside repository root"))?
-                .to_string_lossy()
-                .replace('\\', "/");
             out.push((relative, entry.path()));
         }
     }
@@ -908,18 +927,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn file_metrics_refuse_symlinks() {
+    fn file_metrics_ignore_unselected_symlink_files() {
         let root = crate::test_tempdir::TempDir::new().expect("temporary root");
         let outside = crate::test_tempdir::TempDir::new().expect("outside root");
         fs::write(outside.path().join("A.java"), "x").expect("outside source");
-        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("link");
+        fs::create_dir_all(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/A.rs"), "fn main() {}\n").expect("selected source");
+        std::os::unix::fs::symlink(outside.path().join("A.java"), root.path().join("other.txt"))
+            .expect("link");
+        std::os::unix::fs::symlink(
+            root.path().join("missing"),
+            root.path().join("dangling.txt"),
+        )
+        .expect("dangling link");
+        let result = run_file_metrics(
+            &["src/**/*.rs".to_string()],
+            FileMetric::LineCount,
+            root.path(),
+            "test",
+        )
+        .expect("unselected symlink is ignored");
+        assert_eq!(result.value.measurements.expect("measurements").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_metrics_refuse_selected_symlink_files() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("outside root");
+        fs::write(outside.path().join("A.rs"), "fn main() {}\n").expect("outside source");
+        fs::create_dir_all(root.path().join("src")).expect("source directory");
+        std::os::unix::fs::symlink(outside.path().join("A.rs"), root.path().join("src/A.rs"))
+            .expect("link");
         let error = run_file_metrics(
-            &["**/*.java".to_string()],
+            &["src/**/*.rs".to_string()],
             FileMetric::SizeBytes,
             root.path(),
             "test",
         )
         .expect_err("symlinks are refused");
+        assert!(error.message.contains("symbolic links"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_metrics_refuse_unselected_symlink_directories() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("outside root");
+        fs::write(outside.path().join("A.rs"), "fn main() {}\n").expect("outside source");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked"))
+            .expect("directory link");
+        let error = run_file_metrics(
+            &["src/**/*.rs".to_string()],
+            FileMetric::SizeBytes,
+            root.path(),
+            "test",
+        )
+        .expect_err("symlink directories fail closed");
         assert!(error.message.contains("symbolic links"));
     }
 

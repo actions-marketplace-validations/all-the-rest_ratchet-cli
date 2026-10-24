@@ -278,7 +278,10 @@ its metric is `size_bytes`, `line_count` or `max_line_length`. Byte size counts
 raw bytes. Line count treats CRLF as one terminator, handles CR and LF, returns
 zero for an empty file and adds no phantom line after a trailing terminator.
 Maximum line length counts Unicode scalar values excluding terminators. The
-walk is deterministic and refuses symbolic links.
+walk is deterministic. A matching symbolic-link file is refused; an unmatched
+symbolic-link file is ignored. Symbolic-link directories are refused rather
+than traversed, so selected files cannot be silently omitted or read outside
+the repository tree.
 
 Named scopes take this shape:
 
