@@ -15,4 +15,8 @@ outside that vocabulary is a hard error, never a fallback.
 
 ## Open
 
-_No open items._
+- [ ] **One-time TODO migration to GitHub Issues:** inventory the actionable work
+  in `AGENTS.todo.md`, migrate the selected project TODOs into GitHub Issues with
+  Ratchet's membership/severity labels and owners, verify the issue set against
+  the source list, then update the project's workflow and documentation so
+  ongoing work is managed in Issues rather than duplicated in the file.

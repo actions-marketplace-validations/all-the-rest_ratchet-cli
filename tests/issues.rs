@@ -258,7 +258,8 @@ fn command(project: &Path, api_base: &str) -> Command {
         .env("RATCHET_ISSUES_API_BASE", api_base)
         .env("RATCHET_NO_UPDATE_CHECK", "1")
         .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN");
+        .env_remove("GH_TOKEN")
+        .env("RATCHET_GH_PATH", "/ratchet-test-no-gh");
     command
 }
 
@@ -509,6 +510,75 @@ fn the_gh_token_is_the_fallback() {
 
     assert_eq!(code(&output), 0, "{}", said(&output));
     assert_eq!(count_of(&output), 1);
+}
+
+#[cfg(unix)]
+fn fake_gh(directory: &Path, script: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = directory.join("gh");
+    fs::write(&path, script).expect("the fake gh is written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .expect("the fake gh is executable");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn the_installed_github_cli_supplies_the_token_when_environment_tokens_are_absent() {
+    let body = page(&[issue(1, "an issue", "open", &["ratchet"], &[])]);
+    let server = FakeIssues::start(|_| vec![Route::ok(issues_path(), body)]);
+    let project = project(&count_object(), 1);
+    let gh = fake_gh(project.path(), "#!/bin/sh\nprintf '%s\\n' 'test-token'\n");
+
+    let output = command(project.path(), &server.api_base)
+        .env("RATCHET_GH_PATH", gh)
+        .args(["check", "--format", "json"])
+        .output()
+        .expect("the binary runs");
+
+    assert_eq!(code(&output), 0, "{}", said(&output));
+    assert_eq!(count_of(&output), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_environment_token_takes_precedence_over_the_github_cli() {
+    let body = page(&[issue(1, "an issue", "open", &["ratchet"], &[])]);
+    let server = FakeIssues::start(|_| vec![Route::ok(issues_path(), body)]);
+    let project = project(&count_object(), 1);
+    let gh = fake_gh(
+        project.path(),
+        "#!/bin/sh\necho should-not-run >&2\nexit 1\n",
+    );
+
+    let output = command(project.path(), &server.api_base)
+        .env("RATCHET_GH_PATH", gh)
+        .env("GITHUB_TOKEN", TOKEN)
+        .args(["check", "--format", "json"])
+        .output()
+        .expect("the binary runs");
+
+    assert_eq!(code(&output), 0, "{}", said(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_github_cli_auth_is_closed_and_does_not_expose_its_output() {
+    let project = project(&count_object(), 0);
+    let gh = fake_gh(
+        project.path(),
+        "#!/bin/sh\necho secret-token\necho secret-token >&2\nexit 1\n",
+    );
+
+    let output = command(project.path(), "http://127.0.0.1:1")
+        .env("RATCHET_GH_PATH", gh)
+        .args(["check", "--format", "json"])
+        .output()
+        .expect("the binary runs");
+
+    assert_eq!(code(&output), 2, "{}", said(&output));
+    assert!(!said(&output).contains("secret-token"), "{}", said(&output));
+    assert!(detail_of(&output).contains("gh auth login"));
 }
 
 #[test]

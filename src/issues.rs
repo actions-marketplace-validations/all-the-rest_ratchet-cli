@@ -43,6 +43,9 @@ pub const DEFAULT_SEVERITY: Severity = Severity::Medium;
 /// The environment variables a token is read from, in order.
 pub const TOKEN_ENV: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
 
+/// Optional override for the GitHub CLI executable, primarily for tests.
+pub const GH_PATH_ENV: &str = "RATCHET_GH_PATH";
+
 /// How long one request may take.
 ///
 /// The counter runs inside a gate: a request that hangs must not hang the
@@ -121,10 +124,27 @@ fn token_from_env(repository: &str) -> Result<String, Error> {
             }
         }
     }
-    Err(Error::new(format!(
-        "the issues of {repository} cannot be read: neither GITHUB_TOKEN nor GH_TOKEN is set \
-         — the issues counter needs a token"
-    )))
+    let gh = std::env::var_os(GH_PATH_ENV).unwrap_or_else(|| "gh".into());
+    match std::process::Command::new(gh)
+        .args(["auth", "token"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Ok(token);
+            }
+            Err(token_unavailable(repository))
+        }
+        _ => Err(token_unavailable(repository)),
+    }
+}
+
+fn token_unavailable(repository: &str) -> Error {
+    Error::new(format!(
+        "the issues of {repository} cannot be read: neither GITHUB_TOKEN nor GH_TOKEN is set, \
+         and GitHub CLI authentication is unavailable — run `gh auth login` or set a token"
+    ))
 }
 
 /// Reads the findings of the repository and selects the ones that count.

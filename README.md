@@ -398,12 +398,13 @@ instead of keeping a second list beside them:
   count; without `statuses` the counting statuses count — for issues that is
   `open`, because a closed issue is `fixed`. An empty list is a configuration
   error.
-* **The token** comes from `GITHUB_TOKEN`, then `GH_TOKEN`. Without either, the
-  gate is **not green**: the rule fails as a counter error and the run exits
-  with code 2. The same is true for an unreachable API, a status other than
-  200, an answer that is not JSON, a missing field or an unknown state. The
-  pagination follows the `Link` header of the API and is bounded to 20 pages;
-  more is an error, never a truncated count.
+* **The token** comes from `GITHUB_TOKEN`, then `GH_TOKEN`, then the installed
+  GitHub CLI (`gh auth token`). If none is available or the CLI is not
+  authenticated, the gate is **not green**: the rule fails as a counter error
+  and the run exits with code 2. The same is true for an unreachable API, a
+  status other than 200, an answer that is not JSON, a missing field or an
+  unknown state. The pagination follows the `Link` header of the API and is
+  bounded to 20 pages; more is an error, never a truncated count.
 * **The network exception.** The engine opens no connection at runtime except
   the update check. This counter is the second exception and it is **opt-in
   per config**: a project without an `issues` counter never opens a connection.

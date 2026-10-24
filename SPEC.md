@@ -1045,7 +1045,9 @@ counter that cannot read the tracker never reports zero findings.
 **The network exception.** The engine opens no connection at runtime except the
 update check; this counter is the second exception, and it is **opt-in per
 config** — a project that does not configure `issues` never opens a connection.
-The token comes from `GITHUB_TOKEN`, then `GH_TOKEN`. The base of the API is
+The token comes from `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token` from
+the installed GitHub CLI. If all three sources are unavailable, the counter
+fails closed. The base of the API is
 `https://api.github.com` and can be overridden **only** by the environment
 variable `RATCHET_ISSUES_API_BASE`, never by the config: the request carries
 the token, and a base in a committed config would let the config decide where
