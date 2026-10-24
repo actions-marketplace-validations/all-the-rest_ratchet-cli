@@ -73,3 +73,10 @@ block is written by `ratchet release`.
 ### Fixed
 
 - build the linux assets on ubuntu 22.04 (release)
+
+## [0.4.0] - 2026-10-24
+
+### Added
+
+- count GitHub findings as a backend (issues)
+- add path-scoped metric gates (scopes)
