@@ -64,6 +64,7 @@ ratchet baseline init   # write the current count as the baseline
 ratchet baseline update # pay a ceiling down / a floor up — in that direction only
 ratchet baseline path   # print the path of the baseline file
 ratchet baseline raise --rule <id> --value <n> --reason "<text>" # move a baseline against its direction — with a reason
+ratchet baseline raise --rule <id> --scope <scope-id> --value <n> --reason "<text>" # raise only one path scope
 ratchet drift           # run the drift gates: the generated files
 ratchet verify          # run the pre-release checks: the commands against their snapshots
 ratchet report --format md # render the run into a Markdown report
@@ -241,11 +242,44 @@ A counter produces one of these values:
 | array of strings | the items; the count is the number of items after `exclude` |
 | `{"count": N}` | the count |
 | `{"count": N, "items": [...]}` | the count and the items |
+| `{"measurements": [{"path":"src/auth/Login.java", "value":123}]}` | one nonnegative integer per repository-relative file |
 
 For a command counter the stdout is parsed: trimmed, then tried as an integer,
 then as JSON in the shapes above. The command runs in the repository root,
 without a shell — the arguments are passed through verbatim. A counter that
 fails, produces garbage or a negative number is a counter error.
+
+For path-scoped metrics, a command can emit the `measurements` JSON shape above.
+Each path must be unique and resolve to a regular file inside the repository;
+malformed, duplicate, absolute, traversal and out-of-root paths fail closed.
+Rules use `aggregate: "count"` (distinct files) or `aggregate: "max"` before
+their values are compared with independent baselines.
+
+The built-in `file_metrics` counter measures any glob-selected files without
+language-specific parsing:
+
+```jsonc
+"java-file-size": {
+  "class": "file growth", "incident": "large source files are hard to change",
+  "unit": "bytes", "direction": "ceiling", "description": "All Java source files",
+  "aggregate": "max",
+  "count": { "file_metrics": { "files": ["**/*.java"], "metric": "size_bytes" } },
+  "scopes": [
+    { "id": "auth", "description": "Authentication module", "files": ["src/auth/**"] },
+    { "id": "legacy-login", "description": "Legacy login", "file": "src/auth/LegacyLogin.java" }
+  ]
+}
+```
+
+Metrics are `size_bytes` (raw bytes), `line_count` (CRLF-aware logical physical
+lines; an empty file is zero and a trailing newline adds no phantom line), and
+`max_line_length` (Unicode scalar values, excluding line terminators). Scopes
+assign every measurement once: exact file first, then the most-specific glob,
+then the global fallback. Tied specificity and empty named scopes are errors.
+Every scope has an independent baseline under the rule's `scopes` map; init
+and update process each executed scope. Add `--scope <id>` to `baseline raise`
+to raise only that named scope; without it, the global fallback is raised.
+Scope IDs and descriptions appear in human, JSON and Markdown reports.
 
 A **file** counter reads a JSON file of the repository — optionally a dotted
 `path` into it. The file follows the **one rule**: it is relative and it lies
@@ -771,8 +805,10 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `--version`, `--help` | |
 
 `baseline init` and `baseline update` accept `--reason <text>`, which is stored
-in the baseline record. `baseline raise` needs `--rule <id>`, `--value <n>` and
-`--reason <text>` — the reason is not optional there.
+in the baseline record. For measurement rules they process each selected scope
+independently. `baseline raise` needs `--rule <id>`, `--value <n>` and
+`--reason <text>` — the reason is not optional there. Add `--scope <id>` to
+raise only a named scope; without it the global fallback is addressed.
 
 ### The deliberate raise
 

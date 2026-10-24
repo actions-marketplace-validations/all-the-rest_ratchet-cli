@@ -119,6 +119,8 @@ pub enum Counter {
         /// The program and its arguments.
         command: Vec<String>,
     },
+    /// Built-in, language-agnostic metrics over selected repository files.
+    FileMetrics { file_metrics: FileMetrics },
     /// A JSON file, optionally with a dotted path into it.
     File {
         /// The file, relative to the repository root.
@@ -167,11 +169,32 @@ pub enum Counter {
     },
 }
 
+/// A built-in metric measured independently for each file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileMetric {
+    SizeBytes,
+    LineCount,
+    MaxLineLength,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileMetrics {
+    pub files: Vec<String>,
+    pub metric: FileMetric,
+}
+
 impl Counter {
     /// A short human readable description, used by `--debug`.
     pub fn describe(&self) -> String {
         match self {
             Counter::Command { command } => command.join(" "),
+            Counter::FileMetrics { file_metrics } => {
+                format!(
+                    "file_metrics {:?} ({:?})",
+                    file_metrics.files, file_metrics.metric
+                )
+            }
             Counter::File {
                 file,
                 path,
@@ -290,12 +313,37 @@ pub struct Rule {
     /// Free text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// How per-file measurements reduce to a scoped value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<Aggregate>,
+    /// Named path scopes. Exact-file scopes take precedence over glob scopes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<PathScope>,
     /// Compiled `exclude` patterns.
     #[serde(skip)]
     pub exclude_globs: Vec<GlobMatcher>,
     /// Compiled `files` patterns.
     #[serde(skip)]
     pub file_globs: Vec<GlobMatcher>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Aggregate {
+    Count,
+    Max,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathScope {
+    pub id: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(skip)]
+    pub globs: Vec<GlobMatcher>,
 }
 
 impl Rule {
@@ -949,6 +997,8 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
             "exclude",
             "files",
             "description",
+            "aggregate",
+            "scopes",
         ],
         &path,
     )?;
@@ -1009,6 +1059,51 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
         None => None,
         Some(value) => Some(expect_string(value, &format!("{path}.description"))?),
     };
+    if description
+        .as_deref()
+        .is_some_and(|text| text.trim().is_empty())
+    {
+        return Err(ConfigError::new(
+            format!("{path}.description"),
+            "must not be empty",
+        ));
+    }
+    let aggregate = match map.get("aggregate") {
+        None => None,
+        Some(value) => Some(
+            match expect_string(value, &format!("{path}.aggregate"))?.as_str() {
+                "count" => Aggregate::Count,
+                "max" => Aggregate::Max,
+                other => {
+                    return Err(ConfigError::new(
+                        format!("{path}.aggregate"),
+                        format!("expected \"count\" or \"max\", found \"{other}\""),
+                    ));
+                }
+            },
+        ),
+    };
+    let scopes = parse_scopes(map.get("scopes"), &format!("{path}.scopes"))?;
+    if matches!(count, Counter::FileMetrics { .. }) && aggregate.is_none() {
+        return Err(ConfigError::new(
+            format!("{path}.aggregate"),
+            "is required for file_metrics counters",
+        ));
+    }
+    if !scopes.is_empty() && aggregate.is_none() {
+        return Err(ConfigError::new(
+            format!("{path}.aggregate"),
+            "is required when scopes are configured",
+        ));
+    }
+    if (!scopes.is_empty() || aggregate.is_some())
+        && !matches!(count, Counter::Command { .. } | Counter::FileMetrics { .. })
+    {
+        return Err(ConfigError::new(
+            format!("{path}.count"),
+            "scoped metrics require per-file measurements",
+        ));
+    }
     let exclude_globs = compile_globs(&exclude, &format!("{path}.exclude"))?;
     let file_globs = compile_globs(&files, &format!("{path}.files"))?;
 
@@ -1023,6 +1118,8 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
         exclude,
         files,
         description,
+        aggregate,
+        scopes,
         exclude_globs,
         file_globs,
     })
@@ -1033,7 +1130,7 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
 
     // Exactly one form per counter: a counter that says two things at once
     // does not say which one counts.
-    let forms = ["command", "file", "registry", "issues"];
+    let forms = ["command", "file", "registry", "issues", "file_metrics"];
     let present: Vec<&str> = forms
         .iter()
         .copied()
@@ -1050,6 +1147,39 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
                 ));
             }
             Ok(Counter::Command { command })
+        }
+        ["file_metrics"] => {
+            check_unknown(map, &["file_metrics"], path)?;
+            let metrics = expect_object(&map["file_metrics"], &format!("{path}.file_metrics"))?;
+            check_unknown(
+                metrics,
+                &["files", "metric"],
+                &format!("{path}.file_metrics"),
+            )?;
+            let files = require_string_array(metrics, "files", &format!("{path}.file_metrics"))?;
+            if files.is_empty() {
+                return Err(ConfigError::new(
+                    format!("{path}.file_metrics.files"),
+                    "must not be empty",
+                ));
+            }
+            compile_globs(&files, &format!("{path}.file_metrics.files"))?;
+            let metric = match require_string(metrics, "metric", &format!("{path}.file_metrics"))?
+                .as_str()
+            {
+                "size_bytes" => FileMetric::SizeBytes,
+                "line_count" => FileMetric::LineCount,
+                "max_line_length" => FileMetric::MaxLineLength,
+                other => {
+                    return Err(ConfigError::new(
+                        format!("{path}.file_metrics.metric"),
+                        format!("unknown file metric \"{other}\""),
+                    ));
+                }
+            };
+            Ok(Counter::FileMetrics {
+                file_metrics: FileMetrics { files, metric },
+            })
         }
         ["file"] => {
             check_unknown(map, &["file", "path", "generate", "output_arg"], path)?;
@@ -1121,9 +1251,84 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
         ["issues"] => parse_issues_counter(map, path),
         _ => Err(ConfigError::new(
             path,
-            "expected exactly one of \"command\", \"file\", \"registry\" or \"issues\"",
+            "expected exactly one of \"command\", \"file\", \"registry\", \"issues\" or \"file_metrics\"",
         )),
     }
+}
+
+fn parse_scopes(value: Option<&Value>, path: &str) -> Result<Vec<PathScope>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = expect_array(value, path)?;
+    let mut scopes = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let at = format!("{path}[{index}]");
+        let map = expect_object(entry, &at)?;
+        check_unknown(map, &["id", "description", "file", "files"], &at)?;
+        let id = require_string(map, "id", &at)?;
+        let description = require_string(map, "description", &at)?;
+        if id.trim().is_empty() || description.trim().is_empty() {
+            return Err(ConfigError::new(
+                &at,
+                "id and description must not be empty",
+            ));
+        }
+        if scopes.iter().any(|scope: &PathScope| scope.id == id) {
+            return Err(ConfigError::new(
+                format!("{at}.id"),
+                format!("duplicate scope id \"{id}\""),
+            ));
+        }
+        let file = optional_string(map, "file", &at)?;
+        let files = optional_string_array(map, "files", &at)?;
+        if file.is_some() == !files.is_empty() {
+            return Err(ConfigError::new(
+                &at,
+                "specify exactly one of file or files",
+            ));
+        }
+        let selectors = file.iter().cloned().chain(files.iter().cloned());
+        for selector in selectors {
+            let path = Path::new(&selector);
+            if path.is_absolute()
+                || selector.contains('\\')
+                || path.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(ConfigError::new(
+                    &at,
+                    "scope paths must be repository-relative",
+                ));
+            }
+        }
+        if let Some(exact) = file.as_deref() {
+            if scopes
+                .iter()
+                .any(|scope: &PathScope| scope.file.as_deref() == Some(exact))
+            {
+                return Err(ConfigError::new(
+                    format!("{at}.file"),
+                    format!("duplicate exact-file scope \"{exact}\""),
+                ));
+            }
+        }
+        let globs = compile_globs(&files, &format!("{at}.files"))?;
+        scopes.push(PathScope {
+            id,
+            description,
+            file,
+            files,
+            globs,
+        });
+    }
+    Ok(scopes)
 }
 
 /// The `issues` counter: the findings of a GitHub repository (SPEC 13).
@@ -1454,6 +1659,51 @@ fn check_unknown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scoped_metric_config(scopes: &str) -> String {
+        r#"{"rules":{"size":{"class":"growth","incident":"i","unit":"bytes","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/*.java"],"metric":"size_bytes"}},"scopes":SCOPES}}}"#.replace("SCOPES", scopes)
+    }
+
+    #[test]
+    fn parses_scoped_file_metrics_and_exact_overrides() {
+        let config = parse_config_str(&scoped_metric_config(
+            r#"[
+            {"id":"auth","description":"Authentication","files":["src/auth/**"]},
+            {"id":"login","description":"Legacy login","file":"src/auth/Login.java"}
+        ]"#,
+        ))
+        .expect("valid scoped metric");
+        let rule = config.rules.get("size").expect("rule");
+        assert_eq!(rule.scopes.len(), 2);
+        assert_eq!(rule.aggregate, Some(Aggregate::Max));
+        assert!(matches!(
+            rule.count,
+            Counter::FileMetrics {
+                file_metrics: FileMetrics {
+                    metric: FileMetric::SizeBytes,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_scopes_without_aggregate_and_duplicate_scope_ids() {
+        let no_aggregate = scoped_metric_config("[]").replace("\"aggregate\":\"max\",", "");
+        assert!(parse_config_str(&no_aggregate).is_err());
+        let duplicates = scoped_metric_config(
+            r#"[
+            {"id":"same","description":"A","files":["a/**"]},
+            {"id":"same","description":"B","files":["b/**"]}
+        ]"#,
+        );
+        assert!(
+            parse_config_str(&duplicates)
+                .expect_err("duplicate ids fail")
+                .message
+                .contains("duplicate scope id")
+        );
+    }
 
     #[test]
     fn parses_a_jsonc_config_with_comments() {

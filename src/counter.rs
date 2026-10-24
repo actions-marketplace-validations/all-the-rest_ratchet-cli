@@ -12,7 +12,7 @@ use std::process::Command;
 use globset::GlobMatcher;
 use serde_json::Value;
 
-use crate::config::Counter;
+use crate::config::{Counter, FileMetric};
 use crate::generate::Generator;
 use crate::issues;
 use crate::registry::{Finding, Registry, Severity, Status};
@@ -24,6 +24,15 @@ pub struct CounterValue {
     pub count: Option<i64>,
     /// The counted items, if the counter reported any.
     pub items: Option<Vec<String>>,
+    /// Values emitted for individual repository-relative paths.
+    pub measurements: Option<Vec<Measurement>>,
+}
+
+/// One nonnegative metric attached to a repository-relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Measurement {
+    pub path: String,
+    pub value: i64,
 }
 
 /// A counter that did not deliver a usable count.
@@ -39,7 +48,7 @@ pub struct CounterError {
 
 impl CounterError {
     /// A failure of the counter at runtime.
-    fn runtime(message: impl Into<String>) -> Self {
+    pub(crate) fn runtime(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             output: None,
@@ -57,7 +66,7 @@ impl CounterError {
     }
 
     /// A misconfigured counter.
-    fn config(message: impl Into<String>) -> Self {
+    pub(crate) fn config(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             output: None,
@@ -92,8 +101,11 @@ pub struct CounterRun {
 /// `path` is the path of the counter in the config (`rules.a.count`): a
 /// counter that is misconfigured names it.
 pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<CounterRun, CounterError> {
-    match counter {
+    let run = match counter {
         Counter::Command { command } => run_command(command, root),
+        Counter::FileMetrics { file_metrics } => {
+            run_file_metrics(&file_metrics.files, file_metrics.metric, root, path)
+        }
         Counter::File {
             file,
             path: json_path,
@@ -142,7 +154,35 @@ pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<Counter
             severities: severities.as_deref(),
             statuses: statuses.as_deref(),
         }),
+    }?;
+    validate_measurement_files(&run.value, root)?;
+    Ok(run)
+}
+
+fn validate_measurement_files(value: &CounterValue, root: &Path) -> Result<(), CounterError> {
+    for measurement in value.measurements.iter().flatten() {
+        let resolved =
+            crate::path::inside_repository(root, &measurement.path).map_err(|refusal| {
+                CounterError::runtime(format!(
+                    "measurement path {} is outside the repository root: {}",
+                    measurement.path,
+                    refusal.message(&measurement.path, "is outside the repository root")
+                ))
+            })?;
+        let metadata = fs::metadata(&resolved).map_err(|error| {
+            CounterError::runtime(format!(
+                "cannot inspect measurement path {}: {error}",
+                measurement.path
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(CounterError::runtime(format!(
+                "measurement path {} is not a regular file",
+                measurement.path
+            )));
+        }
     }
+    Ok(())
 }
 
 /// Applies `exclude` to the items and turns the value into the final count.
@@ -151,7 +191,16 @@ pub fn finalize(
     exclude: &[GlobMatcher],
     exclude_path: &str,
 ) -> Result<i64, CounterError> {
-    let CounterValue { count, items } = value;
+    let CounterValue {
+        count,
+        items,
+        measurements,
+    } = value;
+    if measurements.is_some() {
+        return Err(CounterError::config(format!(
+            "config error at {exclude_path}: per-file measurements require scoped aggregation"
+        )));
+    }
 
     if let Some(items) = items {
         let mut items = items;
@@ -177,6 +226,28 @@ pub fn finalize(
     non_negative(count)
 }
 
+/// Reduces file measurements using a configured aggregate.
+pub fn finalize_measurements(
+    value: CounterValue,
+    aggregate: crate::config::Aggregate,
+) -> Result<i64, CounterError> {
+    let measurements = value
+        .measurements
+        .ok_or_else(|| CounterError::runtime("the counter did not emit per-file measurements"))?;
+    if measurements.is_empty() {
+        return Err(CounterError::runtime("the counter selected no files"));
+    }
+    match aggregate {
+        crate::config::Aggregate::Count => i64::try_from(measurements.len())
+            .map_err(|_| CounterError::runtime("measurement count is too large")),
+        crate::config::Aggregate::Max => measurements
+            .iter()
+            .map(|measurement| measurement.value)
+            .max()
+            .ok_or_else(|| CounterError::runtime("the counter selected no files")),
+    }
+}
+
 /// Parses the stdout of a command counter.
 pub fn parse_counter_output(raw: &str) -> Result<CounterValue, CounterError> {
     let trimmed = raw.trim();
@@ -187,6 +258,7 @@ pub fn parse_counter_output(raw: &str) -> Result<CounterValue, CounterError> {
         return Ok(CounterValue {
             count: Some(count),
             items: None,
+            measurements: None,
         });
     }
     let value: Value = serde_json::from_str(trimmed)
@@ -204,6 +276,7 @@ pub fn value_to_counter_value(value: &Value) -> Result<CounterValue, CounterErro
             Ok(CounterValue {
                 count: Some(count),
                 items: None,
+                measurements: None,
             })
         }
         Value::Array(items) => {
@@ -217,6 +290,7 @@ pub fn value_to_counter_value(value: &Value) -> Result<CounterValue, CounterErro
             Ok(CounterValue {
                 count: None,
                 items: Some(out),
+                measurements: None,
             })
         }
         Value::Object(map) => {
@@ -243,10 +317,73 @@ pub fn value_to_counter_value(value: &Value) -> Result<CounterValue, CounterErro
                     Some(out)
                 }
             };
-            if count.is_none() && items.is_none() {
+            let measurements = match map.get("measurements") {
+                None => None,
+                Some(value) => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        CounterError::runtime("the counter printed malformed measurements")
+                    })?;
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    let mut seen = std::collections::BTreeSet::new();
+                    for entry in entries {
+                        let item = entry.as_object().ok_or_else(|| {
+                            CounterError::runtime("the counter printed malformed measurements")
+                        })?;
+                        if item.len() != 2 {
+                            return Err(CounterError::runtime(
+                                "the counter printed malformed measurements",
+                            ));
+                        }
+                        let path = item.get("path").and_then(Value::as_str).ok_or_else(|| {
+                            CounterError::runtime("the counter printed malformed measurements")
+                        })?;
+                        let candidate = Path::new(path);
+                        if path.is_empty()
+                            || candidate.is_absolute()
+                            || path.contains('\\')
+                            || candidate
+                                .components()
+                                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                        {
+                            return Err(CounterError::runtime(
+                                "the counter printed a path that is not repository-relative",
+                            ));
+                        }
+                        if !seen.insert(path.to_string()) {
+                            return Err(CounterError::runtime(
+                                "the counter printed duplicate measurement paths",
+                            ));
+                        }
+                        let number = item
+                            .get("value")
+                            .and_then(Value::as_i64)
+                            .filter(|n| *n >= 0)
+                            .ok_or_else(|| {
+                                CounterError::runtime(
+                                    "the counter printed an invalid measurement value",
+                                )
+                            })?;
+                        parsed.push(Measurement {
+                            path: path.to_string(),
+                            value: number,
+                        });
+                    }
+                    Some(parsed)
+                }
+            };
+            if measurements.is_some() && (count.is_some() || items.is_some()) {
+                return Err(CounterError::runtime(
+                    "the counter mixed scalar values with per-file measurements",
+                ));
+            }
+            if count.is_none() && items.is_none() && measurements.is_none() {
                 return Err(CounterError::runtime("the counter did not print a count"));
             }
-            Ok(CounterValue { count, items })
+            Ok(CounterValue {
+                count,
+                items,
+                measurements,
+            })
         }
         _ => Err(CounterError::runtime("the counter did not print a count")),
     }
@@ -259,6 +396,128 @@ fn non_negative(count: i64) -> Result<i64, CounterError> {
         ));
     }
     Ok(count)
+}
+
+fn run_file_metrics(
+    patterns: &[String],
+    metric: FileMetric,
+    root: &Path,
+    path: &str,
+) -> Result<CounterRun, CounterError> {
+    let globs = crate::config::compile_globs(patterns, &format!("{path}.file_metrics.files"))
+        .map_err(|error| CounterError::config(error.to_string()))?;
+    let mut paths = Vec::new();
+    collect_files(root, root, &mut paths)?;
+    paths.sort();
+    let mut measurements = Vec::new();
+    for (relative, full) in paths {
+        if !globs.iter().any(|glob| glob.is_match(&relative)) {
+            continue;
+        }
+        let bytes = fs::read(&full)
+            .map_err(|error| CounterError::runtime(format!("cannot read {relative}: {error}")))?;
+        let value = match metric {
+            FileMetric::SizeBytes => i64::try_from(bytes.len())
+                .map_err(|_| CounterError::runtime("file is too large to measure"))?,
+            FileMetric::LineCount | FileMetric::MaxLineLength => {
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| CounterError::runtime(format!("{relative} is not UTF-8")))?;
+                let (line_count, max_line_length) = line_metrics(text);
+                let count = if metric == FileMetric::LineCount {
+                    line_count
+                } else {
+                    max_line_length
+                };
+                i64::try_from(count)
+                    .map_err(|_| CounterError::runtime("file metric is too large"))?
+            }
+        };
+        measurements.push(Measurement {
+            path: relative,
+            value,
+        });
+    }
+    Ok(CounterRun {
+        value: CounterValue {
+            count: None,
+            items: None,
+            measurements: Some(measurements),
+        },
+        output: String::new(),
+        findings: None,
+    })
+}
+
+fn line_metrics(text: &str) -> (usize, usize) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    let mut lines = 0usize;
+    let mut current = 0usize;
+    let mut longest = 0usize;
+    let mut chars = text.chars().peekable();
+    let mut ended_with_terminator = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '\n' => {
+                lines += 1;
+                longest = longest.max(current);
+                current = 0;
+                ended_with_terminator = true;
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                lines += 1;
+                longest = longest.max(current);
+                current = 0;
+                ended_with_terminator = true;
+            }
+            _ => {
+                current += 1;
+                ended_with_terminator = false;
+            }
+        }
+    }
+    if !ended_with_terminator {
+        lines += 1;
+        longest = longest.max(current);
+    }
+    (lines, longest)
+}
+
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) -> Result<(), CounterError> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        CounterError::runtime(format!("cannot read repository directory: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CounterError::runtime(format!("cannot read repository entry: {error}"))
+        })?;
+        let kind = entry.file_type().map_err(|error| {
+            CounterError::runtime(format!("cannot inspect repository entry: {error}"))
+        })?;
+        if kind.is_symlink() {
+            return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+        }
+        if kind.is_dir() {
+            collect_files(root, &entry.path(), out)?;
+        } else if kind.is_file() {
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|_| CounterError::runtime("file path is outside repository root"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((relative, entry.path()));
+        }
+    }
+    Ok(())
 }
 
 fn run_command(command: &[String], root: &Path) -> Result<CounterRun, CounterError> {
@@ -430,6 +689,7 @@ fn run_registry(
         value: CounterValue {
             count: Some(count),
             items: None,
+            measurements: None,
         },
         output: String::new(),
         findings: Some(findings),
@@ -450,6 +710,7 @@ fn run_issues(options: &issues::Options<'_>) -> Result<CounterRun, CounterError>
         value: CounterValue {
             count: Some(findings.len() as i64),
             items: None,
+            measurements: None,
         },
         output: String::new(),
         findings: Some(findings),
@@ -530,6 +791,136 @@ mod tests {
         assert!(parse_counter_output("not a number").is_err());
         assert!(parse_counter_output("").is_err());
         assert!(parse_counter_output(r#"{"nope": 1}"#).is_err());
+    }
+
+    #[test]
+    fn parses_per_file_measurements_and_rejects_unsafe_or_duplicate_paths() {
+        let value = parse_counter_output(r#"{"measurements":[{"path":"src/a.java","value":3}]}"#)
+            .expect("measurement parses");
+        assert_eq!(
+            value.measurements.expect("measurement list")[0],
+            Measurement {
+                path: "src/a.java".to_string(),
+                value: 3
+            }
+        );
+        for input in [
+            r#"{"measurements":[{"path":"/tmp/a","value":1}]}"#,
+            r#"{"measurements":[{"path":"../a","value":1}]}"#,
+            r#"{"measurements":[{"path":"a","value":-1}]}"#,
+            r#"{"measurements":[{"path":"a","value":1},{"path":"a","value":2}]}"#,
+        ] {
+            assert!(parse_counter_output(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn line_metrics_follow_crlf_and_unicode_scalar_semantics() {
+        assert_eq!(line_metrics(""), (0, 0));
+        assert_eq!(line_metrics("a\r\nb\n"), (2, 1));
+        assert_eq!(line_metrics("é🙂\n"), (1, 2));
+        assert_eq!(line_metrics("a\r\rb"), (3, 1));
+    }
+
+    #[test]
+    fn count_and_max_reduce_file_measurements() {
+        let value = CounterValue {
+            count: None,
+            items: None,
+            measurements: Some(vec![
+                Measurement {
+                    path: "a".to_string(),
+                    value: 4,
+                },
+                Measurement {
+                    path: "b".to_string(),
+                    value: 9,
+                },
+            ]),
+        };
+        assert_eq!(
+            finalize_measurements(value.clone(), crate::config::Aggregate::Count).expect("count"),
+            2
+        );
+        assert_eq!(
+            finalize_measurements(value, crate::config::Aggregate::Max).expect("max"),
+            9
+        );
+    }
+
+    #[test]
+    fn file_metrics_filter_globs_and_measure_bytes_and_lines() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        fs::create_dir_all(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/A.java"), "é\r\n🙂🙂\n").expect("Java source");
+        fs::write(root.path().join("src/B.txt"), "ignored").expect("nonmatching file");
+        fs::write(root.path().join("Top.java"), "x").expect("root-level Java source");
+        let patterns = vec!["**/*.java".to_string()];
+        let size = run_file_metrics(&patterns, FileMetric::SizeBytes, root.path(), "test")
+            .expect("size metric");
+        assert_eq!(
+            size.value
+                .measurements
+                .as_ref()
+                .expect("measurements")
+                .len(),
+            2
+        );
+        let nested_size = size
+            .value
+            .measurements
+            .as_ref()
+            .expect("measurements")
+            .iter()
+            .find(|measurement| measurement.path == "src/A.java")
+            .expect("nested Java file")
+            .value;
+        assert_eq!(nested_size, 13);
+        let lines = run_file_metrics(&patterns, FileMetric::LineCount, root.path(), "test")
+            .expect("line metric");
+        assert_eq!(
+            lines
+                .value
+                .measurements
+                .as_ref()
+                .expect("measurements")
+                .iter()
+                .find(|measurement| measurement.path == "src/A.java")
+                .expect("nested Java file")
+                .value,
+            2
+        );
+        let longest = run_file_metrics(&patterns, FileMetric::MaxLineLength, root.path(), "test")
+            .expect("line length metric");
+        assert_eq!(
+            longest
+                .value
+                .measurements
+                .as_ref()
+                .expect("measurements")
+                .iter()
+                .find(|measurement| measurement.path == "src/A.java")
+                .expect("nested Java file")
+                .value,
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_metrics_refuse_symlinks() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("outside root");
+        fs::write(outside.path().join("A.java"), "x").expect("outside source");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("link");
+        let error = run_file_metrics(
+            &["**/*.java".to_string()],
+            FileMetric::SizeBytes,
+            root.path(),
+            "test",
+        )
+        .expect_err("symlinks are refused");
+        assert!(error.message.contains("symbolic links"));
     }
 
     #[test]

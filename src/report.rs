@@ -40,10 +40,14 @@ pub fn render_stylish(report: &Report, quiet: bool) -> String {
         } else {
             "PASS"
         };
+        let detail = match rule.scope_description.as_deref() {
+            Some(description) => format!("{} — {description}", detail(rule)),
+            None => detail(rule),
+        };
         out.push_str(&format!(
             "  {status}  {:<width$}  {}\n",
             label(rule),
-            detail(rule),
+            detail,
             width = width
         ));
     }
@@ -405,9 +409,19 @@ pub fn render_counts(report: &Report) -> String {
             .as_ref()
             .map(|unit| format!("  ({unit})"))
             .unwrap_or_default();
+        let label = rule
+            .scope_id
+            .as_ref()
+            .map(|scope| format!("{}#{scope}", rule.id))
+            .unwrap_or_else(|| rule.id.clone());
+        let description = rule
+            .scope_description
+            .as_ref()
+            .map(|description| format!(" — {description}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  {:<width$}  {count}{unit}\n",
-            rule.id,
+            "  {:<width$}  {count}{unit}{description}\n",
+            label,
             width = width
         ));
     }
@@ -535,20 +549,44 @@ pub fn render_markdown(report: &Report) -> String {
     // 2. one row per rule.  The detail says why a rule is not green: the
     //    file alone has to say why.
     out.push_str("## Rules\n\n");
-    out.push_str("| Rule | Class | Direction | Tier | Count | Baseline | Status | Detail |\n");
-    out.push_str("|---|---|---|---|---|---|---|---|\n");
-    for rule in &report.rules {
-        out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
-            cell(&rule.id),
-            value(rule.class.as_deref()),
-            value(rule.direction.map(|direction| direction.as_str())),
-            value(rule.tier.map(|tier| tier.as_str())),
-            number(rule.count),
-            number(rule.baseline),
-            rule.status.as_str(),
-            value(rule.detail.as_deref()),
-        ));
+    let scoped = report
+        .rules
+        .iter()
+        .any(|rule| rule.scope_id.is_some() || rule.scope_description.is_some());
+    if scoped {
+        out.push_str("| Rule | Scope | Description | Class | Direction | Tier | Count | Baseline | Status | Detail |\n");
+        out.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+        for rule in &report.rules {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                cell(&rule.id),
+                value(rule.scope_id.as_deref()),
+                value(rule.scope_description.as_deref()),
+                value(rule.class.as_deref()),
+                value(rule.direction.map(|direction| direction.as_str())),
+                value(rule.tier.map(|tier| tier.as_str())),
+                number(rule.count),
+                number(rule.baseline),
+                rule.status.as_str(),
+                value(rule.detail.as_deref()),
+            ));
+        }
+    } else {
+        out.push_str("| Rule | Class | Direction | Tier | Count | Baseline | Status | Detail |\n");
+        out.push_str("|---|---|---|---|---|---|---|---|\n");
+        for rule in &report.rules {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                cell(&rule.id),
+                value(rule.class.as_deref()),
+                value(rule.direction.map(|direction| direction.as_str())),
+                value(rule.tier.map(|tier| tier.as_str())),
+                number(rule.count),
+                number(rule.baseline),
+                rule.status.as_str(),
+                value(rule.detail.as_deref()),
+            ));
+        }
     }
     out.push('\n');
 
@@ -645,11 +683,18 @@ fn number(value: Option<i64>) -> String {
 }
 
 /// The label of a rule in the human readable output.
-fn label(rule: &RuleResult) -> &str {
-    if rule.status == RuleStatus::MissingBaseline {
-        "missing-baseline"
+fn label(rule: &RuleResult) -> String {
+    let id = rule
+        .scope_id
+        .as_ref()
+        .map(|scope| format!("{}#{scope}", rule.id))
+        .unwrap_or_else(|| rule.id.clone());
+    if rule.status == RuleStatus::MissingBaseline && rule.scope_id.is_none() {
+        "missing-baseline".to_string()
+    } else if rule.status == RuleStatus::MissingBaseline {
+        format!("missing-baseline {id}")
     } else {
-        &rule.id
+        id
     }
 }
 
@@ -801,6 +846,10 @@ impl<'a> From<&'a VerifyEntry> for JsonVerify<'a> {
 #[derive(Serialize)]
 struct JsonRule<'a> {
     id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
     status: &'a str,
     count: Option<i64>,
     baseline: Option<i64>,
@@ -817,6 +866,8 @@ impl<'a> From<&'a RuleResult> for JsonRule<'a> {
     fn from(rule: &'a RuleResult) -> Self {
         Self {
             id: &rule.id,
+            scope: rule.scope_id.as_deref(),
+            description: rule.scope_description.as_deref(),
             status: rule.status.as_str(),
             count: rule.count,
             baseline: rule.baseline,

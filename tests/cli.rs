@@ -19,6 +19,183 @@ fn binary() -> Command {
     command
 }
 
+#[test]
+fn scoped_file_metrics_initialize_check_report_and_raise_only_one_scope() {
+    let config = r#"{
+      "rules": {"metric": {
+        "class": "file growth", "incident": "test", "unit": "bytes",
+        "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+        "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+        "scopes": [{"id":"auth", "description":"Authentication module", "files":["src/auth/**"]}]
+      }}
+    }"#;
+    let repo = Repo::plain(config, None);
+    repo.write("src/auth/Login.java", "abc");
+    repo.write("src/util/Other.java", "123456");
+    let missing = repo.run(&["check", "--format", "json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    let missing: Value = serde_json::from_slice(&missing.stdout).expect("missing-baseline report");
+    assert_eq!(missing["summary"]["failed"], 2);
+    let initialized = repo.run(&["baseline", "init", "--rule", "metric"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let baseline: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(baseline["rules"]["metric"]["value"], 6);
+    assert_eq!(baseline["rules"]["metric"]["scopes"]["auth"]["value"], 3);
+    repo.git(&["init", "-q", "."]);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "baseline"]);
+
+    let checked = repo.run(&["check", "--format", "json"]);
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).expect("JSON report");
+    assert_eq!(report["rules"].as_array().expect("rule results").len(), 2);
+    assert!(
+        report["rules"]
+            .as_array()
+            .expect("rule results")
+            .iter()
+            .any(
+                |entry| entry["scope"] == "auth" && entry["description"] == "Authentication module"
+            )
+    );
+    let repeated = repo.run(&["check", "--format", "json"]);
+    assert_eq!(
+        checked.stdout, repeated.stdout,
+        "scope reports are deterministic"
+    );
+
+    let counts = repo.run(&["count", "--rule", "metric", "--format", "json"]);
+    assert!(
+        counts.status.success(),
+        "{}",
+        String::from_utf8_lossy(&counts.stderr)
+    );
+    let counts: Value = serde_json::from_slice(&counts.stdout).expect("count JSON");
+    assert_eq!(counts["rules"].as_array().expect("count results").len(), 2);
+    let markdown = repo.run(&["report"]);
+    assert!(
+        markdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    assert!(String::from_utf8_lossy(&markdown.stdout).contains("Authentication module"));
+
+    let raised = repo.run(&[
+        "baseline",
+        "raise",
+        "--rule",
+        "metric",
+        "--scope",
+        "auth",
+        "--value",
+        "4",
+        "--reason",
+        "planned growth",
+    ]);
+    assert!(
+        raised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raised.stderr)
+    );
+    let after: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(after["rules"]["metric"]["value"], 6);
+    assert_eq!(after["rules"]["metric"]["scopes"]["auth"]["value"], 4);
+    let raised_check = repo.run(&["check", "--format", "json"]);
+    assert!(
+        raised_check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raised_check.stdout)
+    );
+
+    repo.write("src/auth/Login.java", "ab");
+    let updated = repo.run(&["baseline", "update", "--rule", "metric"]);
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stdout)
+    );
+    let after_update: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(after_update["rules"]["metric"]["value"], 6);
+    assert_eq!(
+        after_update["rules"]["metric"]["scopes"]["auth"]["value"],
+        2
+    );
+}
+
+#[test]
+fn command_counter_measurements_are_aggregated_and_paths_are_validated() {
+    let valid = r#"{"rules":{"r":{"class":"coverage","incident":"test","unit":"files","direction":"floor","aggregate":"count","count":{"command":["sh","-c","printf '%s' '{\"measurements\":[{\"path\":\"src/A.java\",\"value\":10},{\"path\":\"src/B.java\",\"value\":20}]}'"]}}}}"#;
+    let repo = Repo::plain(valid, None);
+    repo.write("src/A.java", "a");
+    repo.write("src/B.java", "b");
+    let count = repo.run(&["count", "--format", "json"]);
+    assert!(
+        count.status.success(),
+        "{}",
+        String::from_utf8_lossy(&count.stderr)
+    );
+    let report: Value = serde_json::from_slice(&count.stdout).expect("count JSON");
+    assert_eq!(report["rules"][0]["count"], 2);
+
+    let unsafe_config = r#"{"rules":{"r":{"class":"coverage","incident":"test","unit":"files","direction":"floor","aggregate":"count","count":{"command":["sh","-c","printf '%s' '{\"measurements\":[{\"path\":\"outside.java\",\"value\":10}]}'"]}}}}"#;
+    let unsafe_repo = Repo::plain(unsafe_config, None);
+    let _outside = TempDir::new().expect("outside root");
+    unsafe_repo.write("outside.java", "inside");
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(unsafe_repo.path().join("outside.java")).expect("remove inside file");
+        std::os::unix::fs::symlink(
+            _outside.path().join("secret.java"),
+            unsafe_repo.path().join("outside.java"),
+        )
+        .expect("outside link");
+        std::fs::write(_outside.path().join("secret.java"), "secret").expect("outside file");
+        let output = unsafe_repo.run(&["count", "--format", "json"]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("outside the repository root"));
+    }
+}
+
+#[test]
+fn scoped_baseline_can_start_without_a_global_fallback_and_initialize_it_later() {
+    let config = r#"{"rules":{"m":{"class":"growth","incident":"test","unit":"bytes","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/*.java"],"metric":"size_bytes"}},"scopes":[{"id":"auth","description":"Auth","files":["src/auth/**"]}]}}}"#;
+    let repo = Repo::plain(config, None);
+    repo.write("src/auth/Login.java", "abc");
+    let first = repo.run(&["baseline", "init"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let initial: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline");
+    assert!(initial["rules"]["m"].get("value").is_none());
+    assert_eq!(initial["rules"]["m"]["scopes"]["auth"]["value"], 3);
+
+    repo.write("src/Other.java", "12345");
+    let second = repo.run(&["baseline", "init"]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let updated: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline");
+    assert_eq!(updated["rules"]["m"]["value"], 5);
+    assert_eq!(updated["rules"]["m"]["scopes"]["auth"]["value"], 3);
+}
+
 /// A temporary git repository with a config and a baseline.
 struct Repo {
     dir: TempDir,
