@@ -35,7 +35,8 @@ only decrease, and `ratchet baseline update` is the only way to move it.
 Keep them few and justified. Every dependency is a supply-chain and a build-time
 cost; a standard-library implementation is preferred over a crate for anything
 small. No network access at runtime except the (optional, once-a-day) update
-check.
+check and the opt-in `issues` counter — a project that does not configure
+`issues` never opens a connection.
 
 ## Commit convention
 

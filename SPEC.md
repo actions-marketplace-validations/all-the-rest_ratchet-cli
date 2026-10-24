@@ -216,6 +216,7 @@ Exactly one of:
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites" }
 { "file": "docs/_audit-raw.json", "path": "coherence.unwrappedCallSites", "generate": ["node", "scripts/audit-inventory.mjs"], "output_arg": "--output" }
 { "registry": "ratchet.findings.json", "severities": ["critical", "high"], "statuses": ["open", "in-progress"] }
+{ "issues": { "repository": "owner/repo", "label": "ratchet" }, "severities": ["critical", "high"], "statuses": ["open"] }
 ```
 
 * `command` — an argv array. **No shell** is involved; the arguments are passed
@@ -242,6 +243,11 @@ Exactly one of:
   responsible for its freshness. `output_arg` without `generate` is a
   configuration error — a silently ignored argument is a rule that does not do
   what it says.
+
+`registry` and `issues` are the two **findings backends**: they do not produce
+a raw value, they produce the findings the count is made of (§13). Both take
+the optional `severities` and `statuses` lists, and an empty list is a
+configuration error — a gate that counts nothing is green forever.
 
 The value the counter produces may be:
 
@@ -937,6 +943,75 @@ The prose document (the security review closure, the UI review log) stays the
 migrated in the same commit and must not disagree about the severity of a
 finding — a status written into the severity field destroys the severity, and
 the migration has to recover it from the row.
+
+### The issues backend
+
+A project that already tracks its findings as GitHub issues can count them
+there instead of keeping a second list beside them:
+
+```jsonc
+"open-findings": {
+  "tier": "slow",
+  "count": {
+    "issues": {
+      "repository": "owner/repo",
+      "label": "ratchet",
+      "severity_prefix": "severity:",
+      "default_severity": "medium"
+    },
+    "severities": ["critical", "high"],
+    "statuses": ["open"]
+  }
+}
+```
+
+`repository` is **required** and has the form `owner/repo`. `label` (default
+`ratchet`), `severity_prefix` (default `severity:`) and `default_severity`
+(default `medium`) are optional. `severities` and `statuses` are the lists of
+the registry: they narrow the count in the same way, and without them every
+level counts and the counting statuses count. `issues` is mutually exclusive
+with `command`, `file` and `registry`. An unknown field, an empty label, an
+unknown default level or a `repository` outside the form is a configuration
+error that names its path.
+
+**Membership.** The API is asked for the issues that carry the membership label
+(`state=all&labels=<label>&per_page=100`, 100 per page). Pull requests are not
+findings although the issues API carries them: an entry with a `pull_request`
+field is skipped.
+
+**The mapping.**
+
+| Issue | Finding |
+|---|---|
+| label `<severity_prefix><level>` | `severity`; a label with the prefix and a level outside the vocabulary is an **operational error** that names the issue and the label |
+| no severity label | `default_severity` |
+| `state: "open"` | `status: "open"` |
+| `state: "closed"` | `status: "fixed"` |
+| the first assignee | `owner`; empty when the issue has none |
+| `#<number>` | `ticket` and `id`; `title` is the issue title, `path` stays empty |
+
+The findings are sorted by issue number. The report shows the findings the
+count was made of, exactly as it does for the registry (§14), and the same
+answer produces the same bytes.
+
+**The failure modes.** A missing token, an unreachable API, a status other than
+200, an answer that is not JSON, a missing field or an unknown state is an
+**operational error** (exit 2). The pagination follows the `Link` header with
+`rel="next"` and is bounded to 20 pages; more is an operational error. A
+counter that cannot read the tracker never reports zero findings.
+
+**The network exception.** The engine opens no connection at runtime except the
+update check; this counter is the second exception, and it is **opt-in per
+config** — a project that does not configure `issues` never opens a connection.
+The token comes from `GITHUB_TOKEN`, then `GH_TOKEN`. The base of the API is
+`https://api.github.com` and can be overridden **only** by the environment
+variable `RATCHET_ISSUES_API_BASE`, never by the config: the request carries
+the token, and a base in a committed config would let the config decide where
+the token of the person who runs the gate is sent. A rule that counts issues
+belongs to the **slow** tier: the counter is a network call, and the fast tier
+is defined as one that needs no infrastructure (§7). Since rules otherwise
+default to `fast`, an issues rule must explicitly set `"tier": "slow"`; an
+omitted tier or `"fast"` is a configuration error.
 
 ## 14. The Markdown report
 

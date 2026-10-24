@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::config::Counter;
 use crate::generate::Generator;
+use crate::issues;
 use crate::registry::{Finding, Registry, Severity, Status};
 
 /// The value a counter produced.
@@ -78,11 +79,11 @@ pub struct CounterRun {
     pub value: CounterValue,
     /// The raw output of the subprocess; the diagnostic channel carries it.
     pub output: String,
-    /// The findings that count, when the counter is a findings registry.
+    /// The findings that count, when the counter is a findings backend.
     ///
     /// The list is the **same** selection the count was made of: the report
     /// shows the findings that produced the number, not a second reading of
-    /// the registry (SPEC 14).  It is `None` for every other counter.
+    /// the source (SPEC 14). It is `None` for every other counter.
     pub findings: Option<Vec<Finding>>,
 }
 
@@ -126,6 +127,21 @@ pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<Counter
             root,
             path,
         ),
+        Counter::Issues {
+            repository,
+            label,
+            severity_prefix,
+            default_severity,
+            severities,
+            statuses,
+        } => run_issues(&issues::Options {
+            repository,
+            label,
+            severity_prefix,
+            default_severity: *default_severity,
+            severities: severities.as_deref(),
+            statuses: statuses.as_deref(),
+        }),
     }
 }
 
@@ -413,6 +429,26 @@ fn run_registry(
     Ok(CounterRun {
         value: CounterValue {
             count: Some(count),
+            items: None,
+        },
+        output: String::new(),
+        findings: Some(findings),
+    })
+}
+
+/// Reads the findings of a GitHub repository (SPEC 13).
+///
+/// The token, the endpoint and the requests live in [`crate::issues`]; the
+/// counter turns the answer into a count, and the findings travel with it —
+/// exactly as the registry's do.  A failure never becomes a zero: a missing
+/// token, a failing request or a label outside the vocabulary leaves the rule
+/// without a count, and the run exits with 2.
+fn run_issues(options: &issues::Options<'_>) -> Result<CounterRun, CounterError> {
+    let findings =
+        issues::findings(options).map_err(|error| CounterError::runtime(error.message()))?;
+    Ok(CounterRun {
+        value: CounterValue {
+            count: Some(findings.len() as i64),
             items: None,
         },
         output: String::new(),

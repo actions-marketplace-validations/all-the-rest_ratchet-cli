@@ -146,6 +146,25 @@ pub enum Counter {
         #[serde(skip_serializing_if = "Option::is_none")]
         statuses: Option<Vec<Status>>,
     },
+    /// The findings of a GitHub repository; the count is the number of the
+    /// issues that count (SPEC 13).
+    Issues {
+        /// The repository, in the form `owner/repo`.
+        repository: String,
+        /// The label that makes an issue a finding of the gate.
+        label: String,
+        /// The prefix of the label that carries the severity.
+        severity_prefix: String,
+        /// The severity of an issue without a severity label.
+        default_severity: Severity,
+        /// The levels that count; every level counts without the list.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        severities: Option<Vec<Severity>>,
+        /// The statuses that count; the counting statuses count without the
+        /// list.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        statuses: Option<Vec<Status>>,
+    },
 }
 
 impl Counter {
@@ -203,6 +222,37 @@ impl Counter {
                     text.push_str(&filters.join("; "));
                     text.push(')');
                 }
+                text
+            }
+            Counter::Issues {
+                repository,
+                label,
+                severities,
+                statuses,
+                ..
+            } => {
+                let mut text = format!("{repository} (label: {label}");
+                if let Some(severities) = severities {
+                    text.push_str(&format!(
+                        "; severities: {}",
+                        severities
+                            .iter()
+                            .map(|severity| severity.as_str())
+                            .collect::<Vec<&str>>()
+                            .join(", ")
+                    ));
+                }
+                if let Some(statuses) = statuses {
+                    text.push_str(&format!(
+                        "; statuses: {}",
+                        statuses
+                            .iter()
+                            .map(|status| status.as_str())
+                            .collect::<Vec<&str>>()
+                            .join(", ")
+                    ));
+                }
+                text.push(')');
                 text
             }
         }
@@ -947,6 +997,12 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
         }
         Some(value) => parse_counter(value, &format!("{path}.count"))?,
     };
+    if matches!(&count, Counter::Issues { .. }) && tier != Tier::Slow {
+        return Err(ConfigError::new(
+            format!("{path}.tier"),
+            "issues counters require tier \"slow\" because they make network requests",
+        ));
+    }
     let exclude = optional_string_array(map, "exclude", &path)?;
     let files = optional_string_array(map, "files", &path)?;
     let description = match map.get("description") {
@@ -975,11 +1031,16 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
 fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
     let map = expect_object(value, path)?;
 
-    let has_command = map.contains_key("command");
-    let has_file = map.contains_key("file");
-    let has_registry = map.contains_key("registry");
-    match (has_command, has_file, has_registry) {
-        (true, false, false) => {
+    // Exactly one form per counter: a counter that says two things at once
+    // does not say which one counts.
+    let forms = ["command", "file", "registry", "issues"];
+    let present: Vec<&str> = forms
+        .iter()
+        .copied()
+        .filter(|key| map.contains_key(*key))
+        .collect();
+    match present.as_slice() {
+        ["command"] => {
             check_unknown(map, &["command"], path)?;
             let command = require_string_array(map, "command", path)?;
             if command.is_empty() {
@@ -990,7 +1051,7 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
             }
             Ok(Counter::Command { command })
         }
-        (false, true, false) => {
+        ["file"] => {
             check_unknown(map, &["file", "path", "generate", "output_arg"], path)?;
             let file = require_string(map, "file", path)?;
             let json_path = match map.get("path") {
@@ -1040,7 +1101,7 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
                 output_arg,
             })
         }
-        (false, false, true) => {
+        ["registry"] => {
             check_unknown(map, &["registry", "severities", "statuses"], path)?;
             let registry = require_string(map, "registry", path)?;
             if registry.trim().is_empty() {
@@ -1057,14 +1118,113 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
                 statuses,
             })
         }
+        ["issues"] => parse_issues_counter(map, path),
         _ => Err(ConfigError::new(
             path,
-            "expected exactly one of \"command\", \"file\" or \"registry\"",
+            "expected exactly one of \"command\", \"file\", \"registry\" or \"issues\"",
         )),
     }
 }
 
-/// The levels of a registry counter; every level counts without the list.
+/// The `issues` counter: the findings of a GitHub repository (SPEC 13).
+fn parse_issues_counter(map: &Map<String, Value>, path: &str) -> Result<Counter, ConfigError> {
+    check_unknown(map, &["issues", "severities", "statuses"], path)?;
+    let issues_path = format!("{path}.issues");
+    let value = map
+        .get("issues")
+        .ok_or_else(|| ConfigError::new(&issues_path, "missing required field"))?;
+    let issues = expect_object(value, &issues_path)?;
+    check_unknown(
+        issues,
+        &["repository", "label", "severity_prefix", "default_severity"],
+        &issues_path,
+    )?;
+
+    let repository = require_string(issues, "repository", &issues_path)?;
+    if !is_repository(&repository) {
+        return Err(ConfigError::new(
+            format!("{issues_path}.repository"),
+            format!("expected \"owner/repo\", found \"{repository}\""),
+        ));
+    }
+
+    let label = optional_string(issues, "label", &issues_path)?
+        .unwrap_or_else(|| crate::issues::DEFAULT_LABEL.to_string());
+    if label.trim().is_empty() {
+        return Err(ConfigError::new(
+            format!("{issues_path}.label"),
+            "must not be empty",
+        ));
+    }
+    // The API takes the labels of the query comma separated: a comma inside
+    // the label would select two labels and the count would be of another
+    // set than the one the config names.
+    if label.contains(',') {
+        return Err(ConfigError::new(
+            format!("{issues_path}.label"),
+            "must not contain a comma — the API separates labels with it",
+        ));
+    }
+
+    let severity_prefix = optional_string(issues, "severity_prefix", &issues_path)?
+        .unwrap_or_else(|| crate::issues::DEFAULT_SEVERITY_PREFIX.to_string());
+    if severity_prefix.is_empty() {
+        return Err(ConfigError::new(
+            format!("{issues_path}.severity_prefix"),
+            "must not be empty",
+        ));
+    }
+
+    let default_severity = match issues.get("default_severity") {
+        None => crate::issues::DEFAULT_SEVERITY,
+        Some(value) => {
+            let text = expect_string(value, &format!("{issues_path}.default_severity"))?;
+            Severity::parse(&text).ok_or_else(|| {
+                ConfigError::new(
+                    format!("{issues_path}.default_severity"),
+                    format!(
+                        "unknown severity \"{text}\" — expected one of {}",
+                        SEVERITIES.join(", ")
+                    ),
+                )
+            })?
+        }
+    };
+
+    let severities = optional_severities(map, "severities", path)?;
+    let statuses = optional_statuses(map, "statuses", path)?;
+    Ok(Counter::Issues {
+        repository,
+        label,
+        severity_prefix,
+        default_severity,
+        severities,
+        statuses,
+    })
+}
+
+/// True when a repository is in the form `owner/repo`.
+///
+/// The form is checked strictly: the name is part of the request URL, and a
+/// name that carries a path separator, a query or a fragment would address a
+/// different resource than the one the config names.
+fn is_repository(text: &str) -> bool {
+    let mut parts = text.split('/');
+    let (Some(owner), Some(repository), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    valid(owner) && valid(repository)
+}
+
+/// The levels of a findings counter; every level counts without the list.
 fn optional_severities(
     map: &Map<String, Value>,
     key: &str,
@@ -1101,7 +1261,7 @@ fn optional_severities(
     }
 }
 
-/// The statuses of a registry counter; the counting statuses count without
+/// The statuses of a findings counter; the counting statuses count without
 /// the list.
 fn optional_statuses(
     map: &Map<String, Value>,
@@ -1437,6 +1597,132 @@ mod tests {
                 severities: None,
                 statuses: None,
             }
+        );
+    }
+
+    #[test]
+    fn parses_the_issues_counter_with_its_defaults() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "tier": "slow", "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets" } } } } }]"#;
+        let config = parse_config_str(text).expect("config parses");
+        let rule = config.rules.get("a").expect("rule exists");
+        assert_eq!(
+            rule.count,
+            Counter::Issues {
+                repository: "acme/widgets".into(),
+                label: "ratchet".into(),
+                severity_prefix: "severity:".into(),
+                default_severity: Severity::Medium,
+                severities: None,
+                statuses: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_the_issues_counter_with_every_field() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "tier": "slow", "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets", "label": "gate",
+                                   "severity_prefix": "level:",
+                                   "default_severity": "low" },
+                       "severities": ["critical", "high"],
+                       "statuses": ["open"] } } } }]"#;
+        let config = parse_config_str(text).expect("config parses");
+        let rule = config.rules.get("a").expect("rule exists");
+        assert_eq!(
+            rule.count,
+            Counter::Issues {
+                repository: "acme/widgets".into(),
+                label: "gate".into(),
+                severity_prefix: "level:".into(),
+                default_severity: Severity::Low,
+                severities: Some(vec![Severity::Critical, Severity::High]),
+                statuses: Some(vec![Status::Open]),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_issues_counters_in_the_fast_tier() {
+        for tier in [None, Some("fast")] {
+            let tier = tier
+                .map(|tier| format!("\"tier\": \"{tier}\","))
+                .unwrap_or_default();
+            let text = format!(
+                r#"[{{ "rules": {{ "a": {{ "class": "c", "incident": "i", "unit": "u",
+                    {tier} "direction": "ceiling",
+                    "count": {{ "issues": {{ "repository": "acme/widgets" }} }} }} }} }}]"#
+            );
+            let error = parse_config_str(&text).expect_err("network rules cannot be fast");
+            assert_eq!(error.path, "rules.a.tier");
+            assert!(error.message.contains("slow"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn rejects_a_repository_that_is_not_owner_repo() {
+        for repository in [
+            "widgets",
+            "owner/",
+            "/widgets",
+            "a/b/c",
+            "own er/widgets",
+            "../x",
+        ] {
+            let text = format!(
+                r#"[{{ "rules": {{ "a": {{ "class": "c", "incident": "i", "unit": "u",
+                    "direction": "ceiling",
+                    "count": {{ "issues": {{ "repository": "{repository}" }} }} }} }} }}]"#
+            );
+            let error = parse_config_str(&text).expect_err("the repository is malformed");
+            assert_eq!(
+                error.path, "rules.a.count.issues.repository",
+                "for {repository}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_field_in_the_issues_counter() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets", "base": "https://example.com" } } } } }]"#;
+        let error = parse_config_str(text).expect_err("an unknown field is an error");
+        assert_eq!(error.path, "rules.a.count.issues.base");
+    }
+
+    #[test]
+    fn rejects_an_unknown_default_severity() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets", "default_severity": "blocker" } } } } }]"#;
+        let error = parse_config_str(text).expect_err("an unknown level is an error");
+        assert_eq!(error.path, "rules.a.count.issues.default_severity");
+    }
+
+    #[test]
+    fn rejects_an_empty_label() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets", "label": "  " } } } } }]"#;
+        let error = parse_config_str(text).expect_err("an empty label is an error");
+        assert_eq!(error.path, "rules.a.count.issues.label");
+    }
+
+    #[test]
+    fn rejects_issues_together_with_a_registry() {
+        let text = r#"[{ "rules": { "a": { "class": "c", "incident": "i", "unit": "u",
+            "direction": "ceiling",
+            "count": { "issues": { "repository": "acme/widgets" },
+                       "registry": "ratchet.findings.json" } } } }]"#;
+        let error = parse_config_str(text).expect_err("two counters is an error");
+        assert_eq!(error.path, "rules.a.count");
+        assert!(
+            error.message.contains("\"issues\""),
+            "the message names the form: {}",
+            error.message
         );
     }
 

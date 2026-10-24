@@ -21,7 +21,7 @@ declared direction — or, deliberately and with a reason, against it.
 
 The engine owns the baseline, the direction, the monotonicity and the
 reporting. The project owns the counting: a rule produces its number through a
-command, a JSON file or a findings registry.
+command, a JSON file, a findings registry or the issues of a repository.
 
 ## Install
 
@@ -324,6 +324,61 @@ The file itself:
 * The registry is a **view** of the prose findings, not a second source of
   truth: the review log stays the human record, and the two are migrated in
   the same commit.
+
+### The issues backend
+
+A project that already tracks its findings as GitHub issues counts them there
+instead of keeping a second list beside them:
+
+```jsonc
+"open-findings": {
+  "tier": "slow",
+  "count": {
+    "issues": {
+      "repository": "owner/repo",      // required, the form is owner/repo
+      "label": "ratchet",              // optional, the membership label
+      "severity_prefix": "severity:",  // optional, the prefix of the level label
+      "default_severity": "medium"     // optional, an issue without a level
+    },
+    "severities": ["critical", "high"],
+    "statuses": ["open"]
+  }
+}
+```
+
+* **Membership is a label.** Only issues that carry the label count — `ratchet`
+  by default — so the tracker can hold other tickets without feeding the gate.
+  Pull requests are not findings: an entry with a `pull_request` field is
+  skipped although the issues API carries it.
+* **The level is a label.** `<severity_prefix><level>` with `level` in
+  `critical`, `high`, `medium`, `low`, `info`; an issue without such a label
+  counts as `default_severity` (`medium`). A label with the prefix and a level
+  outside the vocabulary is an **error** that names the issue and the label —
+  never a silent fallback.
+* **The mapping follows the registry.** An open issue is `open`, a closed one
+  is `fixed`; the first assignee is the `owner` (empty when the issue has
+  none), and `#<number>` is the `ticket` and the `id`. A `path` stays empty.
+  The findings are sorted by issue number, so the same data produces the same
+  bytes.
+* **The filters are the registry's.** `severities` and `statuses` narrow the
+  count; without `statuses` the counting statuses count — for issues that is
+  `open`, because a closed issue is `fixed`. An empty list is a configuration
+  error.
+* **The token** comes from `GITHUB_TOKEN`, then `GH_TOKEN`. Without either, the
+  gate is **not green**: the rule fails as a counter error and the run exits
+  with code 2. The same is true for an unreachable API, a status other than
+  200, an answer that is not JSON, a missing field or an unknown state. The
+  pagination follows the `Link` header of the API and is bounded to 20 pages;
+  more is an error, never a truncated count.
+* **The network exception.** The engine opens no connection at runtime except
+  the update check. This counter is the second exception and it is **opt-in
+  per config**: a project without an `issues` counter never opens a connection.
+  The endpoint is `https://api.github.com`, overridable only through
+  `RATCHET_ISSUES_API_BASE` (for tests and CI) — a base in the config would
+  decide where the token of the person who runs the gate is sent. The counter
+  is a network call: a rule that counts issues belongs to the `slow` tier.
+  Since rules otherwise default to `fast`, set `"tier": "slow"` on the rule;
+  omitting it or setting `fast` is a configuration error.
 
 ### The globs
 
@@ -1115,9 +1170,10 @@ The CI sets that variable: a green run never depends on the network.
 
 The first three exist so that the tests can serve a fake release from a local
 socket. Every invocation of the binary in the tests carries
-`RATCHET_NO_UPDATE_CHECK=1` — the update check is the only thing that would
-reach the network, and it is off: **the tests never touch the network**, and
-they never write into the cache of the machine that runs them.
+`RATCHET_NO_UPDATE_CHECK=1` — an update check would reach the network — and
+the issues counter of the tests is pointed at a local socket: **the tests never
+touch the network**, and they never write into the cache of the machine that
+runs them.
 
 ## The GitHub Action
 

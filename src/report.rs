@@ -1,6 +1,8 @@
 //! The output formats: `stylish` (human readable), `json` (machine readable)
 //! and `md` (the Markdown report).
 
+use std::cmp::Ordering;
+
 use serde::Serialize;
 
 use crate::check::{BaselineAction, Report, RuleResult, RuleStatus};
@@ -550,21 +552,22 @@ pub fn render_markdown(report: &Report) -> String {
     }
     out.push('\n');
 
-    // 3. the findings that count, for every rule that counts a registry.
-    let registries: Vec<&RuleResult> = report
+    // 3. the findings that count, for every rule that counts a findings backend.
+    let findings_rules: Vec<&RuleResult> = report
         .rules
         .iter()
         .filter(|rule| rule.findings.is_some())
         .collect();
-    if !registries.is_empty() {
+    if !findings_rules.is_empty() {
         out.push_str("## Findings\n\n");
-        for rule in registries {
+        for rule in findings_rules {
             out.push_str(&format!("### {}\n\n", cell(&rule.id)));
             out.push_str("| Id | Severity | Status | Title | Owner | Ticket |\n");
             out.push_str("|---|---|---|---|---|---|\n");
             let mut findings: Vec<&Finding> = rule.findings.iter().flatten().collect();
-            // The findings are sorted by id: the report is a stable diff.
-            findings.sort_by(|left, right| left.id.cmp(&right.id));
+            // The findings are ordered like their ids: the report is a stable
+            // diff.
+            findings.sort_by(|left, right| finding_order(left, right));
             for finding in findings {
                 out.push_str(&format!(
                     "| {} | {} | {} | {} | {} | {} |\n",
@@ -593,6 +596,24 @@ pub fn render_markdown(report: &Report) -> String {
     let mut out = out.trim_end().to_string();
     out.push('\n');
     out
+}
+
+/// The order of two findings: by issue number when the id is one, by id
+/// otherwise.
+///
+/// A registry id (`SEC-01`) is compared as it is written; an issue id is a
+/// number (`#12`), and `#2` comes before `#10` — the report is a stable diff,
+/// and the numbers of the tracker are a sequence a reader walks upwards.
+fn finding_order(left: &Finding, right: &Finding) -> Ordering {
+    match (issue_number(&left.id), issue_number(&right.id)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.id.cmp(&right.id),
+    }
+}
+
+/// The number of an issue id (`#12`), if the id is one.
+fn issue_number(id: &str) -> Option<u64> {
+    id.strip_prefix('#')?.parse().ok()
 }
 
 /// The content of a table cell: one line, with the pipe escaped.
