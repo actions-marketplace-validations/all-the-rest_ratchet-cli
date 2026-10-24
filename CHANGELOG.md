@@ -80,3 +80,9 @@ block is written by `ratchet release`.
 
 - count GitHub findings as a backend (issues)
 - add path-scoped metric gates (scopes)
+
+## [0.5.0] - 2026-10-24
+
+### Added
+
+- use GitHub CLI token fallback (issues)
