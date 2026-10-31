@@ -548,16 +548,23 @@ fn collect_files(
             .to_string_lossy()
             .replace('\\', "/");
         if kind.is_symlink() {
-            // A directory link could contain selected descendants, and walking
-            // through it would weaken the repository boundary. Fail closed.
-            if globs.iter().any(|glob| glob.is_match(&relative)) {
-                return Err(CounterError::runtime("file_metrics refuses symbolic links"));
-            }
             match fs::metadata(entry.path()) {
-                Ok(metadata) if metadata.is_dir() => {
-                    return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+                // A directory link is **skipped**, never walked: descending
+                // through it would weaken the repository boundary, and a
+                // dependency tree full of links (`node_modules`) would make
+                // every measurement fail. The count can therefore be too low
+                // by the files behind a directory link — a rule that measures
+                // rule files accepts that, and says so.
+                Ok(metadata) if metadata.is_dir() => continue,
+                Ok(_) => {
+                    // A selected file link is refused: its target may lie
+                    // outside the repository.
+                    if globs.iter().any(|glob| glob.is_match(&relative)) {
+                        return Err(CounterError::runtime(
+                            "file_metrics refuses a symbolic link that is selected",
+                        ));
+                    }
                 }
-                Ok(_) => {}
                 // A dangling, unselected link has no descendants to collect.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -856,7 +863,7 @@ fn run_agent_rule(
             count_value(
                 commits
                     .iter()
-                    .filter(|commit| !has_verify_footer(commit))
+                    .filter(|commit| !is_automation(commit) && !has_verify_footer(commit))
                     .count() as i64,
             )
         }
@@ -952,6 +959,21 @@ fn is_product_path(file: &str) -> bool {
 /// A commit that changes a gate and product code at once.
 fn disarms_a_gate(files: &[String]) -> bool {
     files.iter().any(|f| is_gate_path(f)) && files.iter().any(|f| is_product_path(f))
+}
+
+/// Whether the commit was produced by automation rather than a person or an
+/// agent session.
+///
+/// A scheduled data refresh has no verification story to tell, and counting it
+/// would turn the gate red on every bot push — a gate that fires on noise gets
+/// muted. Automation is named by its author, the one thing a bot cannot fake
+/// by accident.
+fn is_automation(commit: &crate::git::Commit) -> bool {
+    let author = commit.author.to_ascii_lowercase();
+    author.ends_with("[bot]")
+        || author.contains("github-actions")
+        || author.contains("dependabot")
+        || author.contains("renovate")
 }
 
 /// Whether a commit message carries a `Verify:` footer.
@@ -1163,26 +1185,29 @@ mod tests {
             root.path(),
             "test",
         )
-        .expect_err("symlinks are refused");
-        assert!(error.message.contains("symbolic links"));
+        .expect_err("a selected symlink is refused");
+        assert!(error.message.contains("symbolic link"), "{}", error.message);
     }
 
     #[cfg(unix)]
     #[test]
-    fn file_metrics_refuse_unselected_symlink_directories() {
+    fn file_metrics_skip_unselected_symlink_directories() {
+        // A dependency tree is full of directory links. Failing closed on the
+        // first one would make every measurement in a JavaScript repository
+        // impossible; the link is skipped and never walked.
         let root = crate::test_tempdir::TempDir::new().expect("temporary root");
         let outside = crate::test_tempdir::TempDir::new().expect("outside root");
         fs::write(outside.path().join("A.rs"), "fn main() {}\n").expect("outside source");
         std::os::unix::fs::symlink(outside.path(), root.path().join("linked"))
             .expect("directory link");
-        let error = run_file_metrics(
-            &["src/**/*.rs".to_string()],
+        let value = run_file_metrics(
+            &["linked/**/*.rs".to_string()],
             FileMetric::SizeBytes,
             root.path(),
             "test",
         )
-        .expect_err("symlink directories fail closed");
-        assert!(error.message.contains("symbolic links"));
+        .expect("a directory link is skipped, not an error");
+        assert_eq!(value.value.measurements.unwrap_or_default().len(), 0);
     }
 
     #[test]
@@ -1291,6 +1316,27 @@ mod tests {
             "docs/agents.md".to_string(),
         ];
         assert!(!disarms_a_gate(&gate_and_docs));
+    }
+
+    #[test]
+    fn automation_is_not_asked_for_a_verification_story() {
+        let bot = crate::git::Commit {
+            subject: "chore: update data".to_string(),
+            date: "2026-10-30".to_string(),
+            author: "github-actions[bot]".to_string(),
+            body: String::new(),
+        };
+        assert!(is_automation(&bot));
+        let human = crate::git::Commit {
+            author: "dev".to_string(),
+            ..bot.clone()
+        };
+        assert!(!is_automation(&human));
+        let dependabot = crate::git::Commit {
+            author: "dependabot[bot]".to_string(),
+            ..bot.clone()
+        };
+        assert!(is_automation(&dependabot));
     }
 
     #[test]
